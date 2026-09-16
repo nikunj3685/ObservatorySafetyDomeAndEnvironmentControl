@@ -1,0 +1,634 @@
+<!DOCTYPE html><html><head><title>Observatory Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --safe:#1a7f37; --safe-bg:#e6f4ea;
+  --unsafe:#c62828; --unsafe-bg:#fdecea;
+  --warn:#9a6300; --warn-bg:#fff4e0;
+  --neutral:#5f6368; --neutral-bg:#eceff1;
+  --page-bg:#f2f4f7; --card-bg:#ffffff; --text:#1f2328; --muted:#6a7178;
+  --accent-safety:#2563eb; --accent-dome:#7c3aed; --accent-heater:#c2620a; --accent-schedule:#0f766e;
+  --accent-allsky:#1f6feb;
+}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      max-width:1040px;margin:0 auto;padding:18px 16px 48px;}
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.subtitle a{color:var(--accent-safety);text-decoration:none;}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;align-items:stretch;}
+.card{background:var(--card-bg);border-radius:14px;padding:18px 20px;margin:0;
+       box-shadow:0 1px 4px rgba(0,0,0,.08);border-top:5px solid var(--accent,#ccc);min-width:0;
+       display:flex;flex-direction:column;}
+/* Safety Monitor normally sits side-by-side with All Sky (a plain grid
+   item, sized like Dome/Heater below); it only spans the full width - via
+   this separate .full-width class, added in Python only when All Sky is
+   disabled - when there's no All Sky card to share the row with. */
+.card.settings{grid-column:1/-1;}
+.card.safety.full-width{grid-column:1/-1;}
+.card.safety{--accent:var(--accent-safety);}
+.card.dome{--accent:var(--accent-dome);}
+.card.heater{--accent:var(--accent-heater);}
+.card.allsky{--accent:var(--accent-allsky);}
+.card.settings{--accent:var(--accent-schedule);}
+.allsky-img-wrap{width:100%;border-radius:10px;overflow:hidden;background:#14161a;min-height:140px;
+  flex:1;display:flex;align-items:center;justify-content:center;}
+.allsky-img-wrap img{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;}
+@media (min-width:741px){
+  /* Fixed 3-column layout (named areas, not auto-fit/auto-flow) so the
+     settings-groups land in exact, predictable spots: column 1 stacks
+     Location & Timezone, Safety Checks, Logging, then ASCOM Device Names;
+     column 2 is Hardware Pins & Addresses (full height); column 3 stacks
+     Dome & Heater, then All Sky Camera, then Service Control - in that
+     order, so both sit above Service Control. */
+  .card.settings{display:grid;grid-template-columns:1fr 1fr 1fr;
+    grid-template-areas:"head head head" "loc hw features" "safety hw allsky" "log hw svc" "names hw svc";gap:0 28px;}
+  .card.settings h2{grid-area:head;}
+  #location-timezone{grid-area:loc;}
+  #safety-checks{grid-area:safety;}
+  #dome-heater-features{grid-area:features;}
+  #allsky-settings{grid-area:allsky;}
+  #hardware-pins{grid-area:hw;}
+  #service-control{grid-area:svc;}
+  #logging-settings{grid-area:log;}
+  #device-names{grid-area:names;}
+  /* The universal "every settings-group but the first" separator below is
+     right for the single mobile column, but on this 3-column desktop
+     layout #hardware-pins and #dome-heater-features are each the FIRST
+     item in their own column (col2/col3), not a continuation of the one
+     above them in DOM order - so undo the stray top rule just for those
+     two here. */
+  #hardware-pins,#dome-heater-features{border-top:none;margin-top:0;padding-top:0;}
+}
+.card input[type=text],.card select{width:100%;box-sizing:border-box;padding:6px 8px;margin:4px 0 2px;
+      border-radius:6px;border:1px solid #ccc;font-size:14px;}
+.hint{font-size:12px;color:var(--muted);margin:2px 0 10px;}
+.hint-warn{color:var(--unsafe);}
+.settings-group{margin-bottom:6px;}
+/* Separate each Settings section with the same splitter line style used
+   elsewhere on the page (.sep, e.g. between blocks in the Safety Monitor
+   card) - here as a top rule on every section but the first, so it reads
+   as a divider between consecutive sections rather than framing each one. */
+.settings-group + .settings-group{border-top:1px solid #eee;margin-top:16px;padding-top:16px;}
+.settings-group h3{font-size:13.5px;margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}
+.card h2{margin:0 0 14px;font-size:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.card h2 .title{display:flex;align-items:center;gap:8px;}
+.badge{display:inline-block;padding:4px 13px;border-radius:20px;font-weight:700;font-size:13px;letter-spacing:.3px;}
+.badge-safe{background:var(--safe-bg);color:var(--safe);}
+.badge-unsafe{background:var(--unsafe-bg);color:var(--unsafe);}
+.badge-open{background:var(--safe-bg);color:var(--safe);}
+.badge-closed{background:var(--neutral-bg);color:var(--neutral);}
+.badge-moving{background:var(--warn-bg);color:var(--warn);}
+.badge-fault{background:var(--unsafe-bg);color:var(--unsafe);}
+.badge-disabled{background:var(--neutral-bg);color:var(--neutral);}
+.override-label{font-size:12px;color:var(--muted);margin:-8px 0 12px;}
+.hold-countdown{font-size:13px;color:var(--warn);background:var(--warn-bg);border-radius:8px;
+      padding:6px 10px;margin:-4px 0 12px;display:inline-block;}
+.btn-row{margin-bottom:4px;}
+.btn{display:inline-block;text-decoration:none;padding:9px 16px;border-radius:8px;font-size:13px;font-weight:600;
+      border:none;cursor:pointer;margin:2px 6px 6px 0;}
+.btn-safe{background:var(--safe);color:#fff;}
+.btn-unsafe{background:var(--unsafe);color:#fff;}
+.btn-neutral{background:var(--neutral-bg);color:var(--text);}
+.btn-dome{background:var(--accent-dome);color:#fff;}
+.btn-heater{background:var(--accent-heater);color:#fff;}
+.btn-safety{background:var(--accent-safety);color:#fff;}
+.btn:disabled{opacity:.45;cursor:not-allowed;}
+/* Used to grey out a whole settings section at once (the Dome schedule
+   form, Heater thresholds form, and the reed/relay/MOSFET rows under
+   Hardware Pins) when the Dome or Heater master switch is off - a plain
+   <fieldset disabled> stops every input/button inside from being edited or
+   submitted, and the opacity here makes that visually obvious rather than
+   leaving it looking accidentally broken. Reset to remove the browser's
+   default border/padding/margin so it's invisible when NOT disabled. */
+fieldset{border:none;margin:0;padding:0;min-width:0;}
+fieldset:disabled{opacity:.5;}
+.banner{border-radius:9px;padding:10px 14px;font-size:13.5px;margin:4px 0 14px;}
+.banner-warn{background:var(--warn-bg);color:var(--warn);border:1px solid #f0d38a;}
+.top-banner{font-size:14.5px;padding:12px 16px;}
+.top-banner a{color:var(--warn);font-weight:600;text-decoration:underline;}
+.field{font-size:14.5px;margin:6px 0;color:#333;}
+.field b{color:#111;}
+.muted{color:var(--muted);font-size:12.5px;}
+.tag{display:inline-block;font-size:11px;color:var(--muted);border:1px solid #ddd;border-radius:4px;
+     padding:1px 6px;margin-left:4px;vertical-align:middle;}
+.tag-warn{color:var(--unsafe);border-color:var(--unsafe);}
+.warn-text{color:var(--unsafe);}
+.status-dot{display:inline-block;width:15px;height:15px;border-radius:50%;
+     vertical-align:middle;cursor:help;box-shadow:0 0 0 1px rgba(0,0,0,.08);flex-shrink:0;}
+.dot-safe{background:var(--safe);}
+.dot-unsafe{background:var(--unsafe);}
+/* Every Safety Monitor reading is a 3-column grid row: a dot slot, an icon
+   slot, then the text. Each <p> is its own grid, but they all share the
+   same column widths, so the dots line up with each other, the icons line
+   up with each other, and the text lines up with the text - down the
+   whole card - instead of just flowing as one run of inline content.
+   col-dot/col-icon are pinned to the top of the row and given a fixed
+   line-height so they sit level with the first line of text even when the
+   text column wraps onto multiple lines (e.g. the Outside/Sky readings). */
+.field-grid{display:grid;grid-template-columns:24px 26px 1fr;column-gap:2px;align-items:start;}
+.col-dot,.col-icon{display:flex;align-items:center;height:21px;line-height:21px;}
+.col-text{line-height:1.45;}
+/* The light-gray "previous status" line shown under a safety-affecting
+   reading (Day/Night, Rain, Sky/MLX90614, simpleCloudDetect) - what it
+   read before its last change, and when. Deliberately lighter/smaller than
+   the regular .muted text elsewhere, so it reads as secondary history, not
+   part of the current reading. */
+.prev-status{color:#b0b5bb;font-size:11.5px;margin-top:-4px;margin-bottom:10px;}
+.prev-status b{color:#b0b5bb;font-weight:600;}
+.sep{border:0;border-top:1px solid #eee;margin:12px 0;}
+label{font-size:13.5px;display:block;margin:10px 0 4px;color:#333;}
+input[type=number],input[type=time]{font-size:14px;padding:5px 7px;border-radius:6px;border:1px solid #ccc;}
+.setting-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin:10px 0;}
+.setting-row label{display:flex;align-items:center;gap:6px;margin:0;flex:1 1 auto;min-width:180px;}
+.setting-row input[type=time]{margin-left:auto;}
+.narrow-number{width:80px;}
+.sensor-name-input{width:180px;max-width:100%;}
+.pin-row{display:flex;flex-direction:column;gap:6px;margin:14px 0;}
+.pin-row .pin-name{display:flex;align-items:center;gap:6px;margin:0;font-weight:600;}
+.pin-field{display:flex;align-items:center;gap:8px;margin-left:24px;}
+.pin-field .pin-label{color:var(--muted);font-size:12.5px;min-width:36px;}
+input[type=checkbox]{vertical-align:middle;margin-right:6px;}
+input[type=range]{width:100%;accent-color:var(--accent-heater);}
+a{color:var(--accent-safety);}
+</style></head><body>
+
+<h1>🔭 Observatory Control</h1>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a></p>
+<div class='banner banner-warn top-banner'>📍 <b>Location not set</b> — latitude/longitude are still at the 0&deg;,0&deg; placeholder, so the Day/Night sun-elevation gate is computing nonsense for your actual site. <a href='#settings'>Set your real coordinates in Settings</a>.</div>
+<div class="grid">
+<div class="card safety">
+  <h2><span class="title">🛡️ Safety Monitor <span id="safeState" class="badge badge-unsafe">UNSAFE</span></span></h2>
+  <p class="hold-countdown" id="safeHoldCountdown" >⏳ Conditions clear — reporting SAFE in <b id="safeHoldTime">3:07</b></p>
+  <p class="override-label" id="overrideLabel">Mode: Auto (sensor-based)</p>
+  <div class="btn-row">
+    <a href="/override?mode=safe"><button class="btn btn-safe">Force SAFE</button></a>
+    <a href="/override?mode=unsafe"><button class="btn btn-unsafe">Force UNSAFE</button></a>
+    <a href="/override?mode=auto"><button class="btn btn-neutral">Back to Auto</button></a>
+  </div>
+  <div id="warningBanner"><div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> Rain disabled &mdash; see <a href='/config'>Settings</a></div></div>
+  <hr class="sep">
+  <div id="daynightBlock"><p class="field field-grid muted"><span class="col-dot"></span><span class="col-icon">🕐</span><span class="col-text">Friday, September 11, 2026 03:42:07 P.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="Day/Night check: FAILING — it's daytime (sun elevation 12.3&deg; &gt; threshold -12.0&deg;)."></span></span><span class="col-icon">☀️</span><span class="col-text"><b>Daytime</b> <span class='muted'>(sun elevation 12.3&deg;, threshold -12.0&deg;)</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Dusk <b>08:15 P.M.</b> &nbsp;&middot;&nbsp; Dawn <b>05:40 A.M.</b></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Nighttime</b> at 11:28 P.M.</span></p></div>
+  <hr class="sep">
+  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="MLX90614 clear-sky check: FAILING — reads Cloudy."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>-10.2&deg;C</b> &nbsp;
+  🌬️ <b>17.9&deg;C</b>
+  (Cloudy)
+  <span class="tag">MLX90614</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Clear</b> at 01:58 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>WET</b> at 12:58 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="Simple Cloud Detect ML check: FAILING — reports Cloudy, or the service is unreachable/its reading is stale."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Cloudy</b> <span class="muted">(88%)</span>
+  &nbsp; <a href="http://192.168.2.147:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Clear</b> at 02:13 A.M.</span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>18.4&deg;C</b> &nbsp;
+  💧 <b>55.2%</b> &nbsp;
+  🎚️ <b>1012 hPa</b>
+  <span class="tag">BME280</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">📦</span><span class="col-text">Box: 🌡️ <b>19.8&deg;C</b> &nbsp;
+  💧 <b>48.0%</b>
+  <span class="tag">DHT11</span></span></p></div>
+  <p class="hint">Enable/disable individual checks and the SAFE-report hold delay under
+  <a href="#safety-checks">Settings → Safety Checks</a>.</p>
+</div>
+
+<div class="card allsky" id="allsky">
+  <h2><span class="title">🌌 All Sky</span></h2>
+  <div class="allsky-img-wrap">
+    <img id="allskyImg" src="https://picsum.photos/640/360?_t=1789439301" alt="Latest all-sky camera image"
+     onerror="this.dataset.broken='1';var s=document.getElementById('allskyStatus');if(s)s.textContent='Image failed to load — check the location under Settings → All Sky Camera.';"
+     onload="if(this.dataset.broken!=='1'){var s=document.getElementById('allskyStatus');if(s)s.textContent='Updated '+new Date().toLocaleTimeString();} this.dataset.broken='';">
+  </div>
+  <p class="hint" id="allskyStatus">Loading&hellip;</p>
+  <p class='hint'><a href='http://192.168.1.50/allsky/' target='_blank' rel='noopener'>View full All Sky page &rarr;</a></p>
+</div>
+
+<div class="card dome" id="dome">
+  <h2><span class="title">🚪 Dome <span id="domeState" class="badge badge-fault">UNKNOWN</span></span></h2>
+  
+  
+  
+  <div class="btn-row">
+    <button class="btn btn-dome"  onclick="fetch('/open').then(()=>poll())">OPEN</button>
+    <button class="btn btn-neutral"  onclick="fetch('/close').then(()=>poll())">CLOSE</button>
+  </div>
+  <hr class="sep">
+  <form action="/save" method="get">
+   <fieldset >
+    
+    <div class="setting-row">
+      <label><input type="checkbox" name="openEnable" checked> Enable automatic OPEN</label>
+      <input type="time" name="openTime" value="06:30">
+    </div>
+    <div class="setting-row">
+      <label><input type="checkbox" name="closeEnable" checked> Enable automatic CLOSE</label>
+      <input type="time" name="closeTime" value="20:00">
+    </div>
+    <p class="hint">The two OPEN/CLOSE boxes above are a one-time daily schedule — each switches itself
+    back off after it fires once; re-check it to arm that occurrence again.</p>
+    <hr class="sep">
+    <div class="setting-row">
+      <label><input type="checkbox" name="autoCloseEnable" checked> Auto-close roof if UNSAFE for this many seconds:</label>
+      <input type="number" name="autoCloseSeconds" value="60" class="narrow-number">
+    </div>
+    <div class="setting-row">
+      <label><input type="checkbox" name="autoOpenEnable" > Auto-open roof if SAFE for this many seconds:</label>
+      <input type="number" name="autoOpenSeconds" value="90" class="narrow-number">
+    </div>
+    <p class="hint">These two are standing safety guards, not one-time events — they stay checked or
+    unchecked exactly as you set them and keep firing every time the condition occurs, so a stretch of
+    UNSAFE always closes the roof (and a stretch of SAFE always reopens it) without you re-arming anything.</p>
+    <hr class="sep">
+    <div class="setting-row">
+      <label><input type="checkbox" name="rainAutoCloseEnable" checked disabled> Auto-close roof if Rain for this many seconds:</label>
+      <input type="number" name="rainAutoCloseSeconds" value="30" class="narrow-number" disabled>
+    </div>
+    <p class='hint hint-warn'>Greyed out because the RG-9 rain sensor is disabled under <a href='#hardware-pins'>Hardware Pins</a> — enable it there first, since it means the RG-9 isn't wired/trusted yet.</p>
+    <p><button type="submit" class="btn btn-dome">Save schedule</button></p>
+   </fieldset>
+  </form>
+</div>
+
+<div class="card heater">
+  <h2><span class="title">🔥 Dew / Frost Heater <span id="heaterModeBadge" class="badge badge-closed">AUTO</span></span></h2>
+  
+  <div id="heaterInfo"><p class="field">Heater <b>OFF</b>
+  <span class="muted">(pin OFF)</span></p>
+  <p class='field muted'>Waiting for first sensor reading&hellip;</p>
+  </div>
+  <div id="heaterControls" >
+    <label>Power (auto): <output id="pwrOut">0</output>%</label>
+    <input type="range" id="pwrSlider" min="0" max="100" value="0" disabled
+     oninput="document.getElementById('pwrOut').textContent=this.value"
+     onchange="fetch('/heater-override-ajax?mode=manual&power='+this.value)">
+    <p><a href="/heater-override?mode=manual"><button class="btn btn-heater">Switch to Manual</button></a></p>
+  </div>
+  <hr class="sep">
+  <div class="settings-group" id="heater-thresholds">
+    <h3>Heater Thresholds</h3>
+    <form action="/save-heater" method="get">
+     <fieldset >
+      
+      <label>Freezing threshold (deg C)</label><input type="text" name="freezec" value="0.0">
+      <label>Dew-risk spread (deg C)</label><input type="text" name="dewspreadc" value="3.0">
+      <label>Freeze power ramp range (deg C)</label><input type="text" name="freezerampc" value="5.0">
+      <button type="submit" class="btn btn-heater">Save thresholds</button>
+     </fieldset>
+    </form>
+  </div>
+</div>
+
+<div class="card settings" id="settings">
+  <h2><span class="title">⚙️ Settings</span></h2>
+
+  <div class="settings-group" id="location-timezone">
+    <h3>Location &amp; Timezone</h3>
+    <form action="/save-location" method="get">
+      <label>Latitude (deg, north +)</label><input type="text" name="lat" value="0.0">
+      <label>Longitude (deg, east +)</label><input type="text" name="lon" value="0.0">
+      <label>Timezone</label><select name="tz"><option value='UTC' selected>UTC</option><option value='America/New_York'>America/New_York</option><option value='America/Chicago'>America/Chicago</option><option value='America/Denver'>America/Denver</option><option value='America/Phoenix'>America/Phoenix</option><option value='America/Los_Angeles'>America/Los_Angeles</option><option value='America/Anchorage'>America/Anchorage</option><option value='Pacific/Honolulu'>Pacific/Honolulu</option><option value='America/Halifax'>America/Halifax</option><option value='America/St_Johns'>America/St_Johns</option><option value='America/Mexico_City'>America/Mexico_City</option><option value='America/Sao_Paulo'>America/Sao_Paulo</option><option value='America/Argentina/Buenos_Aires'>America/Argentina/Buenos_Aires</option><option value='Europe/London'>Europe/London</option><option value='Europe/Paris'>Europe/Paris</option><option value='Europe/Athens'>Europe/Athens</option><option value='Atlantic/Reykjavik'>Atlantic/Reykjavik</option><option value='Europe/Moscow'>Europe/Moscow</option><option value='Africa/Lagos'>Africa/Lagos</option><option value='Africa/Nairobi'>Africa/Nairobi</option><option value='Africa/Johannesburg'>Africa/Johannesburg</option><option value='Asia/Dubai'>Asia/Dubai</option><option value='Asia/Riyadh'>Asia/Riyadh</option><option value='Europe/Istanbul'>Europe/Istanbul</option><option value='Asia/Kolkata'>Asia/Kolkata</option><option value='Asia/Karachi'>Asia/Karachi</option><option value='Asia/Dhaka'>Asia/Dhaka</option><option value='Asia/Kathmandu'>Asia/Kathmandu</option><option value='Asia/Shanghai'>Asia/Shanghai</option><option value='Asia/Tokyo'>Asia/Tokyo</option><option value='Asia/Seoul'>Asia/Seoul</option><option value='Asia/Singapore'>Asia/Singapore</option><option value='Asia/Jakarta'>Asia/Jakarta</option><option value='Asia/Bangkok'>Asia/Bangkok</option><option value='Asia/Manila'>Asia/Manila</option><option value='Australia/Sydney'>Australia/Sydney</option><option value='Australia/Brisbane'>Australia/Brisbane</option><option value='Australia/Adelaide'>Australia/Adelaide</option><option value='Australia/Perth'>Australia/Perth</option><option value='Pacific/Auckland'>Pacific/Auckland</option></select>
+      <p class="hint">Night threshold and clear-sky delta thresholds have moved to
+      <a href="#safety-checks">Safety Checks</a> below, next to the checks they control.</p>
+      <button type="submit" class="btn btn-neutral">Save location</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="safety-checks">
+    <h3>Safety Checks</h3>
+    <p class="hint hint-warn">Turning any of these off removes that guard from the SAFE/UNSAFE decision
+    entirely — a disabled check can never report UNSAFE on its own again.</p>
+    <p class="hint">The Rain and MLX90614 check enable/disable toggles live under
+    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings.</p>
+    <form action="/save-checks" method="get">
+      <label><input type="checkbox" name="daynight" checked> Day/Night check</label>
+      <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="-12.0">
+      <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
+      <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="15.0">
+      <p class="hint">MLX90614's (ambient − sky) must be at least this many degrees to call it "Clear" —
+      enable/disable that check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <label><input type="checkbox" name="mlcloud" checked> Simple Cloud Detect ML check</label>
+      <label><input type="checkbox" name="safedelay" checked> Hold before reporting SAFE</label>
+      <input type="text" name="safedelaymin" value="5">
+      <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
+      reported immediately — this delay only applies to a transition back to SAFE.</p>
+      <button type="submit" class="btn btn-safety">Save checks</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="dome-heater-features">
+    <h3>Dome &amp; Heater</h3>
+    <p class="hint">Turn a whole subsystem off if you don't have it at all — e.g. no motorized roof, or
+    no dew/frost heater. Takes effect immediately, no restart needed.</p>
+    <form action="/save-features" method="get">
+      <label><input type="checkbox" name="domeEnable" checked> Enable Dome control</label>
+      <p class="hint">Off: OPEN/CLOSE, the schedule, safety auto-close/open, and rain auto-close all stop
+      issuing commands; the reed switch is no longer read; and the ASCOM Dome device reports Not Connected
+      to any client that tries to use it — the same as if the ASCOM dome service itself were stopped.</p>
+      <label><input type="checkbox" name="heaterEnable" checked> Enable Heater control</label>
+      <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
+      output is forced off.</p>
+      <button type="submit" class="btn btn-neutral">Save Dome &amp; Heater</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="allsky-settings">
+    <h3>All Sky Camera</h3>
+    <p class="hint">Shows the latest frame from a separate all-sky camera (e.g. Thomas Jacquin's Allsky
+    software running on this Pi or another device) next to the Safety Monitor. Off by default since
+    there's no sensible default location — set one below, then check the box. Takes effect on next
+    page load.</p>
+    <form action="/save-allsky" method="get">
+      <label><input type="checkbox" name="allskyEnable" checked> Show All Sky section</label>
+      <label>Image location</label>
+      <input type="text" name="imageLocation" value="https://picsum.photos/640/360"
+       placeholder="http://192.168.1.50/allsky/image.jpg  or  /home/pi/allsky/images/image.jpg">
+      <p class="hint">An http(s):// URL is loaded straight from wherever it points (e.g. another device's
+      own all-sky web server); a plain file path is read directly off this Pi's disk and refreshed
+      automatically, so it always shows the latest frame written there.</p>
+      <label>All Sky page link (optional)</label>
+      <input type="text" name="pageUrl" value="http://192.168.1.50/allsky/"
+       placeholder="http://192.168.1.50/allsky/">
+      <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
+      it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
+      <button type="submit" class="btn btn-neutral">Save All Sky</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="hardware-pins">
+    <h3>Hardware Pins &amp; Addresses (GPIO / I2C)</h3>
+    <p class="hint hint-warn">Nothing on this form takes effect until the service is restarted
+    (<code>sudo systemctl restart dome-safety.service</code>) — every device below is only ever
+    initialized once, at startup. Unchecking a device skips setting it up at all, so it's safe to
+    leave unwired hardware unchecked instead of it crashing the service.</p>
+    <form action="/save-pins" method="get">
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="dht11Enable" checked> Box temp/humidity Sensor</label>
+        <div class="pin-field"><span class="pin-label">GPIO</span><input type="number" name="dht11" value="4" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="dht11Name" value="DHT11" class="sensor-name-input"></div>
+      </div>
+      <fieldset >
+      
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="reedEnable" checked> Roof status (open/closed) read Sensor</label>
+        <div class="pin-field"><span class="pin-label">GPIO</span><input type="number" name="reed" value="16" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="reedName" value="Reed Switch" class="sensor-name-input"></div>
+      </div>
+      <p class="hint hint-warn">Disabling the reed switch means the dome has NO real position feedback -
+      OPEN/CLOSED state just reflects whatever was last commanded, not a confirmed reading. Only turn this
+      off if you genuinely don't have one wired.</p>
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="relayEnable" checked> Roof relay (Open/Close) Sensor</label>
+        <div class="pin-field"><span class="pin-label">GPIO</span><input type="number" name="relay" value="23" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="relayName" value="Roof Relay" class="sensor-name-input"></div>
+      </div>
+      <p class="hint">Disabling this puts the dome in bench-test mode: OPEN/CLOSE commands still run through
+      the state machine, but no physical relay pulse is ever sent.</p>
+      </fieldset>
+      <fieldset >
+      
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="mosfetEnable" checked> Box heater MOSFET Sensor</label>
+        <div class="pin-field"><span class="pin-label">GPIO</span><input type="number" name="mosfet" value="18" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="mosfetName" value="Heater MOSFET" class="sensor-name-input"></div>
+      </div>
+      <p class="hint">Disabling this keeps computing the heater's AUTO/MANUAL power for display, just
+      never drives the physical output.</p>
+      </fieldset>
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="rainCheckEnable" > Rain detection (Dry/Wet) Sensor</label>
+        <div class="pin-field"><span class="pin-label">GPIO</span><input type="number" name="rain" value="17" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="rainName" value="RG-9" class="sensor-name-input"></div>
+      </div>
+      <p class="hint">Only enable the check above once the RG-9 is actually wired to this pin.</p>
+      <p class="hint">I2C devices below don't use a GPIO pin — each is identified by which I2C bus it's
+      wired to plus its address on that bus. It's normal for several devices to share the same bus number
+      (e.g. bus 1, the Pi's standard I2C bus) since each has its own address.</p>
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="bme280Enable" checked> Environment temp/humidity/pressure Sensor</label>
+        <div class="pin-field"><span class="pin-label">Bus</span><input type="number" name="bme280bus" value="1" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Addr</span><input type="text" name="bme280" value="0x76" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="bme280Name" value="BME280" class="sensor-name-input"></div>
+      </div>
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="mlxCheckEnable" checked> Sky/ambient temperature (cloudy/clear) Sensor</label>
+        <div class="pin-field"><span class="pin-label">Bus</span><input type="number" name="mlxbus" value="1" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Addr</span><input type="text" name="mlx" value="0x5A" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="mlxName" value="MLX90614" class="sensor-name-input"></div>
+      </div>
+      <div class="pin-row">
+        <label class="pin-name"><input type="checkbox" name="oledEnable" checked> OLED display</label>
+        <div class="pin-field"><span class="pin-label">Bus</span><input type="number" name="oled" value="2" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Addr</span><input type="text" name="oledaddr" value="0x3C" class="narrow-number"></div>
+        <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="oledName" value="OLED Display" class="sensor-name-input"></div>
+      </div>
+      <button type="submit" class="btn btn-neutral">Save pins</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="service-control">
+    <h3>Service Control</h3>
+    <p class="hint hint-warn">Both act immediately once confirmed — the page (and for a reboot, the whole
+    Pi) will be briefly unreachable while it comes back up.</p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-neutral"
+       onclick="if(confirm('Restart the dome-safety service now?')) doServiceAction('/restart-service')">Restart Service</button>
+      <button type="button" class="btn btn-unsafe"
+       onclick="if(confirm('Reboot the entire Raspberry Pi now? This also stops the service until it boots back up.')) doServiceAction('/reboot-pi')">Reboot Pi</button>
+    </div>
+    <p class="hint" id="serviceStatus"></p>
+    <p class="hint">Requires passwordless sudo for these two commands, under the user this service runs
+    as. One-time setup — run <code>sudo visudo</code> and add a line like:</p>
+    <p class="hint"><code>admin ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart dome-safety.service, /usr/bin/systemctl reboot</code></p>
+    <p class="hint">(swap "admin" for whatever <code>User=</code> your dome-safety.service unit file uses,
+    and confirm the systemctl path with <code>which systemctl</code>.)</p>
+  </div>
+
+  <div class="settings-group" id="logging-settings">
+    <h3>Logging</h3>
+    <form action="/save-logging" method="get">
+      <label>Keep All Sky log images for this many days</label>
+      <input type="number" name="imgdays" min="1" value="30" class="narrow-number">
+      <label>Keep old weekly log files for this many days</label>
+      <input type="number" name="logdays" min="1" value="90" class="narrow-number">
+      <p class="hint">Event log text always rotates to a new file every week — these two just control
+      cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
+      above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
+      <hr class="sep">
+      <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
+      checking "what did the sky actually look like when this changed" while a new setup is being shaken
+      out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgDaynight" checked> Day/Night change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgRain" checked> Rain sensor change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgMlx" checked> Sky/ambient temperature (MLX90614) change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgMlcloud" checked> ML cloud detection change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgOverall" checked> Overall SAFE/UNSAFE change</label>
+      </div>
+      <button type="submit" class="btn btn-neutral">Save logging settings</button>
+    </form>
+    <hr class="sep">
+    <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
+    unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
+    nothing left to show.</p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-unsafe"
+       onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
+    </div>
+    <p class="hint" id="clearImagesStatus"></p>
+  </div>
+
+  <div class="settings-group" id="device-names">
+    <h3>ASCOM Device Names</h3>
+    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
+    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
+    clients only re-read this list occasionally, so a change may not show up there until the client itself
+    refreshes it.</p>
+    <form action="/save-device-names" method="get">
+      <label>Safety Monitor</label>
+      <input type="text" name="safetyName" value="Observatory Combined Safety Monitor">
+      <label>Dome</label>
+      <input type="text" name="domeName" value="Observatory Roof Dome">
+      <label>Observing Conditions</label>
+      <input type="text" name="obsName" value="Observatory Environment Sensors">
+      <button type="submit" class="btn btn-neutral">Save device names</button>
+    </form>
+  </div>
+</div>
+</div>
+
+<script>
+function doServiceAction(url){
+  var el=document.getElementById('serviceStatus');
+  if(el) el.textContent='Working...';
+  fetch(url).then(r=>r.json()).then(d=>{
+    if(el) el.textContent=(d&&d.message)||'Done.';
+  }).catch(()=>{
+    // Expected for a real restart/reboot - the connection drops before a
+    // response arrives. Not an error from the user's point of view.
+    if(el) el.textContent='Command sent - the page will be unreachable for a bit while it restarts.';
+  });
+}
+
+function clearLogImages(){
+  var el=document.getElementById('clearImagesStatus');
+  if(el) el.textContent='Working...';
+  fetch('/clear-log-images').then(r=>r.json()).then(d=>{
+    if(el) el.textContent=(d&&d.message)||'Done.';
+  }).catch(()=>{
+    if(el) el.textContent='Failed to clear images.';
+  });
+}
+
+var holdEndTime=null; // ms epoch when the safe-report hold finishes, or null when not counting down
+
+function fmtMMSS(totalSeconds){
+  totalSeconds=Math.max(0,Math.round(totalSeconds));
+  var m=Math.floor(totalSeconds/60), sec=totalSeconds%60;
+  return m+':'+(sec<10?'0':'')+sec;
+}
+
+function tickHoldCountdown(){
+  var timeEl=document.getElementById('safeHoldTime');
+  if(!timeEl||holdEndTime===null) return;
+  var remaining=(holdEndTime-Date.now())/1000;
+  if(remaining<=0){
+    var el=document.getElementById('safeHoldCountdown');
+    if(el) el.hidden=true;
+    holdEndTime=null;
+    return;
+  }
+  timeEl.textContent=fmtMMSS(remaining);
+}
+setInterval(tickHoldCountdown,1000);
+
+function poll(){
+  fetch('/fragments').then(r=>r.json()).then(d=>{
+    var domeBadgeMap={OPEN:'badge-open',CLOSED:'badge-closed',OPENING:'badge-moving',CLOSING:'badge-moving',STUCK:'badge-fault',UNKNOWN:'badge-fault',DISABLED:'badge-disabled'};
+    var domeEl=document.getElementById('domeState');
+    domeEl.textContent=d.dome_state;
+    domeEl.className='badge '+(domeBadgeMap[d.dome_state]||'badge-fault');
+
+    var safeEl=document.getElementById('safeState');
+    safeEl.textContent=d.overall_safe?'SAFE':'UNSAFE';
+    safeEl.className='badge '+(d.overall_safe?'badge-safe':'badge-unsafe');
+
+    var holdEl=document.getElementById('safeHoldCountdown');
+    var holdTimeEl=document.getElementById('safeHoldTime');
+    if(holdEl){
+      if(d.safe_hold_active){
+        holdEndTime=Date.now()+d.safe_hold_remaining_sec*1000;
+        holdEl.hidden=false;
+        if(holdTimeEl) holdTimeEl.textContent=fmtMMSS(d.safe_hold_remaining_sec);
+      } else {
+        holdEl.hidden=true;
+        holdEndTime=null;
+      }
+    }
+
+    var ovEl=document.getElementById('overrideLabel');
+    if(ovEl) ovEl.textContent='Mode: '+d.override_label;
+
+    var wbEl=document.getElementById('warningBanner');
+    if(wbEl) wbEl.innerHTML=d.warning_html;
+
+    var dnEl=document.getElementById('daynightBlock');
+    if(dnEl) dnEl.innerHTML=d.daynight_html;
+
+    var envEl=document.getElementById('envReadings');
+    if(envEl) envEl.innerHTML=d.env_html;
+
+    var hmEl=document.getElementById('heaterModeBadge');
+    if(hmEl){
+      hmEl.textContent=d.heater_enabled?d.heater_mode:'DISABLED';
+      hmEl.className='badge '+(!d.heater_enabled?'badge-disabled':(d.heater_mode==='MANUAL'?'badge-moving':'badge-closed'));
+    }
+
+    var hiEl=document.getElementById('heaterInfo');
+    if(hiEl) hiEl.innerHTML=d.heater_info_html;
+
+    var hcEl=document.getElementById('heaterControls');
+    if(hcEl) hcEl.hidden=!d.heater_enabled;
+
+    var slider=document.getElementById('pwrSlider');
+    var pwrOut=document.getElementById('pwrOut');
+    if(slider && document.activeElement!==slider){
+      slider.value=d.heater_target_percent;
+      slider.disabled=(d.heater_mode!=='MANUAL');
+      if(pwrOut) pwrOut.textContent=d.heater_target_percent;
+    }
+  });
+}
+setInterval(poll,3000);
+
+function allskyCacheBust(url){
+  var sep = url.indexOf('?') === -1 ? '?' : '&';
+  return url + sep + '_t=' + Date.now();
+}
+function allskyReload(){
+  var img = document.getElementById('allskyImg');
+  if (img) img.src = allskyCacheBust('https://picsum.photos/640/360');
+}
+var allskyLastVersion = null;
+var allskyTick = 0;
+function checkAllsky(){
+  var img = document.getElementById('allskyImg');
+  if (!img) return;
+  allskyTick++;
+  fetch('/allsky-check').then(function(r){ return r.json(); }).then(function(d){
+    if (d.ok){
+      if (d.version !== allskyLastVersion){
+        allskyLastVersion = d.version;
+        allskyReload();
+      }
+    } else if (allskyTick % 3 === 0){
+      // No reliable "has it changed" signal (e.g. a remote camera with no
+      // Last-Modified/ETag header) - fall back to an occasional blind
+      // reload so the image still updates, just less often/efficiently.
+      allskyReload();
+    }
+  }).catch(function(){});
+}
+setInterval(checkAllsky, 5000);
+</script>
+</body></html>

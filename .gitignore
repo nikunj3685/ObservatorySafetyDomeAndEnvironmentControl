@@ -1,0 +1,11 @@
+# Generated at runtime by dome_safety_service.py - local settings/state,
+# never something to version-control.
+dome_config.json
+logs/
+
+# Created only by the test suite (a fake local-file All Sky source image).
+fake_allsky_source.jpg
+
+# Python bytecode cache.
+__pycache__/
+*.pyc

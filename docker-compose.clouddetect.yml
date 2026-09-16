@@ -1,0 +1,26 @@
+# simpleCloudDetect, pointed at Allsky's own captured image instead of
+# opening the camera itself (avoids two processes fighting over one USB
+# camera).
+#
+# Allsky's live image on this Pi lives at /home/admin/allsky/tmp/image.jpg
+# (this Pi uses the "admin" user, not the default "pi") - already reflected
+# in the volume line below.
+
+services:
+  clouddetect:
+    image: chvvkumar/simpleclouddetect:latest
+    container_name: clouddetect
+    restart: unless-stopped
+    network_mode: host          # simplest on a Pi - matches ALPACA_PORT below directly
+    environment:
+      - IMAGE_URL=file:///data/image.jpg
+      - ALPACA_PORT=11111        # what safety_aggregator.py's CLOUDDETECT_STATUS_URL expects
+      - ALPACA_UPDATE_INTERVAL=30
+      - DETECT_INTERVAL=30       # match Allsky's own capture cadence - tune once you see how often Allsky actually saves a new frame at night
+      - MQTT_TOPIC=Astro/SimpleCloudDetect   # only matters if you're also using MQTT elsewhere - harmless if not
+    volumes:
+      - /home/admin/allsky/tmp/image.jpg:/data/image.jpg:ro   # confirm the filename is really "image.jpg" with: ls -la /home/admin/allsky/tmp/
+      - ./clouddetect-config:/config                        # persists alpaca_config.json across restarts
+      # Once Phase 3 (training) is done, mount your trained model over the stock one:
+      # - ./keras_model.h5:/app/keras_model.h5:ro
+      # - ./labels.txt:/app/labels.txt:ro
