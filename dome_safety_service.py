@@ -1101,8 +1101,19 @@ def recompute_overall_safe():
 
         # MLX90614 ambient-vs-sky clear/cloud delta (the ESP32's own cloud check)
         mlx_fresh = sensor_state["mlx_ok"] and (now - sensor_state["mlx_last_poll"] <= STALE_AFTER_SEC)
+        # The MLX90614 normally lives inside the equipment enclosure (only
+        # its IR eye has a clear view of the sky), so its own onboard
+        # ambient-temperature sensor reads the box's air - which runs
+        # warmer than the true outside air. An inflated ambient widens the
+        # ambient-vs-sky delta past the "Clear" threshold even on a
+        # genuinely cloudy night (the failure mode this fixes). Use the
+        # BME280's true outside-air reading as the ambient reference
+        # whenever it's fresh; fall back to the MLX's own ambient sensor
+        # only if no BME280 reading is available (e.g. not installed).
+        bme_fresh = sensor_state["bme_ok"] and (now - sensor_state["bme_last_poll"] <= STALE_AFTER_SEC)
         if mlx_fresh:
-            delta = sensor_state["mlx_ambient_c"] - sensor_state["mlx_sky_c"]
+            ambient_ref_c = sensor_state["bme_temp_c"] if bme_fresh else sensor_state["mlx_ambient_c"]
+            delta = ambient_ref_c - sensor_state["mlx_sky_c"]
             gate_mlx_cloud = delta >= loc["clear_sky_delta_threshold_c"]
         else:
             gate_mlx_cloud = False
@@ -3471,8 +3482,10 @@ a{{color:var(--accent-safety);}}
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="{loc['night_threshold_deg']}">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
       <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="{loc['clear_sky_delta_threshold_c']}">
-      <p class="hint">MLX90614's (ambient − sky) must be at least this many degrees to call it "Clear" —
-      enable/disable that check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <p class="hint">(Ambient − sky) must be at least this many degrees to call it "Clear" — ambient is the
+      BME280's outside-air reading when available (falls back to the MLX90614's own onboard ambient sensor
+      otherwise, since that sensor usually sits inside the enclosure and reads warmer box air, not true
+      outside air). Enable/disable the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
       <label><input type="checkbox" name="mlcloud" {"checked" if checks['ml_cloud_enabled'] else ""}> Simple Cloud Detect ML check</label>
       <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
