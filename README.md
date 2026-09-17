@@ -21,6 +21,7 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
 | File | Purpose |
 |---|---|
 | `dome_safety_service.py` | The service - Alpaca server + web dashboard + logging, run continuously on the Pi. |
+| `Observatory_Setup_Guide.docx` | Full installation/setup guide - hardware prerequisites, installing and running the service, configuring every Settings section, connecting an ASCOM client, and publishing the project to GitHub. |
 | `preview_index.html` | A static snapshot of the dashboard's rendered HTML, for reference/preview only (not served by the app). |
 | `safety_aggregator.py` | An earlier prototype that only fused an ESP32 weather station's SafetyMonitor with simpleCloudDetect over the network - superseded by `dome_safety_service.py`, which reads all sensors directly off this Pi's own GPIO/I2C instead. Kept for history. |
 | `docker-compose.clouddetect.yml` | Compose file for running simpleCloudDetect itself (pointed at Allsky's captured image) alongside this service. |
