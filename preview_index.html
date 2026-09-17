@@ -36,30 +36,18 @@ h1{font-size:21px;margin:2px 0 2px;}
   flex:1;display:flex;align-items:center;justify-content:center;}
 .allsky-img-wrap img{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;}
 @media (min-width:741px){
-  /* Fixed 3-column layout (named areas, not auto-fit/auto-flow) so the
-     settings-groups land in exact, predictable spots: column 1 stacks
+  /* Three independent vertical stacks, not a shared grid: column 1 is
      Location & Timezone, Safety Checks, Logging, then ASCOM Device Names;
-     column 2 is Hardware Pins & Addresses (full height); column 3 stacks
-     Dome & Heater, then All Sky Camera, then Service Control - in that
-     order, so both sit above Service Control. */
-  .card.settings{display:grid;grid-template-columns:1fr 1fr 1fr;
-    grid-template-areas:"head head head" "loc hw features" "safety hw allsky" "log hw svc" "names hw svc";gap:0 28px;}
-  .card.settings h2{grid-area:head;}
-  #location-timezone{grid-area:loc;}
-  #safety-checks{grid-area:safety;}
-  #dome-heater-features{grid-area:features;}
-  #allsky-settings{grid-area:allsky;}
-  #hardware-pins{grid-area:hw;}
-  #service-control{grid-area:svc;}
-  #logging-settings{grid-area:log;}
-  #device-names{grid-area:names;}
-  /* The universal "every settings-group but the first" separator below is
-     right for the single mobile column, but on this 3-column desktop
-     layout #hardware-pins and #dome-heater-features are each the FIRST
-     item in their own column (col2/col3), not a continuation of the one
-     above them in DOM order - so undo the stray top rule just for those
-     two here. */
-  #hardware-pins,#dome-heater-features{border-top:none;margin-top:0;padding-top:0;}
+     column 2 is Hardware Pins & Addresses; column 3 is Dome & Heater, All
+     Sky Camera, then Service Control. Deliberately NOT css grid rows -
+     grid would force every item in the same row to match the tallest
+     one, so a group in one column growing taller (e.g. Dome & Heater
+     picking up new fields) used to stretch an unrelated, shorter group
+     in a different column, leaving an ugly gap under the shorter one.
+     Each .settings-col here is its own flex column, sized purely from
+     its own contents, with zero height coupling to the other two. */
+  .settings-columns{display:flex;align-items:flex-start;gap:28px;}
+  .settings-col{flex:1;min-width:0;}
 }
 .card input[type=text],.card select{width:100%;box-sizing:border-box;padding:6px 8px;margin:4px 0 2px;
       border-radius:6px;border:1px solid #ccc;font-size:14px;}
@@ -158,9 +146,9 @@ a{color:var(--accent-safety);}
 <p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a></p>
 <div class='banner banner-warn top-banner'>📍 <b>Location not set</b> — latitude/longitude are still at the 0&deg;,0&deg; placeholder, so the Day/Night sun-elevation gate is computing nonsense for your actual site. <a href='#settings'>Set your real coordinates in Settings</a>.</div>
 <div class="grid">
-<div class="card safety">
+<div class="card safety full-width">
   <h2><span class="title">🛡️ Safety Monitor <span id="safeState" class="badge badge-unsafe">UNSAFE</span></span></h2>
-  <p class="hold-countdown" id="safeHoldCountdown" >⏳ Conditions clear — reporting SAFE in <b id="safeHoldTime">3:07</b></p>
+  <p class="hold-countdown" id="safeHoldCountdown" hidden>⏳ Conditions clear — reporting SAFE in <b id="safeHoldTime">0:00</b></p>
   <p class="override-label" id="overrideLabel">Mode: Auto (sensor-based)</p>
   <div class="btn-row">
     <a href="/override?mode=safe"><button class="btn btn-safe">Force SAFE</button></a>
@@ -169,32 +157,23 @@ a{color:var(--accent-safety);}
   </div>
   <div id="warningBanner"><div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> Rain disabled &mdash; see <a href='/config'>Settings</a></div></div>
   <hr class="sep">
-  <div id="daynightBlock"><p class="field field-grid muted"><span class="col-dot"></span><span class="col-icon">🕐</span><span class="col-text">Friday, September 11, 2026 03:42:07 P.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="Day/Night check: FAILING — it's daytime (sun elevation 12.3&deg; &gt; threshold -12.0&deg;)."></span></span><span class="col-icon">☀️</span><span class="col-text"><b>Daytime</b> <span class='muted'>(sun elevation 12.3&deg;, threshold -12.0&deg;)</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Dusk <b>08:15 P.M.</b> &nbsp;&middot;&nbsp; Dawn <b>05:40 A.M.</b></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Nighttime</b> at 11:28 P.M.</span></p></div>
+  <div id="daynightBlock"><p class="field field-grid warn-text"><span class="col-dot"><span class="status-dot dot-safe" title="Day/Night check: passing."></span></span><span class="col-icon">⚠️</span><span class="col-text">Clock not synced — treated as daytime/unsafe</span></p></div>
   <hr class="sep">
-  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="MLX90614 clear-sky check: FAILING — reads Cloudy."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>-10.2&deg;C</b> &nbsp;
-  🌬️ <b>17.9&deg;C</b>
-  (Cloudy)
-  <span class="tag">MLX90614</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Clear</b> at 01:58 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>WET</b> at 12:58 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="Simple Cloud Detect ML check: FAILING — reports Cloudy, or the service is unreachable/its reading is stale."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Cloudy</b> <span class="muted">(88%)</span>
-  &nbsp; <a href="http://192.168.2.147:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Clear</b> at 02:13 A.M.</span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>18.4&deg;C</b> &nbsp;
-  💧 <b>55.2%</b> &nbsp;
-  🎚️ <b>1012 hPa</b>
-  <span class="tag">BME280</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">📦</span><span class="col-text">Box: 🌡️ <b>19.8&deg;C</b> &nbsp;
-  💧 <b>48.0%</b>
-  <span class="tag">DHT11</span></span></p></div>
+  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="MLX90614 clear-sky check: passing — ambient-vs-sky delta indicates Clear."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>N/A</b> &nbsp;
+  🌬️ <b>N/A</b>
+  (Unknown &mdash; no reading yet)
+  <span class="tag">MLX90614</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Simple Cloud Detect ML check: passing — reports Unknown and is reachable."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Unknown</b> <span class="muted">(0%)</span>
+  &nbsp; <a href="http://localhost:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>N/A</b> &nbsp;
+  💧 <b>N/A</b> &nbsp;
+  🎚️ <b>N/A</b>
+  <span class="tag">NONE</span> <span class="tag tag-warn">⚠ Disconnected</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">📦</span><span class="col-text">Box: 🌡️ <b>N/A</b> &nbsp;
+  💧 <b>N/A</b>
+  <span class="tag">DHT11</span> <span class="tag tag-warn">⚠ Disconnected</span></span></p></div>
   <p class="hint">Enable/disable individual checks and the SAFE-report hold delay under
   <a href="#safety-checks">Settings → Safety Checks</a>.</p>
 </div>
 
-<div class="card allsky" id="allsky">
-  <h2><span class="title">🌌 All Sky</span></h2>
-  <div class="allsky-img-wrap">
-    <img id="allskyImg" src="https://picsum.photos/640/360?_t=1789439301" alt="Latest all-sky camera image"
-     onerror="this.dataset.broken='1';var s=document.getElementById('allskyStatus');if(s)s.textContent='Image failed to load — check the location under Settings → All Sky Camera.';"
-     onload="if(this.dataset.broken!=='1'){var s=document.getElementById('allskyStatus');if(s)s.textContent='Updated '+new Date().toLocaleTimeString();} this.dataset.broken='';">
-  </div>
-  <p class="hint" id="allskyStatus">Loading&hellip;</p>
-  <p class='hint'><a href='http://192.168.1.50/allsky/' target='_blank' rel='noopener'>View full All Sky page &rarr;</a></p>
-</div>
+
 
 <div class="card dome" id="dome">
   <h2><span class="title">🚪 Dome <span id="domeState" class="badge badge-fault">UNKNOWN</span></span></h2>
@@ -210,31 +189,34 @@ a{color:var(--accent-safety);}
    <fieldset >
     
     <div class="setting-row">
-      <label><input type="checkbox" name="openEnable" checked> Enable automatic OPEN</label>
-      <input type="time" name="openTime" value="06:30">
+      <label><input type="checkbox" name="openEnable" > Enable automatic OPEN</label>
+      <input type="time" name="openTime" value="19:30">
     </div>
     <div class="setting-row">
-      <label><input type="checkbox" name="closeEnable" checked> Enable automatic CLOSE</label>
-      <input type="time" name="closeTime" value="20:00">
+      <label><input type="checkbox" name="closeEnable" > Enable automatic CLOSE</label>
+      <input type="time" name="closeTime" value="05:45">
     </div>
     <p class="hint">The two OPEN/CLOSE boxes above are a one-time daily schedule — each switches itself
     back off after it fires once; re-check it to arm that occurrence again.</p>
+    <p class="hint">Dome movement timing (how long to ignore the reed switch after OPEN, and how long
+    before assuming a move finished) now lives under
+    <a href="#dome-heater-features">Settings → Dome &amp; Heater</a>.</p>
     <hr class="sep">
     <div class="setting-row">
-      <label><input type="checkbox" name="autoCloseEnable" checked> Auto-close roof if UNSAFE for this many seconds:</label>
+      <label><input type="checkbox" name="autoCloseEnable" > Auto-close roof if UNSAFE for this many seconds:</label>
       <input type="number" name="autoCloseSeconds" value="60" class="narrow-number">
     </div>
     <div class="setting-row">
       <label><input type="checkbox" name="autoOpenEnable" > Auto-open roof if SAFE for this many seconds:</label>
-      <input type="number" name="autoOpenSeconds" value="90" class="narrow-number">
+      <input type="number" name="autoOpenSeconds" value="60" class="narrow-number">
     </div>
     <p class="hint">These two are standing safety guards, not one-time events — they stay checked or
     unchecked exactly as you set them and keep firing every time the condition occurs, so a stretch of
     UNSAFE always closes the roof (and a stretch of SAFE always reopens it) without you re-arming anything.</p>
     <hr class="sep">
     <div class="setting-row">
-      <label><input type="checkbox" name="rainAutoCloseEnable" checked disabled> Auto-close roof if Rain for this many seconds:</label>
-      <input type="number" name="rainAutoCloseSeconds" value="30" class="narrow-number" disabled>
+      <label><input type="checkbox" name="rainAutoCloseEnable"  disabled> Auto-close roof if Rain for this many seconds:</label>
+      <input type="number" name="rainAutoCloseSeconds" value="0" class="narrow-number" disabled>
     </div>
     <p class='hint hint-warn'>Greyed out because the RG-9 rain sensor is disabled under <a href='#hardware-pins'>Hardware Pins</a> — enable it there first, since it means the RG-9 isn't wired/trusted yet.</p>
     <p><button type="submit" class="btn btn-dome">Save schedule</button></p>
@@ -274,6 +256,9 @@ a{color:var(--accent-safety);}
 <div class="card settings" id="settings">
   <h2><span class="title">⚙️ Settings</span></h2>
 
+  <div class="settings-columns">
+  <div class="settings-col">
+
   <div class="settings-group" id="location-timezone">
     <h3>Location &amp; Timezone</h3>
     <form action="/save-location" method="get">
@@ -297,10 +282,18 @@ a{color:var(--accent-safety);}
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="-12.0">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
       <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="15.0">
-      <p class="hint">MLX90614's (ambient − sky) must be at least this many degrees to call it "Clear" —
-      enable/disable that check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <p class="hint">(Ambient − sky) must be at least this many degrees to call it "Clear" — ambient is the
+      BME280's outside-air reading when available (falls back to the MLX90614's own onboard ambient sensor
+      otherwise, since that sensor usually sits inside the enclosure and reads warmer box air, not true
+      outside air). Enable/disable the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
       <label><input type="checkbox" name="mlcloud" checked> Simple Cloud Detect ML check</label>
-      <label><input type="checkbox" name="safedelay" checked> Hold before reporting SAFE</label>
+      <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
+      <input type="text" name="mlcloudignore" value="" placeholder="e.g. Glare, Fogged Lens">
+      <p class="hint">If simpleCloudDetect's latest frame is classified as one of these, it's skipped entirely —
+      the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
+      classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
+      (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
+      <label><input type="checkbox" name="safedelay" > Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="5">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
       reported immediately — this delay only applies to a transition back to SAFE.</p>
@@ -308,44 +301,67 @@ a{color:var(--accent-safety);}
     </form>
   </div>
 
-  <div class="settings-group" id="dome-heater-features">
-    <h3>Dome &amp; Heater</h3>
-    <p class="hint">Turn a whole subsystem off if you don't have it at all — e.g. no motorized roof, or
-    no dew/frost heater. Takes effect immediately, no restart needed.</p>
-    <form action="/save-features" method="get">
-      <label><input type="checkbox" name="domeEnable" checked> Enable Dome control</label>
-      <p class="hint">Off: OPEN/CLOSE, the schedule, safety auto-close/open, and rain auto-close all stop
-      issuing commands; the reed switch is no longer read; and the ASCOM Dome device reports Not Connected
-      to any client that tries to use it — the same as if the ASCOM dome service itself were stopped.</p>
-      <label><input type="checkbox" name="heaterEnable" checked> Enable Heater control</label>
-      <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
-      output is forced off.</p>
-      <button type="submit" class="btn btn-neutral">Save Dome &amp; Heater</button>
+  <div class="settings-group" id="logging-settings">
+    <h3>Logging</h3>
+    <form action="/save-logging" method="get">
+      <label>Keep All Sky log images for this many days</label>
+      <input type="number" name="imgdays" min="1" value="30" class="narrow-number">
+      <label>Keep old weekly log files for this many days</label>
+      <input type="number" name="logdays" min="1" value="90" class="narrow-number">
+      <p class="hint">Event log text always rotates to a new file every week — these two just control
+      cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
+      above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
+      <hr class="sep">
+      <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
+      checking "what did the sky actually look like when this changed" while a new setup is being shaken
+      out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgDaynight" checked> Day/Night change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgRain" checked> Rain sensor change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgMlx" checked> Sky/ambient temperature (MLX90614) change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgMlcloud" checked> ML cloud detection change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgOverall" checked> Overall SAFE/UNSAFE change</label>
+      </div>
+      <button type="submit" class="btn btn-neutral">Save logging settings</button>
+    </form>
+    <hr class="sep">
+    <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
+    unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
+    nothing left to show.</p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-unsafe"
+       onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
+    </div>
+    <p class="hint" id="clearImagesStatus"></p>
+  </div>
+
+  <div class="settings-group" id="device-names">
+    <h3>ASCOM Device Names</h3>
+    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
+    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
+    clients only re-read this list occasionally, so a change may not show up there until the client itself
+    refreshes it.</p>
+    <form action="/save-device-names" method="get">
+      <label>Safety Monitor</label>
+      <input type="text" name="safetyName" value="Observatory Combined Safety Monitor">
+      <label>Dome</label>
+      <input type="text" name="domeName" value="Observatory Roof Dome">
+      <label>Observing Conditions</label>
+      <input type="text" name="obsName" value="Observatory Environment Sensors">
+      <button type="submit" class="btn btn-neutral">Save device names</button>
     </form>
   </div>
 
-  <div class="settings-group" id="allsky-settings">
-    <h3>All Sky Camera</h3>
-    <p class="hint">Shows the latest frame from a separate all-sky camera (e.g. Thomas Jacquin's Allsky
-    software running on this Pi or another device) next to the Safety Monitor. Off by default since
-    there's no sensible default location — set one below, then check the box. Takes effect on next
-    page load.</p>
-    <form action="/save-allsky" method="get">
-      <label><input type="checkbox" name="allskyEnable" checked> Show All Sky section</label>
-      <label>Image location</label>
-      <input type="text" name="imageLocation" value="https://picsum.photos/640/360"
-       placeholder="http://192.168.1.50/allsky/image.jpg  or  /home/pi/allsky/images/image.jpg">
-      <p class="hint">An http(s):// URL is loaded straight from wherever it points (e.g. another device's
-      own all-sky web server); a plain file path is read directly off this Pi's disk and refreshed
-      automatically, so it always shows the latest frame written there.</p>
-      <label>All Sky page link (optional)</label>
-      <input type="text" name="pageUrl" value="http://192.168.1.50/allsky/"
-       placeholder="http://192.168.1.50/allsky/">
-      <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
-      it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
-      <button type="submit" class="btn btn-neutral">Save All Sky</button>
-    </form>
   </div>
+  <div class="settings-col">
 
   <div class="settings-group" id="hardware-pins">
     <h3>Hardware Pins &amp; Addresses (GPIO / I2C)</h3>
@@ -418,6 +434,65 @@ a{color:var(--accent-safety);}
     </form>
   </div>
 
+  </div>
+  <div class="settings-col">
+
+  <div class="settings-group" id="dome-heater-features">
+    <h3>Dome &amp; Heater</h3>
+    <p class="hint">Turn a whole subsystem off if you don't have it at all — e.g. no motorized roof, or
+    no dew/frost heater. Takes effect immediately, no restart needed.</p>
+    <form action="/save-features" method="get">
+      <label><input type="checkbox" name="domeEnable" checked> Enable Dome control</label>
+      <p class="hint">Off: OPEN/CLOSE, the schedule, safety auto-close/open, and rain auto-close all stop
+      issuing commands; the reed switch is no longer read; and the ASCOM Dome device reports Not Connected
+      to any client that tries to use it — the same as if the ASCOM dome service itself were stopped.</p>
+      <label><input type="checkbox" name="heaterEnable" checked> Enable Heater control</label>
+      <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
+      output is forced off.</p>
+      <hr class="sep">
+      <div class="setting-row">
+        <label>Ignore reed switch for this many seconds after OPEN is commanded:</label>
+        <input type="number" step="0.5" name="openIgnoreSec" value="10" class="narrow-number">
+      </div>
+      <div class="setting-row">
+        <label>Assume the move finished after this many seconds if the reed switch never confirms it:</label>
+        <input type="number" step="0.5" name="moveAssumeSec" value="30" class="narrow-number">
+      </div>
+      <p class="hint">There's only one reed switch, mounted at the CLOSED position — it can reliably confirm
+      CLOSED, but nothing can confirm a true fully-OPEN position. Right after OPEN is commanded the roof
+      hasn't physically moved yet, so the first setting keeps the state machine from reading "still closed"
+      as a failure before the roof has had a chance to move; after that, if the switch still reads closed
+      once the second setting's time has passed, it's reported CLOSED (the roof really didn't move) —
+      otherwise it's reported OPEN once that same time elapses, since nothing can confirm OPEN directly.
+      CLOSE always reports CLOSED the instant the reed switch confirms it, and also falls back to CLOSED
+      (with a logged warning) if the switch never confirms within the second setting's time.</p>
+      <button type="submit" class="btn btn-neutral">Save Dome &amp; Heater</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="allsky-settings">
+    <h3>All Sky Camera</h3>
+    <p class="hint">Shows the latest frame from a separate all-sky camera (e.g. Thomas Jacquin's Allsky
+    software running on this Pi or another device) next to the Safety Monitor. Off by default since
+    there's no sensible default location — set one below, then check the box. Takes effect on next
+    page load.</p>
+    <form action="/save-allsky" method="get">
+      <label><input type="checkbox" name="allskyEnable" > Show All Sky section</label>
+      <label>Image location</label>
+      <input type="text" name="imageLocation" value=""
+       placeholder="http://192.168.1.50/allsky/image.jpg  or  /home/pi/allsky/images/image.jpg">
+      <p class="hint">An http(s):// URL is loaded straight from wherever it points (e.g. another device's
+      own all-sky web server); a plain file path is read directly off this Pi's disk and refreshed
+      automatically, so it always shows the latest frame written there.</p>
+      <label>All Sky page link (optional)</label>
+      <input type="text" name="pageUrl" value=""
+       placeholder="http://192.168.1.50/allsky/">
+      <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
+      it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
+      <button type="submit" class="btn btn-neutral">Save All Sky</button>
+    </form>
+  </div>
+
   <div class="settings-group" id="service-control">
     <h3>Service Control</h3>
     <p class="hint hint-warn">Both act immediately once confirmed — the page (and for a reboot, the whole
@@ -436,63 +511,7 @@ a{color:var(--accent-safety);}
     and confirm the systemctl path with <code>which systemctl</code>.)</p>
   </div>
 
-  <div class="settings-group" id="logging-settings">
-    <h3>Logging</h3>
-    <form action="/save-logging" method="get">
-      <label>Keep All Sky log images for this many days</label>
-      <input type="number" name="imgdays" min="1" value="30" class="narrow-number">
-      <label>Keep old weekly log files for this many days</label>
-      <input type="number" name="logdays" min="1" value="90" class="narrow-number">
-      <p class="hint">Event log text always rotates to a new file every week — these two just control
-      cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
-      above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
-      <hr class="sep">
-      <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
-      checking "what did the sky actually look like when this changed" while a new setup is being shaken
-      out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgDaynight" checked> Day/Night change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgRain" checked> Rain sensor change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgMlx" checked> Sky/ambient temperature (MLX90614) change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgMlcloud" checked> ML cloud detection change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgOverall" checked> Overall SAFE/UNSAFE change</label>
-      </div>
-      <button type="submit" class="btn btn-neutral">Save logging settings</button>
-    </form>
-    <hr class="sep">
-    <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
-    unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
-    nothing left to show.</p>
-    <div class="btn-row">
-      <button type="button" class="btn btn-unsafe"
-       onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
-    </div>
-    <p class="hint" id="clearImagesStatus"></p>
   </div>
-
-  <div class="settings-group" id="device-names">
-    <h3>ASCOM Device Names</h3>
-    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
-    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
-    clients only re-read this list occasionally, so a change may not show up there until the client itself
-    refreshes it.</p>
-    <form action="/save-device-names" method="get">
-      <label>Safety Monitor</label>
-      <input type="text" name="safetyName" value="Observatory Combined Safety Monitor">
-      <label>Dome</label>
-      <input type="text" name="domeName" value="Observatory Roof Dome">
-      <label>Observing Conditions</label>
-      <input type="text" name="obsName" value="Observatory Environment Sensors">
-      <button type="submit" class="btn btn-neutral">Save device names</button>
-    </form>
   </div>
 </div>
 </div>
@@ -544,7 +563,7 @@ setInterval(tickHoldCountdown,1000);
 
 function poll(){
   fetch('/fragments').then(r=>r.json()).then(d=>{
-    var domeBadgeMap={OPEN:'badge-open',CLOSED:'badge-closed',OPENING:'badge-moving',CLOSING:'badge-moving',STUCK:'badge-fault',UNKNOWN:'badge-fault',DISABLED:'badge-disabled'};
+    var domeBadgeMap={OPEN:'badge-open',CLOSED:'badge-closed',OPENING:'badge-moving',CLOSING:'badge-moving',UNKNOWN:'badge-fault',DISABLED:'badge-disabled'};
     var domeEl=document.getElementById('domeState');
     domeEl.textContent=d.dome_state;
     domeEl.className='badge '+(domeBadgeMap[d.dome_state]||'badge-fault');
@@ -607,7 +626,7 @@ function allskyCacheBust(url){
 }
 function allskyReload(){
   var img = document.getElementById('allskyImg');
-  if (img) img.src = allskyCacheBust('https://picsum.photos/640/360');
+  if (img) img.src = allskyCacheBust('/allsky-image');
 }
 var allskyLastVersion = null;
 var allskyTick = 0;
