@@ -111,7 +111,6 @@ STALE_AFTER_SEC = 30
 DOME_TICK_SEC = 0.2
 DISPLAY_UPDATE_SEC = 1.0
 
-MOVE_TIMEOUT_SEC = 30.0
 SENSOR_DEBOUNCE_SEC = 0.05
 IDLE_STATE_CONFIRM_SEC = 3.0
 RELAY_PULSE_SEC = 0.5
@@ -141,6 +140,32 @@ DEFAULT_SETTINGS = {
     "rain_auto_close": {
         "enabled": False,
         "sustained_rain_seconds": 0,   # 0 = close the instant rain is detected
+    },
+    # Timing for the Dome state machine's OPEN/CLOSE moves. There's only a
+    # single reed switch, mounted at the CLOSED position (see "pins" ->
+    # reed_gpio) - it can reliably confirm CLOSED, but there's no sensor at
+    # all that can confirm a true fully-OPEN position. See DomeController
+    # below for exactly how these two are used.
+    "dome_timing": {
+        # Right after OPEN is commanded, the reed switch is still sitting at
+        # (or very near) the closed position - the roof hasn't physically
+        # cleared it yet, so a normal "still closed" reading here doesn't
+        # mean anything is wrong. Ignore the reed switch entirely for this
+        # many seconds after an OPEN command, so that normal reading can't
+        # get mistaken for a failed open and flip the status straight back
+        # to CLOSED before the roof has even had a chance to move.
+        "open_ignore_sensor_sec": 10.0,
+        # After that grace period, OPEN has no sensor that can ever confirm
+        # true "open" - so once this many seconds (measured from when OPEN
+        # was commanded) have passed with the reed switch no longer reading
+        # closed, the move is simply assumed complete and reported OPEN.
+        # CLOSE uses this the other way around: the reed switch usually
+        # confirms CLOSED immediately once it happens (no waiting needed),
+        # but if it never does within this many seconds, CLOSE is also
+        # assumed complete anyway rather than showing an ambiguous fault -
+        # a warning is still written to the Event Log so it doesn't go
+        # unnoticed.
+        "move_assume_sec": 30.0,
     },
     "safety_checks": {
         "daynight_enabled": True,
@@ -1471,7 +1496,6 @@ STATE_OPEN = "OPEN"
 STATE_CLOSED = "CLOSED"
 STATE_OPENING = "OPENING"
 STATE_CLOSING = "CLOSING"
-STATE_STUCK = "STUCK"
 STATE_DISABLED = "DISABLED"  # Dome feature turned off under Settings -> Dome & Heater
 
 MOVE_NONE = None
@@ -1480,7 +1504,7 @@ MOVE_CLOSING = "CLOSING"
 
 ALPACA_SHUTTER_CODE = {
     STATE_OPEN: 0, STATE_CLOSED: 1, STATE_OPENING: 2, STATE_CLOSING: 3,
-    STATE_UNKNOWN: 4, STATE_STUCK: 4, STATE_DISABLED: 4,
+    STATE_UNKNOWN: 4, STATE_DISABLED: 4,
 }
 
 
@@ -1571,32 +1595,59 @@ class DomeController:
 
             if self.move_direction != MOVE_NONE:
                 self.idle_mismatch_active = False
-                timed_out = (now - self.move_start_time) > MOVE_TIMEOUT_SEC
+                timing = get_setting("dome_timing")
+                move_assume_sec = timing["move_assume_sec"]
+                elapsed = now - self.move_start_time
 
                 if self.move_direction == MOVE_OPENING:
-                    if self.dome_open_raw:
+                    ignore_sensor_sec = timing["open_ignore_sensor_sec"]
+                    if elapsed < ignore_sensor_sec:
+                        # Roof hasn't had time to physically clear the
+                        # (closed-position) reed switch yet - a normal
+                        # "still closed" reading here means nothing, so
+                        # don't even look at the sensor yet.
+                        self.state = STATE_OPENING
+                    elif not self.dome_open_raw:
+                        # Past the grace window and the reed switch STILL
+                        # reads closed - the roof never actually left the
+                        # closed position (relay/motor/linkage problem).
+                        # There's no sensor that can ever confirm a true
+                        # OPEN position, but this one just reliably told us
+                        # "definitely still closed" - trust that over the
+                        # timer and report what's actually true.
+                        self.state = STATE_CLOSED
+                        self.move_direction = MOVE_NONE
+                        print("[dome] ERROR: still reads CLOSED well after OPEN was commanded")
+                        pending_logs.append(("Dome FAULT: commanded OPEN but the reed switch still reads "
+                                              "CLOSED - the roof does not appear to have moved (relay/motor/"
+                                              "linkage may be disconnected)", "error"))
+                    elif elapsed >= move_assume_sec:
+                        # Reed switch confirms it left the closed position
+                        # and stayed away. There's no sensor for a true OPEN
+                        # position, so after the assumed travel time, trust
+                        # the command and call it done.
                         self.state = STATE_OPEN
                         self.move_direction = MOVE_NONE
-                    elif timed_out:
-                        self.state = STATE_STUCK
-                        self.move_direction = MOVE_NONE
-                        print("[dome] ERROR: dome did not confirm OPEN before timeout")
-                        pending_logs.append(("Dome FAULT: did not confirm OPEN before timeout "
-                                              f"({MOVE_TIMEOUT_SEC:g}s) - reed/relay may be disconnected "
-                                              "or the roof is physically stuck", "error"))
                     else:
                         self.state = STATE_OPENING
                 else:
                     if not self.dome_open_raw:
+                        # Fast path: the reed switch confirms CLOSED the
+                        # moment it happens - no need to wait out a timer.
                         self.state = STATE_CLOSED
                         self.move_direction = MOVE_NONE
-                    elif timed_out:
-                        self.state = STATE_STUCK
+                    elif elapsed >= move_assume_sec:
+                        # The reed switch never confirmed closed within the
+                        # assumed travel time either - still just trust the
+                        # command rather than showing an ambiguous fault
+                        # state, but log a warning so it doesn't go
+                        # unnoticed (the reed/wiring may need a look).
+                        self.state = STATE_CLOSED
                         self.move_direction = MOVE_NONE
-                        print("[dome] ERROR: dome did not confirm CLOSED before timeout")
-                        pending_logs.append(("Dome FAULT: did not confirm CLOSED before timeout "
-                                              f"({MOVE_TIMEOUT_SEC:g}s) - reed/relay may be disconnected "
-                                              "or the roof is physically stuck", "error"))
+                        print("[dome] WARNING: CLOSE assumed complete without reed confirmation")
+                        pending_logs.append(("Dome WARNING: commanded CLOSE but the reed switch never "
+                                              f"confirmed closed within {move_assume_sec:g}s - assuming "
+                                              "closed anyway; double-check the reed switch/wiring", "warn"))
                     else:
                         self.state = STATE_CLOSING
                 return
@@ -2677,6 +2728,10 @@ def save_features():
     def patch(s):
         s["features"]["dome_enabled"] = "domeEnable" in request.args
         s["features"]["heater_enabled"] = "heaterEnable" in request.args
+        if "openIgnoreSec" in request.args:
+            s["dome_timing"]["open_ignore_sensor_sec"] = max(0.0, float(request.args["openIgnoreSec"]))
+        if "moveAssumeSec" in request.args:
+            s["dome_timing"]["move_assume_sec"] = max(0.0, float(request.args["moveAssumeSec"]))
     update_settings(patch)
     _log_event("Settings", "Dome & Heater Features settings saved")
     return "", 302, {"Location": "/#dome-heater-features"}
@@ -3087,6 +3142,7 @@ def web_index():
     auto_close = get_setting("safety_auto_close")
     auto_open = get_setting("safety_auto_open")
     rain_auto_close = get_setting("rain_auto_close")
+    dome_timing = get_setting("dome_timing")
     pins = get_setting("pins")
     hw = get_setting("hw_enabled")
     sensor_names = get_setting("sensor_names")
@@ -3161,7 +3217,7 @@ def web_index():
     dome_badge_class = {
         "OPEN": "badge-open", "CLOSED": "badge-closed",
         "OPENING": "badge-moving", "CLOSING": "badge-moving",
-        "STUCK": "badge-fault", "UNKNOWN": "badge-fault", "DISABLED": "badge-disabled",
+        "UNKNOWN": "badge-fault", "DISABLED": "badge-disabled",
     }.get(dome_state, "badge-fault")
 
     dome_disabled_banner_html = (
@@ -3400,6 +3456,9 @@ a{{color:var(--accent-safety);}}
     </div>
     <p class="hint">The two OPEN/CLOSE boxes above are a one-time daily schedule — each switches itself
     back off after it fires once; re-check it to arm that occurrence again.</p>
+    <p class="hint">Dome movement timing (how long to ignore the reed switch after OPEN, and how long
+    before assuming a move finished) now lives under
+    <a href="#dome-heater-features">Settings → Dome &amp; Heater</a>.</p>
     <hr class="sep">
     <div class="setting-row">
       <label><input type="checkbox" name="autoCloseEnable" {"checked" if auto_close['enabled'] else ""}> Auto-close roof if UNSAFE for this many seconds:</label>
@@ -3507,6 +3566,23 @@ a{{color:var(--accent-safety);}}
       <label><input type="checkbox" name="heaterEnable" {"checked" if heater_enabled else ""}> Enable Heater control</label>
       <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
       output is forced off.</p>
+      <hr class="sep">
+      <div class="setting-row">
+        <label>Ignore reed switch for this many seconds after OPEN is commanded:</label>
+        <input type="number" step="0.5" name="openIgnoreSec" value="{dome_timing['open_ignore_sensor_sec']:g}" class="narrow-number">
+      </div>
+      <div class="setting-row">
+        <label>Assume the move finished after this many seconds if the reed switch never confirms it:</label>
+        <input type="number" step="0.5" name="moveAssumeSec" value="{dome_timing['move_assume_sec']:g}" class="narrow-number">
+      </div>
+      <p class="hint">There's only one reed switch, mounted at the CLOSED position — it can reliably confirm
+      CLOSED, but nothing can confirm a true fully-OPEN position. Right after OPEN is commanded the roof
+      hasn't physically moved yet, so the first setting keeps the state machine from reading "still closed"
+      as a failure before the roof has had a chance to move; after that, if the switch still reads closed
+      once the second setting's time has passed, it's reported CLOSED (the roof really didn't move) —
+      otherwise it's reported OPEN once that same time elapses, since nothing can confirm OPEN directly.
+      CLOSE always reports CLOSED the instant the reed switch confirms it, and also falls back to CLOSED
+      (with a logged warning) if the switch never confirms within the second setting's time.</p>
       <button type="submit" class="btn btn-neutral">Save Dome &amp; Heater</button>
     </form>
   </div>
@@ -3737,7 +3813,7 @@ setInterval(tickHoldCountdown,1000);
 
 function poll(){{
   fetch('/fragments').then(r=>r.json()).then(d=>{{
-    var domeBadgeMap={{OPEN:'badge-open',CLOSED:'badge-closed',OPENING:'badge-moving',CLOSING:'badge-moving',STUCK:'badge-fault',UNKNOWN:'badge-fault',DISABLED:'badge-disabled'}};
+    var domeBadgeMap={{OPEN:'badge-open',CLOSED:'badge-closed',OPENING:'badge-moving',CLOSING:'badge-moving',UNKNOWN:'badge-fault',DISABLED:'badge-disabled'}};
     var domeEl=document.getElementById('domeState');
     domeEl.textContent=d.dome_state;
     domeEl.className='badge '+(domeBadgeMap[d.dome_state]||'badge-fault');
