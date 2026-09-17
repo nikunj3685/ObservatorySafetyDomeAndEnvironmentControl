@@ -172,6 +172,16 @@ DEFAULT_SETTINGS = {
         "rain_enabled": False,       # off until the RG-9 is actually wired to GPIO17
         "mlx_cloud_enabled": True,   # the ESP32's own ambient-vs-sky delta check
         "ml_cloud_enabled": True,    # simpleCloudDetect's ML classifier - new vs. the ESP32
+        # Comma-separated simpleCloudDetect class name(s) (case-insensitive)
+        # to treat as "ignore this frame" - e.g. a custom Teachable Machine
+        # class trained on bad/glare/fogged-lens frames. When the latest
+        # poll matches one of these, the reading is NOT applied: cloud_class/
+        # cloud_safe/cloud_confidence all stay frozen at whatever they were
+        # before, so the SAFE/UNSAFE decision and the displayed status keep
+        # using the last trusted frame instead of the unreliable one. Empty
+        # by default (feature off) since no such class exists until one is
+        # trained and named in Teachable Machine.
+        "ml_cloud_ignore_classes": "",
     },
     "location": {
         "latitude_deg": 0.0,
@@ -785,6 +795,10 @@ sensor_state = {
 
     "cloud_ok": False, "cloud_last_poll": 0.0,
     "cloud_safe": False, "cloud_class": "Unknown", "cloud_confidence": 0.0,
+    "cloud_ignored": False,  # True when the most recent poll matched an
+                             # "ignore this frame" class and was skipped -
+                             # cloud_class/cloud_safe/cloud_confidence above
+                             # are the last trusted (non-ignored) reading.
 
     # derived environment source (BME280 preferred, DHT11 fallback - matches the ESP32)
     "env_ok": False, "env_temp_c": None, "env_humidity": None, "env_source": "NONE",
@@ -895,12 +909,26 @@ def poll_clouddetect():
         r.raise_for_status()
         data = r.json()
         detection = data.get("detection", {})
+        class_name = detection.get("class_name", "Unknown")
+        ignore_raw = get_setting("safety_checks", "ml_cloud_ignore_classes") or ""
+        ignore_classes = {c.strip().lower() for c in ignore_raw.split(",") if c.strip()}
         with sensor_lock:
+            # Mark the sensor as reachable/fresh either way - an ignored
+            # frame still means the camera/model answered, it's just not a
+            # frame we trust enough to act on. Don't let "ignore" also read
+            # as "disconnected".
             sensor_state["cloud_ok"] = True
-            sensor_state["cloud_safe"] = bool(data.get("is_safe", False))
-            sensor_state["cloud_class"] = detection.get("class_name", "Unknown")
-            sensor_state["cloud_confidence"] = detection.get("confidence_score", 0.0)
             sensor_state["cloud_last_poll"] = time.time()
+            if class_name.strip().lower() in ignore_classes:
+                # Freeze cloud_class/cloud_safe/cloud_confidence at whatever
+                # they already were - the SAFE/UNSAFE gate and the displayed
+                # status both keep using the last trusted reading.
+                sensor_state["cloud_ignored"] = True
+            else:
+                sensor_state["cloud_ignored"] = False
+                sensor_state["cloud_safe"] = bool(data.get("is_safe", False))
+                sensor_state["cloud_class"] = class_name
+                sensor_state["cloud_confidence"] = detection.get("confidence_score", 0.0)
     except Exception as e:
         print(f"[sensor] simpleCloudDetect unreachable: {e}")
         with sensor_lock:
@@ -2497,6 +2525,7 @@ def livestatus():
         "mlx_ambient_c": s["mlx_ambient_c"], "mlx_sky_c": s["mlx_sky_c"],
         "rain_detected": s["rain_detected"],
         "cloud_class": s["cloud_class"], "cloud_confidence": s["cloud_confidence"],
+        "cloud_ignored": s["cloud_ignored"],
         "heater_mode": heater_mode, "heater_target_percent": h["target_power_percent"],
         "heater_auto_percent": h["auto_power_percent"], "heater_on": h["on"],
         "heater_sensor_missing": h["sensor_missing"],
@@ -2697,6 +2726,8 @@ def save_checks():
         # each sensor's wiring settings. Deliberately not touched by this
         # form anymore so saving Safety Checks can't silently reset them.
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
+        if "mlcloudignore" in request.args:
+            s["safety_checks"]["ml_cloud_ignore_classes"] = request.args["mlcloudignore"].strip()
         if "thresh" in request.args:
             s["location"]["night_threshold_deg"] = float(request.args["thresh"])
         if "delta" in request.args:
@@ -3053,6 +3084,8 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
 
     ml_row = _field_row(ml_cloud_dot, "☁️", f"""Simple Cloud Detect: <b>{s['cloud_class']}</b> <span class="muted">({s['cloud_confidence']:.0f}%)</span>
   &nbsp; <a href="{clouddetect_link}" target="_blank" rel="noopener">View cloud detect &rarr;</a>""")
+    if s.get("cloud_ignored"):
+        ml_row += _field_row("", "", "Latest frame was an ignored class - showing the last trusted reading above.", "prev-status")
     mlcloud_prev = _prev_status_text(s["mlcloud_prev_state"], s["mlcloud_prev_since"], tz_name)
     if mlcloud_prev:
         ml_row += _field_row("", "", mlcloud_prev, "prev-status")
@@ -3546,6 +3579,12 @@ a{{color:var(--accent-safety);}}
       otherwise, since that sensor usually sits inside the enclosure and reads warmer box air, not true
       outside air). Enable/disable the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
       <label><input type="checkbox" name="mlcloud" {"checked" if checks['ml_cloud_enabled'] else ""}> Simple Cloud Detect ML check</label>
+      <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
+      <input type="text" name="mlcloudignore" value="{checks['ml_cloud_ignore_classes']}" placeholder="e.g. Glare, Fogged Lens">
+      <p class="hint">If simpleCloudDetect's latest frame is classified as one of these, it's skipped entirely —
+      the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
+      classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
+      (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
       <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always

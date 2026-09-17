@@ -8,7 +8,7 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
   1. Day/Night, from solar elevation at your configured lat/long/timezone
   2. Rain (RG-9 sensor)
   3. MLX90614 ambient-vs-sky clear/cloud delta
-  4. [simpleCloudDetect](https://github.com/chvvkumar/simpleclouddetect)'s ML sky classification, from an all-sky camera feed
+  4. [simpleCloudDetect](https://github.com/chvvkumar/simpleclouddetect)'s ML sky classification, from an all-sky camera feed - optionally, one or more of its classification classes (e.g. a custom "Glare" class trained on frames a nearby light washes out) can be configured to be ignored entirely, keeping the last trusted reading instead of reacting to that frame
   A manual Force-SAFE / Force-UNSAFE override can bypass all four at once.
 - **Dome** drives a roof relay + reed switch as a simple OPEN/CLOSED/MOVING state machine, with optional safety-auto-close/open and a rain-auto-close feature.
 - A dew/frost **heater** (not part of the SafetyMonitor decision - equipment protection is a separate concern from observing safety) runs AUTO ramped power based on freeze/dew-point math, or a manual power slider.
