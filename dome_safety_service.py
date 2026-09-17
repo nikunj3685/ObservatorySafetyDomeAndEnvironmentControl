@@ -3309,30 +3309,18 @@ h1{{font-size:21px;margin:2px 0 2px;}}
   flex:1;display:flex;align-items:center;justify-content:center;}}
 .allsky-img-wrap img{{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;}}
 @media (min-width:741px){{
-  /* Fixed 3-column layout (named areas, not auto-fit/auto-flow) so the
-     settings-groups land in exact, predictable spots: column 1 stacks
+  /* Three independent vertical stacks, not a shared grid: column 1 is
      Location & Timezone, Safety Checks, Logging, then ASCOM Device Names;
-     column 2 is Hardware Pins & Addresses (full height); column 3 stacks
-     Dome & Heater, then All Sky Camera, then Service Control - in that
-     order, so both sit above Service Control. */
-  .card.settings{{display:grid;grid-template-columns:1fr 1fr 1fr;
-    grid-template-areas:"head head head" "loc hw features" "safety hw allsky" "log hw svc" "names hw svc";gap:0 28px;}}
-  .card.settings h2{{grid-area:head;}}
-  #location-timezone{{grid-area:loc;}}
-  #safety-checks{{grid-area:safety;}}
-  #dome-heater-features{{grid-area:features;}}
-  #allsky-settings{{grid-area:allsky;}}
-  #hardware-pins{{grid-area:hw;}}
-  #service-control{{grid-area:svc;}}
-  #logging-settings{{grid-area:log;}}
-  #device-names{{grid-area:names;}}
-  /* The universal "every settings-group but the first" separator below is
-     right for the single mobile column, but on this 3-column desktop
-     layout #hardware-pins and #dome-heater-features are each the FIRST
-     item in their own column (col2/col3), not a continuation of the one
-     above them in DOM order - so undo the stray top rule just for those
-     two here. */
-  #hardware-pins,#dome-heater-features{{border-top:none;margin-top:0;padding-top:0;}}
+     column 2 is Hardware Pins & Addresses; column 3 is Dome & Heater, All
+     Sky Camera, then Service Control. Deliberately NOT css grid rows -
+     grid would force every item in the same row to match the tallest
+     one, so a group in one column growing taller (e.g. Dome & Heater
+     picking up new fields) used to stretch an unrelated, shorter group
+     in a different column, leaving an ugly gap under the shorter one.
+     Each .settings-col here is its own flex column, sized purely from
+     its own contents, with zero height coupling to the other two. */
+  .settings-columns{{display:flex;align-items:flex-start;gap:28px;}}
+  .settings-col{{flex:1;min-width:0;}}
 }}
 .card input[type=text],.card select{{width:100%;box-sizing:border-box;padding:6px 8px;margin:4px 0 2px;
       border-radius:6px;border:1px solid #ccc;font-size:14px;}}
@@ -3551,6 +3539,9 @@ a{{color:var(--accent-safety);}}
 <div class="card settings" id="settings">
   <h2><span class="title">⚙️ Settings</span></h2>
 
+  <div class="settings-columns">
+  <div class="settings-col">
+
   <div class="settings-group" id="location-timezone">
     <h3>Location &amp; Timezone</h3>
     <form action="/save-location" method="get">
@@ -3593,61 +3584,67 @@ a{{color:var(--accent-safety);}}
     </form>
   </div>
 
-  <div class="settings-group" id="dome-heater-features">
-    <h3>Dome &amp; Heater</h3>
-    <p class="hint">Turn a whole subsystem off if you don't have it at all — e.g. no motorized roof, or
-    no dew/frost heater. Takes effect immediately, no restart needed.</p>
-    <form action="/save-features" method="get">
-      <label><input type="checkbox" name="domeEnable" {"checked" if dome_enabled else ""}> Enable Dome control</label>
-      <p class="hint">Off: OPEN/CLOSE, the schedule, safety auto-close/open, and rain auto-close all stop
-      issuing commands; the reed switch is no longer read; and the ASCOM Dome device reports Not Connected
-      to any client that tries to use it — the same as if the ASCOM dome service itself were stopped.</p>
-      <label><input type="checkbox" name="heaterEnable" {"checked" if heater_enabled else ""}> Enable Heater control</label>
-      <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
-      output is forced off.</p>
+  <div class="settings-group" id="logging-settings">
+    <h3>Logging</h3>
+    <form action="/save-logging" method="get">
+      <label>Keep All Sky log images for this many days</label>
+      <input type="number" name="imgdays" min="1" value="{logging_cfg['image_retention_days']}" class="narrow-number">
+      <label>Keep old weekly log files for this many days</label>
+      <input type="number" name="logdays" min="1" value="{logging_cfg['log_retention_days']}" class="narrow-number">
+      <p class="hint">Event log text always rotates to a new file every week — these two just control
+      cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
+      above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
       <hr class="sep">
+      <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
+      checking "what did the sky actually look like when this changed" while a new setup is being shaken
+      out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
       <div class="setting-row">
-        <label>Ignore reed switch for this many seconds after OPEN is commanded:</label>
-        <input type="number" step="0.5" name="openIgnoreSec" value="{dome_timing['open_ignore_sensor_sec']:g}" class="narrow-number">
+        <label><input type="checkbox" name="imgDaynight" {"checked" if logging_cfg['image_on_daynight_change'] else ""}> Day/Night change</label>
       </div>
       <div class="setting-row">
-        <label>Assume the move finished after this many seconds if the reed switch never confirms it:</label>
-        <input type="number" step="0.5" name="moveAssumeSec" value="{dome_timing['move_assume_sec']:g}" class="narrow-number">
+        <label><input type="checkbox" name="imgRain" {"checked" if logging_cfg['image_on_rain_change'] else ""}> Rain sensor change</label>
       </div>
-      <p class="hint">There's only one reed switch, mounted at the CLOSED position — it can reliably confirm
-      CLOSED, but nothing can confirm a true fully-OPEN position. Right after OPEN is commanded the roof
-      hasn't physically moved yet, so the first setting keeps the state machine from reading "still closed"
-      as a failure before the roof has had a chance to move; after that, if the switch still reads closed
-      once the second setting's time has passed, it's reported CLOSED (the roof really didn't move) —
-      otherwise it's reported OPEN once that same time elapses, since nothing can confirm OPEN directly.
-      CLOSE always reports CLOSED the instant the reed switch confirms it, and also falls back to CLOSED
-      (with a logged warning) if the switch never confirms within the second setting's time.</p>
-      <button type="submit" class="btn btn-neutral">Save Dome &amp; Heater</button>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgMlx" {"checked" if logging_cfg['image_on_mlx_change'] else ""}> Sky/ambient temperature (MLX90614) change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgMlcloud" {"checked" if logging_cfg['image_on_mlcloud_change'] else ""}> ML cloud detection change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgOverall" {"checked" if logging_cfg['image_on_overall_flip'] else ""}> Overall SAFE/UNSAFE change</label>
+      </div>
+      <button type="submit" class="btn btn-neutral">Save logging settings</button>
+    </form>
+    <hr class="sep">
+    <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
+    unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
+    nothing left to show.</p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-unsafe"
+       onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
+    </div>
+    <p class="hint" id="clearImagesStatus"></p>
+  </div>
+
+  <div class="settings-group" id="device-names">
+    <h3>ASCOM Device Names</h3>
+    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
+    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
+    clients only re-read this list occasionally, so a change may not show up there until the client itself
+    refreshes it.</p>
+    <form action="/save-device-names" method="get">
+      <label>Safety Monitor</label>
+      <input type="text" name="safetyName" value="{device_names['safety']}">
+      <label>Dome</label>
+      <input type="text" name="domeName" value="{device_names['dome']}">
+      <label>Observing Conditions</label>
+      <input type="text" name="obsName" value="{device_names['obs']}">
+      <button type="submit" class="btn btn-neutral">Save device names</button>
     </form>
   </div>
 
-  <div class="settings-group" id="allsky-settings">
-    <h3>All Sky Camera</h3>
-    <p class="hint">Shows the latest frame from a separate all-sky camera (e.g. Thomas Jacquin's Allsky
-    software running on this Pi or another device) next to the Safety Monitor. Off by default since
-    there's no sensible default location — set one below, then check the box. Takes effect on next
-    page load.</p>
-    <form action="/save-allsky" method="get">
-      <label><input type="checkbox" name="allskyEnable" {"checked" if allsky_enabled else ""}> Show All Sky section</label>
-      <label>Image location</label>
-      <input type="text" name="imageLocation" value="{allsky_image_location}"
-       placeholder="http://192.168.1.50/allsky/image.jpg  or  /home/pi/allsky/images/image.jpg">
-      <p class="hint">An http(s):// URL is loaded straight from wherever it points (e.g. another device's
-      own all-sky web server); a plain file path is read directly off this Pi's disk and refreshed
-      automatically, so it always shows the latest frame written there.</p>
-      <label>All Sky page link (optional)</label>
-      <input type="text" name="pageUrl" value="{allsky_page_url}"
-       placeholder="http://192.168.1.50/allsky/">
-      <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
-      it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
-      <button type="submit" class="btn btn-neutral">Save All Sky</button>
-    </form>
   </div>
+  <div class="settings-col">
 
   <div class="settings-group" id="hardware-pins">
     <h3>Hardware Pins &amp; Addresses (GPIO / I2C)</h3>
@@ -3726,6 +3723,65 @@ a{{color:var(--accent-safety);}}
     </form>
   </div>
 
+  </div>
+  <div class="settings-col">
+
+  <div class="settings-group" id="dome-heater-features">
+    <h3>Dome &amp; Heater</h3>
+    <p class="hint">Turn a whole subsystem off if you don't have it at all — e.g. no motorized roof, or
+    no dew/frost heater. Takes effect immediately, no restart needed.</p>
+    <form action="/save-features" method="get">
+      <label><input type="checkbox" name="domeEnable" {"checked" if dome_enabled else ""}> Enable Dome control</label>
+      <p class="hint">Off: OPEN/CLOSE, the schedule, safety auto-close/open, and rain auto-close all stop
+      issuing commands; the reed switch is no longer read; and the ASCOM Dome device reports Not Connected
+      to any client that tries to use it — the same as if the ASCOM dome service itself were stopped.</p>
+      <label><input type="checkbox" name="heaterEnable" {"checked" if heater_enabled else ""}> Enable Heater control</label>
+      <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
+      output is forced off.</p>
+      <hr class="sep">
+      <div class="setting-row">
+        <label>Ignore reed switch for this many seconds after OPEN is commanded:</label>
+        <input type="number" step="0.5" name="openIgnoreSec" value="{dome_timing['open_ignore_sensor_sec']:g}" class="narrow-number">
+      </div>
+      <div class="setting-row">
+        <label>Assume the move finished after this many seconds if the reed switch never confirms it:</label>
+        <input type="number" step="0.5" name="moveAssumeSec" value="{dome_timing['move_assume_sec']:g}" class="narrow-number">
+      </div>
+      <p class="hint">There's only one reed switch, mounted at the CLOSED position — it can reliably confirm
+      CLOSED, but nothing can confirm a true fully-OPEN position. Right after OPEN is commanded the roof
+      hasn't physically moved yet, so the first setting keeps the state machine from reading "still closed"
+      as a failure before the roof has had a chance to move; after that, if the switch still reads closed
+      once the second setting's time has passed, it's reported CLOSED (the roof really didn't move) —
+      otherwise it's reported OPEN once that same time elapses, since nothing can confirm OPEN directly.
+      CLOSE always reports CLOSED the instant the reed switch confirms it, and also falls back to CLOSED
+      (with a logged warning) if the switch never confirms within the second setting's time.</p>
+      <button type="submit" class="btn btn-neutral">Save Dome &amp; Heater</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="allsky-settings">
+    <h3>All Sky Camera</h3>
+    <p class="hint">Shows the latest frame from a separate all-sky camera (e.g. Thomas Jacquin's Allsky
+    software running on this Pi or another device) next to the Safety Monitor. Off by default since
+    there's no sensible default location — set one below, then check the box. Takes effect on next
+    page load.</p>
+    <form action="/save-allsky" method="get">
+      <label><input type="checkbox" name="allskyEnable" {"checked" if allsky_enabled else ""}> Show All Sky section</label>
+      <label>Image location</label>
+      <input type="text" name="imageLocation" value="{allsky_image_location}"
+       placeholder="http://192.168.1.50/allsky/image.jpg  or  /home/pi/allsky/images/image.jpg">
+      <p class="hint">An http(s):// URL is loaded straight from wherever it points (e.g. another device's
+      own all-sky web server); a plain file path is read directly off this Pi's disk and refreshed
+      automatically, so it always shows the latest frame written there.</p>
+      <label>All Sky page link (optional)</label>
+      <input type="text" name="pageUrl" value="{allsky_page_url}"
+       placeholder="http://192.168.1.50/allsky/">
+      <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
+      it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
+      <button type="submit" class="btn btn-neutral">Save All Sky</button>
+    </form>
+  </div>
+
   <div class="settings-group" id="service-control">
     <h3>Service Control</h3>
     <p class="hint hint-warn">Both act immediately once confirmed — the page (and for a reboot, the whole
@@ -3744,63 +3800,7 @@ a{{color:var(--accent-safety);}}
     and confirm the systemctl path with <code>which systemctl</code>.)</p>
   </div>
 
-  <div class="settings-group" id="logging-settings">
-    <h3>Logging</h3>
-    <form action="/save-logging" method="get">
-      <label>Keep All Sky log images for this many days</label>
-      <input type="number" name="imgdays" min="1" value="{logging_cfg['image_retention_days']}" class="narrow-number">
-      <label>Keep old weekly log files for this many days</label>
-      <input type="number" name="logdays" min="1" value="{logging_cfg['log_retention_days']}" class="narrow-number">
-      <p class="hint">Event log text always rotates to a new file every week — these two just control
-      cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
-      above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
-      <hr class="sep">
-      <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
-      checking "what did the sky actually look like when this changed" while a new setup is being shaken
-      out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgDaynight" {"checked" if logging_cfg['image_on_daynight_change'] else ""}> Day/Night change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgRain" {"checked" if logging_cfg['image_on_rain_change'] else ""}> Rain sensor change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgMlx" {"checked" if logging_cfg['image_on_mlx_change'] else ""}> Sky/ambient temperature (MLX90614) change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgMlcloud" {"checked" if logging_cfg['image_on_mlcloud_change'] else ""}> ML cloud detection change</label>
-      </div>
-      <div class="setting-row">
-        <label><input type="checkbox" name="imgOverall" {"checked" if logging_cfg['image_on_overall_flip'] else ""}> Overall SAFE/UNSAFE change</label>
-      </div>
-      <button type="submit" class="btn btn-neutral">Save logging settings</button>
-    </form>
-    <hr class="sep">
-    <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
-    unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
-    nothing left to show.</p>
-    <div class="btn-row">
-      <button type="button" class="btn btn-unsafe"
-       onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
-    </div>
-    <p class="hint" id="clearImagesStatus"></p>
   </div>
-
-  <div class="settings-group" id="device-names">
-    <h3>ASCOM Device Names</h3>
-    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
-    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
-    clients only re-read this list occasionally, so a change may not show up there until the client itself
-    refreshes it.</p>
-    <form action="/save-device-names" method="get">
-      <label>Safety Monitor</label>
-      <input type="text" name="safetyName" value="{device_names['safety']}">
-      <label>Dome</label>
-      <input type="text" name="domeName" value="{device_names['dome']}">
-      <label>Observing Conditions</label>
-      <input type="text" name="obsName" value="{device_names['obs']}">
-      <button type="submit" class="btn btn-neutral">Save device names</button>
-    </form>
   </div>
 </div>
 </div>
