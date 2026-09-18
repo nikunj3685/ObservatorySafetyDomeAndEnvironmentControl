@@ -287,6 +287,25 @@ DEFAULT_SETTINGS = {
         # redundant clutter on top of it - check this to skip drawing ours.
         "extra_data_skip_own_overlay": False,
     },
+    # AI Learning (Phase 1: data capture only - no training/inference yet).
+    # Off by default. While enabled, and only while All Sky Camera itself is
+    # also enabled and configured, the service periodically saves the CURRENT
+    # raw All Sky frame (before this service's own sensor-info overlay is
+    # drawn - see _capture_ai_training_sample()) plus a full sensor snapshot
+    # into ai_training/, for later manual classification on a page that
+    # doesn't exist yet. "label_classes" is a comma-separated list, editable
+    # here without a code change, matching the existing convention used for
+    # safety_checks.ml_cloud_ignore_classes.
+    "ai_learning": {
+        "enabled": False,
+        "capture_interval_min": 15,
+        # Only UNLABELED samples are ever auto-deleted by age - once a
+        # sample has been manually classified it becomes curated training
+        # data and is kept forever unless a person removes it themselves
+        # (not built yet). 0 = never auto-delete unlabeled samples either.
+        "unlabeled_retention_days": 45,
+        "label_classes": "Clear, Partly Cloudy, Mostly Cloudy, Overcast, Rain, Snow, Freezing Rain, Ignore",
+    },
     # User-editable display names for each sensor/actuator, shown on the
     # Hardware Pins form and everywhere that sensor's reading is tagged
     # elsewhere on the page (e.g. the Safety Monitor card). Purely cosmetic -
@@ -411,6 +430,18 @@ LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_IMAGES_DIR = os.path.join(LOGS_DIR, "images")
 LOG_CATEGORIES = ["Safety", "Dome", "Heater", "Settings", "Service"]
 LOG_CLEANUP_INTERVAL_SEC = 3600  # re-check retention at most once an hour
+
+# AI Learning (Phase 1) - a separate tree from LOGS_DIR/LOG_IMAGES_DIR above,
+# since these images are raw training material (no sensor-info overlay
+# baked in - see _capture_ai_training_sample()) with their own retention
+# rule (unlabeled samples age out, labeled ones never do), not Event Log
+# snapshots. AI_TRAINING_INDEX_PATH is one JSON file holding every sample's
+# metadata (timestamp, image filename, sensor snapshot, label) as a list -
+# simple to read/write whole, same tradeoff dome_config.json and
+# status_history.json already make elsewhere in this file.
+AI_TRAINING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_training")
+AI_TRAINING_IMAGES_DIR = os.path.join(AI_TRAINING_DIR, "images")
+AI_TRAINING_INDEX_PATH = os.path.join(AI_TRAINING_DIR, "index.json")
 
 _log_write_lock = threading.Lock()
 _log_status_seen = {}      # key -> last-logged display value, for change detection
@@ -780,6 +811,120 @@ def _log_cleanup():
                     os.remove(path)
             except Exception as e:
                 print(f"[logs] cleanup: failed to remove log file {name}: {e}")
+
+
+# ==========================================================================
+# AI LEARNING — Phase 1: data capture only. Periodically saves a raw All
+# Sky frame plus a full sensor snapshot for later manual classification (the
+# classification page itself, and any training/inference on top of it, are
+# later phases - not built yet). Wired into sensor_poll_loop() below, on its
+# own interval, the same way _log_cleanup() already runs on its own timer.
+# ==========================================================================
+def _load_ai_training_index():
+    """Best-effort load of the AI Learning sample index. Returns a fresh,
+    empty index on a missing file or any read/parse error - same fallback
+    philosophy as _load_status_history()."""
+    try:
+        if os.path.exists(AI_TRAINING_INDEX_PATH):
+            with open(AI_TRAINING_INDEX_PATH, "r") as f:
+                idx = json.load(f)
+            if isinstance(idx, dict) and isinstance(idx.get("samples"), list):
+                return idx
+    except Exception:
+        pass
+    return {"samples": []}
+
+
+def _save_ai_training_index(idx):
+    """Atomic (tmp + os.replace) persist of the AI Learning sample index -
+    unlike _save_status_history()'s plain overwrite, this file is read back
+    by a future labeling page while capture keeps running concurrently, so a
+    half-written file must never be visible to a reader. Never raises."""
+    try:
+        os.makedirs(AI_TRAINING_DIR, exist_ok=True)
+        tmp = AI_TRAINING_INDEX_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(idx, f, indent=2)
+        os.replace(tmp, AI_TRAINING_INDEX_PATH)
+    except Exception as e:
+        print(f"[ai-learning] Failed to save training index: {e}")
+
+
+def _capture_ai_training_sample():
+    """Best-effort save of one AI Learning training sample: the CURRENT RAW
+    All Sky frame - fetched/read the same way _capture_allsky_image() does,
+    but deliberately BEFORE _overlay_sensor_info() would draw this service's
+    own text box on it, since a training image should look like what a
+    viewer (or a future image classifier) actually sees, not have our own
+    overlay baked in - plus a full sensor snapshot at this exact moment.
+    Appended to ai_training/index.json, unlabeled, for later manual
+    classification. A no-op whenever AI Learning or All Sky itself isn't
+    enabled/configured. Never raises - a failed capture must never affect
+    the rest of a poll cycle."""
+    try:
+        if not get_setting("ai_learning").get("enabled"):
+            return
+        allsky_cfg = get_setting("allsky")
+        if not allsky_cfg["enabled"] or not allsky_cfg["image_location"]:
+            return
+        loc = allsky_cfg["image_location"]
+        if allsky_is_url(loc):
+            r = requests.get(loc, timeout=HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            data = r.content
+        else:
+            if not os.path.isfile(loc):
+                return
+            with open(loc, "rb") as src:
+                data = src.read()
+
+        os.makedirs(AI_TRAINING_IMAGES_DIR, exist_ok=True)
+        now = time.time()
+        sample_id = f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(now))}_{uuid.uuid4().hex[:8]}"
+        fname = f"{sample_id}.jpg"
+        with open(os.path.join(AI_TRAINING_IMAGES_DIR, fname), "wb") as f:
+            f.write(data)
+
+        idx = _load_ai_training_index()
+        idx["samples"].append({
+            "id": sample_id,
+            "ts": now,
+            "image": fname,
+            "sensors": _log_sensor_snapshot(),
+            "label": None,
+            "labeled_at": None,
+        })
+        _save_ai_training_index(idx)
+    except Exception as e:
+        print(f"[ai-learning] Failed to capture training sample: {e}")
+
+
+def _ai_training_cleanup():
+    """Delete UNLABELED AI Learning samples (and their images) older than
+    ai_learning.unlabeled_retention_days - never a labeled one, no matter
+    its age; a manual classification makes it curated training data, and
+    only a person removing it themselves (not built yet) should do that.
+    0 (or missing) means never auto-delete unlabeled samples either.
+    Best-effort, matches _log_cleanup()'s philosophy."""
+    retention_days = get_setting("ai_learning").get("unlabeled_retention_days", 0)
+    if not retention_days or retention_days <= 0:
+        return
+    cutoff = time.time() - retention_days * 86400
+    idx = _load_ai_training_index()
+    keep = []
+    changed = False
+    for sample in idx["samples"]:
+        if sample.get("label") is None and sample.get("ts", 0) < cutoff:
+            changed = True
+            try:
+                os.remove(os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"]))
+            except Exception as e:
+                print(f"[ai-learning] cleanup: failed to remove image {sample.get('image')}: {e}")
+            continue
+        keep.append(sample)
+    if changed:
+        idx["samples"] = keep
+        _save_ai_training_index(idx)
 
 
 def _log_heater_mode_change():
@@ -1635,6 +1780,7 @@ def sensor_poll_loop():
     global _startup_connectivity_logged
     last_cloud_poll = 0.0
     last_log_cleanup = 0.0
+    last_ai_capture = 0.0
     while True:
         poll_bme280()
         poll_mlx90614()
@@ -1656,7 +1802,15 @@ def sensor_poll_loop():
 
         if now - last_log_cleanup >= LOG_CLEANUP_INTERVAL_SEC:
             _log_cleanup()
+            _ai_training_cleanup()
             last_log_cleanup = now
+
+        ai_cfg = get_setting("ai_learning")
+        if ai_cfg.get("enabled"):
+            capture_interval_sec = max(60, int(ai_cfg.get("capture_interval_min", 15)) * 60)
+            if now - last_ai_capture >= capture_interval_sec:
+                _capture_ai_training_sample()
+                last_ai_capture = now
 
         time.sleep(SENSOR_POLL_INTERVAL_SEC)
 
@@ -3139,6 +3293,27 @@ def save_allsky():
     return "", 302, {"Location": "/#allsky-settings"}
 
 
+@app.route("/save-ai-learning", methods=["GET"])
+def save_ai_learning():
+    def patch(s):
+        s["ai_learning"]["enabled"] = "aiLearningEnable" in request.args
+        if "aiCaptureIntervalMin" in request.args:
+            try:
+                s["ai_learning"]["capture_interval_min"] = max(1, int(request.args["aiCaptureIntervalMin"]))
+            except ValueError:
+                pass
+        if "aiUnlabeledRetentionDays" in request.args:
+            try:
+                s["ai_learning"]["unlabeled_retention_days"] = max(0, int(request.args["aiUnlabeledRetentionDays"]))
+            except ValueError:
+                pass
+        if "aiLabelClasses" in request.args:
+            s["ai_learning"]["label_classes"] = request.args["aiLabelClasses"].strip()
+    update_settings(patch)
+    _log_event("Settings", "AI Learning settings saved")
+    return "", 302, {"Location": "/#ai-learning-settings"}
+
+
 @app.route("/allsky-image", methods=["GET"])
 def allsky_image():
     """Serves the configured All Sky image with the sensor-info overlay
@@ -3533,6 +3708,18 @@ def web_index():
     # regardless of where it actually comes from. See allsky_image().
     allsky_img_base_src = "/allsky-image"
     allsky_img_initial_src = f"{allsky_img_base_src}{'&' if '?' in allsky_img_base_src else '?'}_t={int(time.time())}"
+    ai_learning = get_setting("ai_learning")
+    ai_learning_enabled = ai_learning["enabled"]
+    ai_capture_interval_min = ai_learning.get("capture_interval_min", 15)
+    ai_unlabeled_retention_days = ai_learning.get("unlabeled_retention_days", 0)
+    ai_label_classes = ai_learning.get("label_classes", "")
+    # Cheap-enough stat for the Settings page: how many samples are sitting
+    # there right now, and how many still need a human to look at them - no
+    # labeling page to send anyone to yet (that's the next phase), so this is
+    # the only visible sign the capture side is actually doing something.
+    _ai_idx_for_stats = _load_ai_training_index()
+    ai_sample_count = len(_ai_idx_for_stats["samples"])
+    ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
     dome_snap = dome.snapshot()
     with sensor_lock:
         s = dict(sensor_state)
@@ -3648,7 +3835,8 @@ h1{{font-size:21px;margin:2px 0 2px;}}
      Hardware Pins & Addresses, then ASCOM Device Names (kept right after
      Hardware Pins since device naming is really just another facet of
      "how this hardware is set up"); column 3 is Dome & Heater, All Sky
-     Camera, then Service Control. Deliberately NOT css grid rows -
+     Camera, AI Learning (right after All Sky since it depends on it),
+     then Service Control. Deliberately NOT css grid rows -
      grid would force every item in the same row to match the tallest
      one, so a group in one column growing taller (e.g. Dome & Heater
      picking up new fields) used to stretch an unrelated, shorter group
@@ -4140,6 +4328,32 @@ a{{color:var(--accent-safety);}}
       doesn't end up with two overlapping info boxes.</p>
       <button type="submit" class="btn btn-neutral">Save All Sky</button>
     </form>
+  </div>
+
+  <div class="settings-group" id="ai-learning-settings">
+    <h3>AI Learning</h3>
+    <p class="hint">Collects training data for later, manually-classified sky-condition models —
+    right now this only saves a raw All Sky frame plus the full sensor reading, on a timer, whenever
+    All Sky Camera (above) is also enabled and configured. Nothing is trained or used in the safety
+    decision yet; there's no classification page to review these on yet either — this is just the
+    data-collection groundwork for that.</p>
+    <form action="/save-ai-learning" method="get">
+      <label><input type="checkbox" name="aiLearningEnable" {"checked" if ai_learning_enabled else ""}>
+      Enable AI Learning data capture</label>
+      <label>Capture interval (minutes)</label>
+      <input type="number" name="aiCaptureIntervalMin" min="1" value="{ai_capture_interval_min}" class="narrow-number">
+      <label>Keep UNLABELED samples for this many days (0 = never auto-delete)</label>
+      <input type="number" name="aiUnlabeledRetentionDays" min="0" value="{ai_unlabeled_retention_days}" class="narrow-number">
+      <p class="hint">Only unlabeled samples ever get auto-deleted by age — once you classify one it's
+      curated training data and is kept regardless of how old it gets.</p>
+      <label>Classification labels (comma-separated)</label>
+      <input type="text" name="aiLabelClasses" value="{ai_label_classes}">
+      <p class="hint">Edit this list any time — new labels just become new choices whenever the
+      classification page (a later phase) exists.</p>
+      <button type="submit" class="btn btn-neutral">Save AI Learning</button>
+    </form>
+    <p class="hint">Samples collected so far: <b>{ai_sample_count}</b> ({ai_unlabeled_count} not yet
+    classified).</p>
   </div>
 
   <div class="settings-group" id="service-control">

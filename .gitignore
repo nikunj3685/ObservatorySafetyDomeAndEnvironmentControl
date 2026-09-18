@@ -3,6 +3,7 @@
 dome_config.json
 status_history.json
 logs/
+ai_training/
 
 # Created only by the test suite (a fake local-file All Sky source image).
 fake_allsky_source.jpg
