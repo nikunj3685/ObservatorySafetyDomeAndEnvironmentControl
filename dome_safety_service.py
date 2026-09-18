@@ -442,6 +442,7 @@ LOG_CLEANUP_INTERVAL_SEC = 3600  # re-check retention at most once an hour
 AI_TRAINING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_training")
 AI_TRAINING_IMAGES_DIR = os.path.join(AI_TRAINING_DIR, "images")
 AI_TRAINING_INDEX_PATH = os.path.join(AI_TRAINING_DIR, "index.json")
+AI_CLASSIFY_PAGE_SIZE = 24  # how many sample cards the /ai-classify page shows at once
 
 _log_write_lock = threading.Lock()
 _log_status_seen = {}      # key -> last-logged display value, for change detection
@@ -3940,7 +3941,7 @@ a{{color:var(--accent-safety);}}
 </style></head><body>
 
 <h1>🔭 Observatory Control</h1>
-<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a></p>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify ({ai_unlabeled_count})</a></p>
 {location_banner_html}
 <div class="grid">
 <div class="card safety{'' if allsky_enabled else ' full-width'}">
@@ -4332,11 +4333,11 @@ a{{color:var(--accent-safety);}}
 
   <div class="settings-group" id="ai-learning-settings">
     <h3>AI Learning</h3>
-    <p class="hint">Collects training data for later, manually-classified sky-condition models —
-    right now this only saves a raw All Sky frame plus the full sensor reading, on a timer, whenever
-    All Sky Camera (above) is also enabled and configured. Nothing is trained or used in the safety
-    decision yet; there's no classification page to review these on yet either — this is just the
-    data-collection groundwork for that.</p>
+    <p class="hint">Collects training data for later sky-condition models — while enabled, and whenever
+    All Sky Camera (above) is also enabled and configured, saves a raw All Sky frame plus the full
+    sensor reading on a timer. Review and manually classify what's been captured on the
+    <a href="/ai-classify">Classify page</a>. Nothing is trained or used in the safety decision yet —
+    that's a later phase, once enough labeled samples exist.</p>
     <form action="/save-ai-learning" method="get">
       <label><input type="checkbox" name="aiLearningEnable" {"checked" if ai_learning_enabled else ""}>
       Enable AI Learning data capture</label>
@@ -4353,7 +4354,7 @@ a{{color:var(--accent-safety);}}
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
     <p class="hint">Samples collected so far: <b>{ai_sample_count}</b> ({ai_unlabeled_count} not yet
-    classified).</p>
+    classified) — <a href="/ai-classify">go classify them &rarr;</a></p>
   </div>
 
   <div class="settings-group" id="service-control">
@@ -4678,6 +4679,268 @@ def logs_image(name):
     resp = send_file(path, conditional=True)
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
+
+
+# ==========================================================================
+# AI LEARNING — Phase 2: the manual classification page. Phase 1 only
+# captured raw frames + sensor snapshots into ai_training/; this is where a
+# person actually looks at them and assigns one of the configured labels,
+# which is what turns that pile of unlabeled samples into real training
+# data for the later phases (a sky-temperature model, and eventually
+# retraining simpleCloudDetect). A separate standalone page, same pattern
+# as web_logs() above, not folded into the main dashboard.
+# ==========================================================================
+@app.route("/ai-training-image/<path:name>", methods=["GET"])
+def ai_training_image(name):
+    """Serves one AI Learning sample image - full size, or a resized
+    thumbnail via ?w=<max-width-and-height-px> for the classify page's
+    grid (keeps a page full of images fast to load over a LAN/Pi). Falls
+    back to the full-size file if the resize itself fails for any reason -
+    a broken thumbnail must never make an image unviewable."""
+    safe_name = os.path.basename(name)
+    if safe_name != name:
+        return "Not found", 404
+    path = os.path.join(AI_TRAINING_IMAGES_DIR, safe_name)
+    if not os.path.isfile(path):
+        return "Not found", 404
+    width = request.args.get("w", type=int)
+    if width and width > 0:
+        try:
+            img = Image.open(path)
+            img.thumbnail((width, width))
+            img = img.convert("RGB")
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=80)
+            out.seek(0)
+            resp = send_file(out, mimetype="image/jpeg")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
+        except Exception:
+            pass  # fall through and serve the original file instead
+    resp = send_file(path, conditional=True)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/ai-classify-save", methods=["GET"])
+def ai_classify_save():
+    """Applies one label to one or more sample IDs at once - the batch
+    action behind the classify page's "select several, click one label
+    button" workflow, so a whole run of near-identical overnight frames
+    can be classified together instead of one at a time. Returns JSON
+    (not a redirect) since the page calls this via fetch() and updates
+    itself in place rather than reloading."""
+    ids = [i for i in request.args.get("ids", "").split(",") if i]
+    label = request.args.get("label", "").strip()
+    if not ids or not label:
+        return jsonify({"ok": False, "error": "missing ids or label"}), 400
+
+    idx = _load_ai_training_index()
+    now = time.time()
+    by_id = {s["id"]: s for s in idx["samples"]}
+    matched = 0
+    for sid in ids:
+        sample = by_id.get(sid)
+        if sample is not None:
+            sample["label"] = label
+            sample["labeled_at"] = now
+            matched += 1
+    if matched:
+        _save_ai_training_index(idx)
+
+    unlabeled_count = sum(1 for s in idx["samples"] if s.get("label") is None)
+    return jsonify({"ok": True, "matched": matched, "unlabeled_count": unlabeled_count,
+                     "total_count": len(idx["samples"])})
+
+
+def _render_ai_classify_card(sample, tz):
+    sid = sample["id"]
+    sensors = sample.get("sensors") or {}
+    ts = sample.get("ts", 0)
+    time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
+                if ts else "Unknown time")
+    label = sample.get("label")
+    label_badge_html = f'<span class="ai-label-badge">{label}</span>' if label else ""
+
+    chips = []
+    if sensors.get("environment_temp_c") is not None:
+        chips.append(f"Outside {sensors['environment_temp_c']:.1f}C {sensors.get('environment_humidity') or 0:.0f}%RH")
+    if sensors.get("box_temp_c") is not None:
+        chips.append(f"Box {sensors['box_temp_c']:.1f}C {sensors.get('box_humidity') or 0:.0f}%RH")
+    if sensors.get("sky_mlx"):
+        chips.append(f"Sky {sensors['sky_mlx']}")
+    if sensors.get("rain"):
+        chips.append(f"Rain {sensors['rain']}")
+    if sensors.get("ml_cloud"):
+        chips.append(f"ML {sensors['ml_cloud']}")
+    chips_html = "".join(f'<span class="ai-chip">{c}</span>' for c in chips)
+
+    img_url = f"/ai-training-image/{sample['image']}?w=220"
+    full_url = f"/ai-training-image/{sample['image']}"
+    return f"""<div class="ai-card" id="ai-card-{sid}">
+  <label class="ai-card-select">
+    <input type="checkbox" class="ai-pick" value="{sid}">
+    <img src="{img_url}" loading="lazy" alt="All Sky frame">
+  </label>
+  {label_badge_html}
+  <div class="ai-card-time">{time_str}</div>
+  <div class="ai-card-chips">{chips_html}</div>
+  <a class="ai-fullsize-link" href="{full_url}" target="_blank" onclick="event.stopPropagation()">🔍 full size</a>
+</div>"""
+
+
+@app.route("/ai-classify", methods=["GET"])
+def ai_classify_page():
+    ai_cfg = get_setting("ai_learning")
+    label_classes = [c.strip() for c in ai_cfg.get("label_classes", "").split(",") if c.strip()]
+    show = request.args.get("show", "unclassified")
+    if show not in ("unclassified", "all"):
+        show = "unclassified"
+    try:
+        page = max(0, int(request.args.get("page", 0)))
+    except ValueError:
+        page = 0
+
+    idx = _load_ai_training_index()
+    all_samples = idx["samples"]
+    total_count = len(all_samples)
+    unlabeled_count = sum(1 for s in all_samples if s.get("label") is None)
+
+    filtered = list(all_samples) if show == "all" else [s for s in all_samples if s.get("label") is None]
+    # Oldest first - works through the backlog in order (so nothing quietly
+    # ages out under the unlabeled-retention setting before anyone sees it)
+    # and keeps visually-similar consecutive frames from the same night
+    # next to each other, for the "select a run, label them together" flow.
+    filtered.sort(key=lambda s: s.get("ts", 0))
+
+    start = page * AI_CLASSIFY_PAGE_SIZE
+    page_samples = filtered[start:start + AI_CLASSIFY_PAGE_SIZE]
+    has_prev = page > 0
+    has_next = start + AI_CLASSIFY_PAGE_SIZE < len(filtered)
+
+    loc = get_setting("location")
+    try:
+        tz = ZoneInfo(loc.get("tz_name", "UTC"))
+    except Exception:
+        tz = timezone.utc
+
+    cards_html = ("".join(_render_ai_classify_card(s, tz) for s in page_samples) if page_samples else
+                  "<p class='hint'>Nothing to classify right now — samples build up over time once AI "
+                  "Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
+
+    label_buttons_html = "".join(
+        f'<button type="button" class="btn ai-label-btn" onclick="applyLabel(\'{c}\')">{c}</button>'
+        for c in label_classes) or (
+        "<p class='hint'>No labels are configured — add some under "
+        "<a href='/#ai-learning-settings'>Settings &rarr; AI Learning</a>.</p>")
+
+    show_options = "".join(
+        f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
+        for v, t in [("unclassified", "Unclassified only"), ("all", "All samples")])
+
+    prev_link_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;page={page - 1}">&larr; Prev</a>'
+                       if has_prev else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
+    next_link_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;page={page + 1}">Next &rarr;</a>'
+                       if has_next else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
+
+    html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{{
+  --page-bg:#f2f4f7; --card-bg:#ffffff; --text:#1f2328; --muted:#6a7178;
+  --accent:#0f766e; --info:#2563eb; --warn:#9a6300; --warn-bg:#fff4e0;
+}}
+*{{box-sizing:border-box;}}
+body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      max-width:1100px;margin:0 auto;padding:18px 16px 48px;}}
+h1{{font-size:21px;margin:2px 0 2px;}}
+.subtitle{{color:var(--muted);font-size:13px;margin:0 0 18px;}}
+.subtitle a{{color:var(--accent);text-decoration:none;}}
+.card{{background:var(--card-bg);border-radius:14px;padding:16px 18px;margin:0 0 16px;
+       box-shadow:0 1px 4px rgba(0,0,0,.08);}}
+.hint{{color:var(--muted);font-size:12.5px;}}
+.btn{{padding:7px 14px;border-radius:8px;border:none;font-size:14px;font-weight:600;cursor:pointer;
+      background:var(--accent);color:#fff;text-decoration:none;display:inline-block;}}
+.toolbar{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}}
+.toolbar select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
+.ai-label-btn{{background:var(--info);}}
+.ai-nav-btn-disabled{{background:#c7cdd2;cursor:default;}}
+#classifyStatus{{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}}
+.ai-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}}
+.ai-card{{background:#fafbfc;border-radius:10px;padding:8px;position:relative;}}
+.ai-card-select{{display:block;cursor:pointer;}}
+.ai-card-select img{{width:100%;border-radius:6px;display:block;background:#14161a;}}
+.ai-card-select input[type=checkbox]{{position:absolute;top:12px;left:12px;width:18px;height:18px;}}
+.ai-label-badge{{position:absolute;top:12px;right:12px;background:var(--accent);color:#fff;
+                  border-radius:10px;padding:1px 9px;font-size:11.5px;font-weight:600;}}
+.ai-card-time{{font-size:11.5px;color:var(--muted);margin-top:6px;}}
+.ai-card-chips{{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}}
+.ai-chip{{background:#eceff1;border-radius:6px;padding:2px 6px;font-size:11px;color:var(--muted);}}
+.ai-fullsize-link{{display:inline-block;margin-top:6px;font-size:12px;}}
+.pager{{display:flex;justify-content:space-between;margin-top:16px;}}
+a{{color:var(--accent);}}
+</style></head><body>
+
+<h1>🏷️ AI Learning — Classify</h1>
+<p class="subtitle"><a href="/">&larr; Back to Observatory Control</a> &nbsp;&middot;&nbsp;
+<a href="/logs">🗒 Logs</a></p>
+
+<div class="card">
+  <p class="hint">Pick a label from the row below, then click one or more images to select them (or
+  "Select all shown"), then click the label — it applies to every image you've selected at once. Sorted
+  oldest-first so a run of near-identical overnight frames sits together and can be classified in one go.
+  Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
+  <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
+  <form class="toolbar" action="/ai-classify" method="get">
+    <select name="show" onchange="this.form.submit()">{show_options}</select>
+    <button type="submit" class="btn">Filter</button>
+    <button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>
+    <button type="button" class="btn" onclick="selectAll(false)">Clear selection</button>
+  </form>
+  <div class="toolbar">{label_buttons_html}</div>
+  <p id="classifyStatus"></p>
+</div>
+
+<div class="ai-grid" id="aiGrid">
+{cards_html}
+</div>
+
+<div class="pager">{prev_link_html}{next_link_html}</div>
+
+<script>
+function selectAll(check) {{
+  document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = check);
+}}
+function applyLabel(label) {{
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
+  const status = document.getElementById('classifyStatus');
+  if (ids.length === 0) {{
+    status.textContent = 'Select at least one image first.';
+    return;
+  }}
+  status.textContent = 'Saving...';
+  fetch('/ai-classify-save?ids=' + encodeURIComponent(ids.join(',')) + '&label=' + encodeURIComponent(label))
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+        return;
+      }}
+      ids.forEach(id => {{
+        const el = document.getElementById('ai-card-' + id);
+        if (el) el.remove();
+      }});
+      const totalEl = document.getElementById('aiTotalCount');
+      const unlabeledEl = document.getElementById('aiUnlabeledCount');
+      if (totalEl) totalEl.textContent = data.total_count;
+      if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
+      status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
+}}
+</script>
+</body></html>"""
+    return html
 
 
 # ==========================================================================
