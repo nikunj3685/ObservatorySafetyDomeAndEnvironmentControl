@@ -5141,7 +5141,16 @@ def _render_ai_classify_card(sample, tz):
     if sensors.get("box_temp_c") is not None:
         chips.append(f"Box {sensors['box_temp_c']:.1f}C {sensors.get('box_humidity') or 0:.0f}%RH")
     if sensors.get("sky_mlx"):
-        chips.append(f"Sky {sensors['sky_mlx']}")
+        # The raw MLX90614 numbers - what a trained model actually learns
+        # from (see AI_MODEL_FEATURES) - shown alongside the already-
+        # decided Clear/Cloudy word, not just the word alone, so classifying
+        # by eye can be checked against the same number the model uses.
+        # Older samples captured before this field existed won't have it.
+        mlx_c = sensors.get("mlx_sky_c")
+        delta_c = sensors.get("mlx_delta_c")
+        temp_suffix = f" {mlx_c:.1f}C" if mlx_c is not None else ""
+        delta_suffix = f" (&Delta;{delta_c:.1f}C)" if delta_c is not None else ""
+        chips.append(f"Sky{temp_suffix}{delta_suffix} {sensors['sky_mlx']}")
     if sensors.get("rain"):
         chips.append(f"Rain {sensors['rain']}")
     if sensors.get("ml_cloud"):
