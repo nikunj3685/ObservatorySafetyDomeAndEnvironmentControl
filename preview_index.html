@@ -282,10 +282,18 @@ a{color:var(--accent-safety);}
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="-12.0">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
       <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="15.0">
-      <p class="hint">(Ambient − sky) must be at least this many degrees to call it "Clear" — ambient is the
-      BME280's outside-air reading when available (falls back to the MLX90614's own onboard ambient sensor
-      otherwise, since that sensor usually sits inside the enclosure and reads warmer box air, not true
-      outside air). Enable/disable the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <label>Ambient temperature source (for the delta above)</label>
+      <select name="ambientSensor">
+        <option value="bme280" selected>BME280 (outside air)</option>
+        <option value="dht11">DHT11 (box air)</option>
+        <option value="mlx_ambient">MLX90614's own onboard ambient sensor</option>
+      </select>
+      <p class="hint">(Ambient − sky) must be at least this many degrees to call it "Clear" — ambient comes from
+      whichever sensor is selected above, not a fixed fallback chain. BME280 (outside air) is the most accurate
+      choice if it's installed; the MLX90614's own onboard ambient sensor is always available but usually sits
+      inside the enclosure and reads warmer box air, not true outside air. If the selected sensor is
+      unavailable, this check reports Unknown rather than silently substituting a different one. Enable/disable
+      the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
       <label><input type="checkbox" name="mlcloud" checked> Simple Cloud Detect ML check</label>
       <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
       <input type="text" name="mlcloudignore" value="" placeholder="e.g. Glare, Fogged Lens">
@@ -489,6 +497,22 @@ a{color:var(--accent-safety);}
        placeholder="http://192.168.1.50/allsky/">
       <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
       it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
+
+      <label>Extra Text File path (only if Allsky runs on THIS Pi — clear it otherwise)</label>
+      <input type="text" name="extraTextFile" value="/home/pi/pi-safety-aggregator/allsky_extra.txt"
+       placeholder="/home/pi/pi-safety-aggregator/allsky_extra.txt">
+      <p class="hint">Every poll cycle this service writes the current sensor readings (outside/box
+      temp+humidity, Sky state + delta, Rain, ML Cloud, overall SAFE/UNSAFE) — one per line — to this
+      exact path. Defaults to a file next to this script, assuming the usual install location — adjust it
+      above if this script actually lives somewhere else on your Pi. Paste this SAME path into Allsky's
+      own Settings → Overlay → "Extra Text File" field, and Allsky will stack these lines under its other
+      overlay info AT CAPTURE TIME — so Allsky's own live view/gallery, this page, and every saved log
+      snapshot all show the exact same baked-in text, from one source. Allsky's own "Max Age Of Extra"
+      setting handles hiding it if this service stops updating it. Leave blank to turn this off.</p>
+      <label><input type="checkbox" name="skipOwnOverlay" >
+      Skip this service's own drawn overlay on /allsky-image and saved snapshots</label>
+      <p class="hint">Check this once Allsky's own overlay (above) is showing the readings, so the image
+      doesn't end up with two overlapping info boxes.</p>
       <button type="submit" class="btn btn-neutral">Save All Sky</button>
     </form>
   </div>
