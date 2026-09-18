@@ -146,7 +146,7 @@ a{color:var(--accent-safety);}
 </style></head><body>
 
 <h1>🔭 Observatory Control</h1>
-<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a></p>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (0)</a></p>
 <div class='banner banner-warn top-banner'>📍 <b>Location not set</b> — latitude/longitude are still at the 0&deg;,0&deg; placeholder, so the Day/Night sun-elevation gate is computing nonsense for your actual site. <a href='#settings'>Set your real coordinates in Settings</a>.</div>
 <div class="grid">
 <div class="card safety full-width">
@@ -522,11 +522,11 @@ a{color:var(--accent-safety);}
 
   <div class="settings-group" id="ai-learning-settings">
     <h3>AI Learning</h3>
-    <p class="hint">Collects training data for later, manually-classified sky-condition models —
-    right now this only saves a raw All Sky frame plus the full sensor reading, on a timer, whenever
-    All Sky Camera (above) is also enabled and configured. Nothing is trained or used in the safety
-    decision yet; there's no classification page to review these on yet either — this is just the
-    data-collection groundwork for that.</p>
+    <p class="hint">Collects training data for later sky-condition models — while enabled, and whenever
+    All Sky Camera (above) is also enabled and configured, saves a raw All Sky frame plus the full
+    sensor reading on a timer. Review and manually classify what's been captured on the
+    <a href="/ai-classify">Classify page</a>. Nothing is trained or used in the safety decision yet —
+    that's a later phase, once enough labeled samples exist.</p>
     <form action="/save-ai-learning" method="get">
       <label><input type="checkbox" name="aiLearningEnable" >
       Enable AI Learning data capture</label>
@@ -537,13 +537,13 @@ a{color:var(--accent-safety);}
       <p class="hint">Only unlabeled samples ever get auto-deleted by age — once you classify one it's
       curated training data and is kept regardless of how old it gets.</p>
       <label>Classification labels (comma-separated)</label>
-      <input type="text" name="aiLabelClasses" value="Clear,Cloudy,Rain">
+      <input type="text" name="aiLabelClasses" value="Clear, Partly Cloudy, Mostly Cloudy, Overcast, Rain, Snow, Freezing Rain, Ignore">
       <p class="hint">Edit this list any time — new labels just become new choices whenever the
       classification page (a later phase) exists.</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
     <p class="hint">Samples collected so far: <b>0</b> (0 not yet
-    classified).</p>
+    classified) — <a href="/ai-classify">go classify them &rarr;</a></p>
   </div>
 
   <div class="settings-group" id="service-control">
