@@ -444,6 +444,22 @@ AI_TRAINING_IMAGES_DIR = os.path.join(AI_TRAINING_DIR, "images")
 AI_TRAINING_INDEX_PATH = os.path.join(AI_TRAINING_DIR, "index.json")
 AI_CLASSIFY_PAGE_SIZE = 24  # how many sample cards the /ai-classify page shows at once
 
+# AI Learning Phase 3 - the sky-condition model trained from classified
+# samples (see _train_ai_sky_model() below). AI_MODEL_FEATURES are the only
+# numeric readings it learns from - deliberately the RAW sensor numbers
+# (including the MLX90614's raw sky/ambient/delta, which _log_sensor_
+# snapshot() doesn't carry - see _ai_training_sensor_features()), never the
+# already-decided Clear/Cloudy tri-state, since the whole point is to let
+# the model learn its own mapping from raw readings to your labels instead
+# of just re-deriving today's fixed-threshold logic.
+AI_MODEL_PATH = os.path.join(AI_TRAINING_DIR, "sky_model.json")
+AI_MODEL_FEATURES = [
+    "environment_temp_c", "environment_humidity", "box_temp_c", "box_humidity",
+    "mlx_sky_c", "mlx_ambient_ref_c", "mlx_delta_c",
+]
+AI_MODEL_MIN_SAMPLES_PER_CLASS = 5  # below this, a class's mean/std would be near-meaningless
+AI_MODEL_MIN_STD = 0.5  # floor on a feature's std-dev so a near-zero-variance class never blows up the Gaussian
+
 _log_write_lock = threading.Lock()
 _log_status_seen = {}      # key -> last-logged display value, for change detection
 _connectivity_state = {}   # key -> last-observed fresh/stale bool, for connect/disconnect edges
@@ -851,6 +867,27 @@ def _save_ai_training_index(idx):
         print(f"[ai-learning] Failed to save training index: {e}")
 
 
+def _ai_training_sensor_features():
+    """The sensor snapshot stored with each AI Learning training sample -
+    everything _log_sensor_snapshot() already captures (so the Classify
+    page's chips keep working unchanged) PLUS the raw MLX90614 numbers
+    that function leaves out: mlx_sky_c, mlx_ambient_ref_c, mlx_delta_c.
+    Those raw numbers, not the already-decided Clear/Cloudy tri-state, are
+    what _train_ai_sky_model() actually learns from - see AI_MODEL_FEATURES
+    above. Stale/no reading is stored as None, same convention as every
+    other field here, so training simply excludes it rather than treating
+    a missing sensor as a real zero."""
+    snapshot = _log_sensor_snapshot()
+    with sensor_lock:
+        s = dict(sensor_state)
+    now = time.time()
+    mlx_fresh = s["mlx_ok"] and (now - s["mlx_last_poll"] <= STALE_AFTER_SEC)
+    snapshot["mlx_sky_c"] = s["mlx_sky_c"] if mlx_fresh else None
+    snapshot["mlx_ambient_ref_c"] = s["mlx_ambient_ref_c"] if mlx_fresh else None
+    snapshot["mlx_delta_c"] = s["mlx_delta_c"] if mlx_fresh else None
+    return snapshot
+
+
 def _capture_ai_training_sample():
     """Best-effort save of one AI Learning training sample: the CURRENT RAW
     All Sky frame - fetched/read the same way _capture_allsky_image() does,
@@ -891,7 +928,7 @@ def _capture_ai_training_sample():
             "id": sample_id,
             "ts": now,
             "image": fname,
-            "sensors": _log_sensor_snapshot(),
+            "sensors": _ai_training_sensor_features(),
             "label": None,
             "labeled_at": None,
         })
@@ -926,6 +963,132 @@ def _ai_training_cleanup():
     if changed:
         idx["samples"] = keep
         _save_ai_training_index(idx)
+
+
+# ==========================================================================
+# AI LEARNING — Phase 3: training the sky-condition model. A small Gaussian
+# Naive Bayes classifier (mean/std per feature per class, fit in closed
+# form - no gradient descent, no external ML library, nothing that needs
+# more than a Raspberry Pi's CPU) fit from every manually classified
+# sample. This is READ-ONLY with respect to the SAFE/UNSAFE decision for
+# now - _predict_ai_sky_class() below is wired into the dashboard as an
+# informational comparison line only (see render_env_readings_html()).
+# Actually using it to influence the live safety decision is a later,
+# separate phase, once its predictions have been watched against reality
+# for a while.
+# ==========================================================================
+def _load_ai_sky_model():
+    """Best-effort load of the trained sky model. Returns None on a
+    missing file or any read/parse error - "no model trained yet" and "the
+    model file is corrupt" are handled identically everywhere this is
+    called: fall back to not showing a prediction."""
+    try:
+        if os.path.exists(AI_MODEL_PATH):
+            with open(AI_MODEL_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _save_ai_sky_model(model):
+    """Atomic (tmp + os.replace) persist of the trained model - same
+    reasoning as _save_ai_training_index(): a live prediction read must
+    never see a half-written file. Never raises."""
+    try:
+        os.makedirs(AI_TRAINING_DIR, exist_ok=True)
+        tmp = AI_MODEL_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(model, f, indent=2)
+        os.replace(tmp, AI_MODEL_PATH)
+    except Exception as e:
+        print(f"[ai-learning] Failed to save trained model: {e}")
+
+
+def _train_ai_sky_model():
+    """Fits a Gaussian Naive Bayes classifier from every manually
+    classified AI Learning sample: for each label, the mean/std of each
+    AI_MODEL_FEATURES reading (a feature a given sample never had fresh -
+    e.g. the MLX90614 wasn't installed yet when it was captured - is simply
+    excluded from that feature's statistics, not treated as zero), plus
+    each label's share of the classified samples (its prior). Returns
+    (model_dict, None) on success, or (None, error_message) when there
+    isn't enough classified data yet to fit anything meaningful - never
+    raises, and never leaves a partially-written model file (the old one,
+    if any, is left untouched on failure)."""
+    idx = _load_ai_training_index()
+    labeled = [s for s in idx["samples"] if s.get("label")]
+    by_class = {}
+    for sample in labeled:
+        by_class.setdefault(sample["label"], []).append(sample)
+
+    if not by_class:
+        return None, "No classified samples yet - classify some on the Classify page first."
+    if len(by_class) < 2:
+        return None, "Need at least 2 different labels represented in your classified samples to train a classifier."
+    too_few = sorted(c for c, samples in by_class.items() if len(samples) < AI_MODEL_MIN_SAMPLES_PER_CLASS)
+    if too_few:
+        return None, (f"These labels have fewer than {AI_MODEL_MIN_SAMPLES_PER_CLASS} classified samples so far: "
+                       f"{', '.join(too_few)}. Classify more of those before training.")
+
+    total = len(labeled)
+    class_counts = {}
+    class_stats = {}
+    for cls, samples in by_class.items():
+        class_counts[cls] = len(samples)
+        stats = {}
+        for feat in AI_MODEL_FEATURES:
+            values = [v for v in (sample.get("sensors", {}).get(feat) for sample in samples) if v is not None]
+            if len(values) < 2:
+                continue  # not enough real readings of this feature for this class - omit it entirely
+            mean = sum(values) / len(values)
+            variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+            stats[feat] = {"mean": mean, "std": max(variance ** 0.5, AI_MODEL_MIN_STD), "n": len(values)}
+        class_stats[cls] = stats
+
+    model = {
+        "trained_at": time.time(),
+        "sample_count": total,
+        "classes": sorted(by_class.keys()),
+        "class_counts": class_counts,
+        "priors": {cls: class_counts[cls] / total for cls in by_class},
+        "class_stats": class_stats,
+    }
+    _save_ai_sky_model(model)
+    return model, None
+
+
+def _predict_ai_sky_class(model, features):
+    """Gaussian Naive Bayes prediction: the class with the highest
+    log(prior) + sum of log-likelihoods over every feature BOTH the model
+    and this reading have a real number for - a feature missing from
+    either side is simply skipped for that class (never treated as
+    disqualifying, and never substituted with zero). Returns
+    (predicted_class, {class: log_score}) or (None, {}) if no class has
+    any usable feature overlap with this reading at all."""
+    scores = {}
+    for cls in model["classes"]:
+        stats = model.get("class_stats", {}).get(cls, {})
+        prior = model.get("priors", {}).get(cls, 0)
+        if prior <= 0:
+            continue
+        log_score = math.log(prior)
+        used_any_feature = False
+        for feat, value in features.items():
+            if value is None:
+                continue
+            feat_stats = stats.get(feat)
+            if feat_stats is None:
+                continue
+            used_any_feature = True
+            mean, std = feat_stats["mean"], feat_stats["std"]
+            log_score += -0.5 * math.log(2 * math.pi * std * std) - ((value - mean) ** 2) / (2 * std * std)
+        if used_any_feature:
+            scores[cls] = log_score
+    if not scores:
+        return None, {}
+    best_cls = max(scores, key=scores.get)
+    return best_cls, scores
 
 
 def _log_heater_mode_change():
@@ -3584,6 +3747,30 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if mlx_prev:
         sky_row += _field_row("", "", mlx_prev, "prev-status")
 
+    # AI Learning Phase 3 - purely informational: shows what the trained
+    # sky-condition model (see _train_ai_sky_model()) would currently call
+    # it, for comparing against the fixed-threshold decision above over
+    # time. Absent entirely until a model has actually been trained on the
+    # Classify page, and never feeds into the SAFE/UNSAFE decision itself.
+    ai_model_row = ""
+    ai_model = _load_ai_sky_model()
+    if ai_model:
+        ai_features = {
+            "environment_temp_c": s["env_temp_c"] if env_fresh else None,
+            "environment_humidity": s["env_humidity"] if env_fresh else None,
+            "box_temp_c": s["dht_temp_c"] if box_fresh else None,
+            "box_humidity": s["dht_humidity"] if box_fresh else None,
+            "mlx_sky_c": s.get("mlx_sky_c"),
+            "mlx_ambient_ref_c": s.get("mlx_ambient_ref_c"),
+            "mlx_delta_c": s.get("mlx_delta_c"),
+        }
+        ai_predicted, _ai_scores = _predict_ai_sky_class(ai_model, ai_features)
+        if ai_predicted is not None:
+            ai_model_row = _field_row("", "🤖", f"""Model prediction: <b>{ai_predicted}</b>
+  <span class="muted">(trained on {ai_model['sample_count']} classified samples on the
+  <a href="/ai-classify">Classify page</a> - informational only, not used in the SAFE/UNSAFE decision)</span>""",
+                                       "prev-status")
+
     rain_row = _field_row(rain_dot, "☔", f"""Rain: <b>{'WET' if s['rain_detected'] else 'DRY'}</b> <span class="tag">{sensor_names['rain']}</span>{' <span class="muted">(disabled)</span>' if not checks['rain_enabled'] else ''}""")
     rain_prev = _prev_status_text(s["rain_prev_state"], s["rain_prev_since"], tz_name,
                                    {True: "WET", False: "DRY"})
@@ -3598,7 +3785,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if mlcloud_prev:
         ml_row += _field_row("", "", mlcloud_prev, "prev-status")
 
-    return sky_row + rain_row + ml_row + outside_row + box_row
+    return sky_row + ai_model_row + rain_row + ml_row + outside_row + box_row
 
 
 def render_heater_info_html(h, heater_enabled=True, mosfet_name="Heater MOSFET"):
@@ -4753,6 +4940,21 @@ def ai_classify_save():
                      "total_count": len(idx["samples"])})
 
 
+@app.route("/ai-train-model", methods=["GET"])
+def ai_train_model():
+    """Fits (or re-fits) the sky-condition model from whatever's been
+    classified so far - the Classify page's "Train model now" button.
+    JSON, not a redirect, since the page calls this via fetch() and
+    updates its own model-status card in place."""
+    model, error = _train_ai_sky_model()
+    if error:
+        return jsonify({"ok": False, "error": error})
+    _log_event("Settings", f"AI Learning model trained on {model['sample_count']} classified samples "
+                            f"({', '.join(f'{c}: {n}' for c, n in sorted(model['class_counts'].items()))})")
+    return jsonify({"ok": True, "trained_at": model["trained_at"], "sample_count": model["sample_count"],
+                     "classes": model["classes"], "class_counts": model["class_counts"]})
+
+
 def _render_ai_classify_card(sample, tz):
     sid = sample["id"]
     sensors = sample.get("sensors") or {}
@@ -4843,6 +5045,33 @@ def ai_classify_page():
     next_link_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;page={page + 1}">Next &rarr;</a>'
                        if has_next else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
 
+    # Model status card - how close the classified set is to trainable
+    # (per AI_MODEL_MIN_SAMPLES_PER_CLASS), and whether a model already
+    # exists to compare the dashboard's live prediction against.
+    classified_counts = {}
+    for sample in all_samples:
+        lbl = sample.get("label")
+        if lbl:
+            classified_counts[lbl] = classified_counts.get(lbl, 0) + 1
+    eligibility_html = "".join(
+        f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
+        for c in label_classes) or "<span class='hint'>No labels configured.</span>"
+
+    ai_model = _load_ai_sky_model()
+    if ai_model:
+        try:
+            trained_tz_str = _format_ampm(datetime.fromtimestamp(ai_model["trained_at"], tz).strftime(
+                "%Y-%m-%d %I:%M:%S %p"))
+        except Exception:
+            trained_tz_str = "unknown time"
+        model_breakdown = ", ".join(f"{c}: {n}" for c, n in sorted(ai_model["class_counts"].items()))
+        model_status_html = (f"Model trained <b>{trained_tz_str}</b> on <b>{ai_model['sample_count']}</b> "
+                              f"classified samples ({model_breakdown}). Its live prediction shows on the "
+                              f"<a href='/'>dashboard</a>'s Safety Monitor card, for comparison only — it does "
+                              f"not affect the SAFE/UNSAFE decision.")
+    else:
+        model_status_html = "No model has been trained yet."
+
     html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -4865,7 +5094,7 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .toolbar select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
 .ai-label-btn{{background:var(--info);}}
 .ai-nav-btn-disabled{{background:#c7cdd2;cursor:default;}}
-#classifyStatus{{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}}
+#classifyStatus,#trainStatus{{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}}
 .ai-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}}
 .ai-card{{background:#fafbfc;border-radius:10px;padding:8px;position:relative;}}
 .ai-card-select{{display:block;cursor:pointer;}}
@@ -4884,6 +5113,14 @@ a{{color:var(--accent);}}
 <h1>🏷️ AI Learning — Classify</h1>
 <p class="subtitle"><a href="/">&larr; Back to Observatory Control</a> &nbsp;&middot;&nbsp;
 <a href="/logs">🗒 Logs</a></p>
+
+<div class="card">
+  <p class="hint" id="modelStatus">{model_status_html}</p>
+  <p class="hint">Classified so far, per label (need at least {AI_MODEL_MIN_SAMPLES_PER_CLASS} of each to
+  train): {eligibility_html}</p>
+  <button type="button" class="btn" onclick="trainModel()">Train model now</button>
+  <p id="trainStatus"></p>
+</div>
 
 <div class="card">
   <p class="hint">Pick a label from the row below, then click one or more images to select them (or
@@ -4937,6 +5174,21 @@ function applyLabel(label) {{
       status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
     }})
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
+}}
+function trainModel() {{
+  const status = document.getElementById('trainStatus');
+  status.textContent = 'Training...';
+  fetch('/ai-train-model')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to train: unknown error';
+        return;
+      }}
+      status.textContent = 'Trained on ' + data.sample_count + ' classified samples. Reload this page ' +
+        'to see the updated breakdown, or check the dashboard for its live prediction.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to train: ' + err; }});
 }}
 </script>
 </body></html>"""
