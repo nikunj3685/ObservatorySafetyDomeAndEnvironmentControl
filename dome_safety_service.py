@@ -959,7 +959,8 @@ def _ai_training_cleanup():
     """Delete UNLABELED AI Learning samples (and their images) older than
     ai_learning.unlabeled_retention_days - never a labeled one, no matter
     its age; a manual classification makes it curated training data, and
-    only a person removing it themselves (not built yet) should do that.
+    only a person removing it themselves (see _delete_ai_training_samples()
+    and the Classify page's Delete buttons) should do that.
     0 (or missing) means never auto-delete unlabeled samples either.
     Best-effort, matches _log_cleanup()'s philosophy."""
     retention_days = get_setting("ai_learning").get("unlabeled_retention_days", 0)
@@ -5176,15 +5177,78 @@ def ai_classify_export():
                       download_name=f"ai_training_export_{stamp}.zip")
 
 
-def _render_ai_classify_card(sample, tz):
-    sid = sample["id"]
-    sensors = sample.get("sensors") or {}
-    ts = sample.get("ts", 0)
-    time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
-                if ts else "Unknown time")
-    label = sample.get("label")
-    label_badge_html = f'<span class="ai-label-badge">{label}</span>' if label else ""
+def _delete_ai_training_samples(ids):
+    """Removes the given sample ids from the index and deletes their image
+    files from disk - used by both "Delete selected" (any mix of labeled
+    and unlabeled ids) and "Delete ALL classified images" below. This is
+    the manual removal _ai_training_cleanup() above always deferred to a
+    person, rather than guessing when a classified sample is no longer
+    wanted. Best-effort on the file removal, matching that function's own
+    philosophy - a stuck file must never block dropping the record.
+    Returns the number of samples actually removed."""
+    idx = _load_ai_training_index()
+    id_set = set(ids)
+    keep = []
+    removed = 0
+    for sample in idx["samples"]:
+        if sample["id"] not in id_set:
+            keep.append(sample)
+            continue
+        removed += 1
+        try:
+            img_path = os.path.join(AI_TRAINING_IMAGES_DIR, sample.get("image", ""))
+            if sample.get("image") and os.path.isfile(img_path):
+                os.remove(img_path)
+        except Exception as e:
+            print(f"[ai-learning] delete: failed to remove image {sample.get('image')}: {e}")
+    if removed:
+        idx["samples"] = keep
+        _save_ai_training_index(idx)
+    return removed
 
+
+@app.route("/ai-classify-delete", methods=["GET"])
+def ai_classify_delete():
+    """Permanently deletes one or more selected samples (image + record) -
+    the Classify page's "Delete selected" action, on either grid-view's
+    checkbox selection or the one-by-one view's single current image.
+    Works on labeled and unlabeled samples alike. JSON, not a redirect,
+    for the same reason as /ai-classify-save."""
+    ids = [i for i in request.args.get("ids", "").split(",") if i]
+    if not ids:
+        return jsonify({"ok": False, "error": "missing ids"}), 400
+    removed = _delete_ai_training_samples(ids)
+    if removed:
+        _log_event("Settings", f"AI Learning: deleted {removed} sample(s) from the classify page")
+    idx = _load_ai_training_index()
+    return jsonify({"ok": True, "deleted": removed,
+                     "unlabeled_count": sum(1 for s in idx["samples"] if s.get("label") is None),
+                     "total_count": len(idx["samples"])})
+
+
+@app.route("/ai-classify-delete-classified", methods=["GET"])
+def ai_classify_delete_classified():
+    """Permanently deletes every currently-labeled sample (image + record),
+    leaving unlabeled ones untouched - the Classify page's "Delete ALL
+    classified images" action, for starting a training set over (e.g.
+    after a labeling mistake) without also losing whatever's still
+    waiting to be classified."""
+    idx = _load_ai_training_index()
+    ids = [s["id"] for s in idx["samples"] if s.get("label")]
+    removed = _delete_ai_training_samples(ids)
+    if removed:
+        _log_event("Settings", f"AI Learning: deleted all {removed} classified sample(s)")
+    idx = _load_ai_training_index()
+    return jsonify({"ok": True, "deleted": removed,
+                     "unlabeled_count": sum(1 for s in idx["samples"] if s.get("label") is None),
+                     "total_count": len(idx["samples"])})
+
+
+def _ai_classify_chips_html(sensors):
+    """Shared by both the grid card and the one-by-one single card below -
+    keeping the sensor-chip logic in one place means a fix like the raw
+    MLX temp/delta display applies to every view, not just whichever one
+    happened to be edited."""
     chips = []
     if sensors.get("environment_temp_c") is not None:
         chips.append(f"Outside {sensors['environment_temp_c']:.1f}C {sensors.get('environment_humidity') or 0:.0f}%RH")
@@ -5205,7 +5269,17 @@ def _render_ai_classify_card(sample, tz):
         chips.append(f"Rain {sensors['rain']}")
     if sensors.get("ml_cloud"):
         chips.append(f"ML {sensors['ml_cloud']}")
-    chips_html = "".join(f'<span class="ai-chip">{c}</span>' for c in chips)
+    return "".join(f'<span class="ai-chip">{c}</span>' for c in chips)
+
+
+def _render_ai_classify_card(sample, tz):
+    sid = sample["id"]
+    label = sample.get("label")
+    label_badge_html = f'<span class="ai-label-badge">{label}</span>' if label else ""
+    ts = sample.get("ts", 0)
+    time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
+                if ts else "Unknown time")
+    chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
 
     img_url = f"/ai-training-image/{sample['image']}?w=220"
     full_url = f"/ai-training-image/{sample['image']}"
@@ -5221,6 +5295,30 @@ def _render_ai_classify_card(sample, tz):
 </div>"""
 
 
+def _render_ai_classify_single_card(sample, tz, position, total):
+    """The one-by-one view's card - the same info as a grid card, but one
+    at a time and at full size, since the whole point of this view is
+    "let me actually see this frame clearly" rather than a 220px
+    thumbnail. No checkbox (nothing to batch-select here); a per-image
+    Delete button instead."""
+    sid = sample["id"]
+    label = sample.get("label")
+    label_badge_html = f'<span class="ai-label-badge">Currently: {label}</span>' if label else ""
+    ts = sample.get("ts", 0)
+    time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
+                if ts else "Unknown time")
+    chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
+    full_url = f"/ai-training-image/{sample['image']}"
+    return f"""<div class="ai-single-card" id="singleCard" data-id="{sid}">
+  <div class="ai-single-position">Image {position + 1} of {total}</div>
+  <img class="ai-single-img" src="{full_url}" alt="All Sky frame">
+  {label_badge_html}
+  <div class="ai-card-time">{time_str}</div>
+  <div class="ai-card-chips">{chips_html}</div>
+  <button type="button" class="btn ai-delete-btn" onclick="deleteSingle()">🗑 Delete this image</button>
+</div>"""
+
+
 @app.route("/ai-classify", methods=["GET"])
 def ai_classify_page():
     ai_cfg = get_setting("ai_learning")
@@ -5228,10 +5326,17 @@ def ai_classify_page():
     show = request.args.get("show", "unclassified")
     if show not in ("unclassified", "all"):
         show = "unclassified"
+    view = request.args.get("view", "grid")
+    if view not in ("grid", "single"):
+        view = "grid"
     try:
         page = max(0, int(request.args.get("page", 0)))
     except ValueError:
         page = 0
+    try:
+        sidx = max(0, int(request.args.get("idx", 0)))
+    except ValueError:
+        sidx = 0
 
     idx = _load_ai_training_index()
     all_samples = idx["samples"]
@@ -5260,8 +5365,24 @@ def ai_classify_page():
                   "<p class='hint'>Nothing to classify right now — samples build up over time once AI "
                   "Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
 
+    # One-by-one view: same filtered/sorted list as the grid, but indexed to
+    # a single position instead of paged - clamped so a stale idx (e.g. from
+    # deleting/classifying the last item on the list) never 404s or crashes.
+    total_filtered = len(filtered)
+    sidx = max(0, min(sidx, total_filtered - 1)) if total_filtered else 0
+    if total_filtered == 0:
+        single_card_html = ("<p class='hint'>Nothing to classify right now — samples build up over time once "
+                             "AI Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
+    else:
+        single_card_html = _render_ai_classify_single_card(filtered[sidx], tz, sidx, total_filtered)
+    prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx - 1}">&larr; Prev</a>'
+                         if sidx > 0 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
+    next_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx + 1}">Next &rarr;</a>'
+                         if sidx < total_filtered - 1 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
+
+    label_fn = "applyLabel" if view == "grid" else "applyLabelSingle"
     label_buttons_html = "".join(
-        f'<button type="button" class="btn ai-label-btn" onclick="applyLabel(\'{c}\')">{c}</button>'
+        f'<button type="button" class="btn ai-label-btn" onclick="{label_fn}(\'{c}\')">{c}</button>'
         for c in label_classes) or (
         "<p class='hint'>No labels are configured — add some under "
         "<a href='/#ai-learning-settings'>Settings &rarr; AI Learning</a>.</p>")
@@ -5269,6 +5390,27 @@ def ai_classify_page():
     show_options = "".join(
         f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
         for v, t in [("unclassified", "Unclassified only"), ("all", "All samples")])
+
+    view_toggle_html = (f'<a class="btn" href="/ai-classify?show={show}&amp;view=single&amp;idx=0">👁 One by one</a>'
+                         if view == "grid" else
+                         f'<a class="btn" href="/ai-classify?show={show}&amp;view=grid&amp;page=0">▦ Grid view</a>')
+
+    # Bulk-select controls only make sense against a grid of checkboxes.
+    grid_controls_html = ('<button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>'
+                           '<button type="button" class="btn" onclick="selectAll(false)">Clear selection</button>'
+                           '<button type="button" class="btn ai-delete-btn" onclick="deleteSelected()">Delete selected</button>'
+                           if view == "grid" else "")
+
+    instructions_html = (
+        'Pick a label from the row below, then click one or more images to select them (or '
+        '"Select all shown"), then click the label — it applies to every image you\'ve selected at once, '
+        'or use <b>Delete selected</b> to remove them instead. Sorted oldest-first so a run of '
+        'near-identical overnight frames sits together and can be classified in one go.'
+        if view == "grid" else
+        'Viewing one image at a time — clicking a label classifies it and automatically moves on to the '
+        'next; use Prev/Next below to browse without classifying, and <b>Delete this image</b> on the '
+        'card to remove just this one.'
+    )
 
     prev_link_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;page={page - 1}">&larr; Prev</a>'
                        if has_prev else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
@@ -5292,6 +5434,10 @@ def ai_classify_page():
     export_html = (f'<a class="btn" href="/ai-classify-export">Download labeled images (.zip)</a>'
                    if total_labeled else
                    '<span class="btn ai-nav-btn-disabled">Download labeled images (.zip)</span>')
+    delete_all_html = (f'<button type="button" class="btn ai-delete-btn" '
+                        f'onclick="deleteAllClassified({total_labeled})">Delete ALL classified images</button>'
+                        if total_labeled else
+                        '<span class="btn ai-nav-btn-disabled">Delete ALL classified images</span>')
     eligibility_html = "".join(
         f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
@@ -5362,6 +5508,13 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .ai-chip{{background:#eceff1;border-radius:6px;padding:2px 6px;font-size:11px;color:var(--muted);}}
 .ai-fullsize-link{{display:inline-block;margin-top:6px;font-size:12px;}}
 .pager{{display:flex;justify-content:space-between;margin-top:16px;}}
+.ai-delete-btn{{background:#c0392b;}}
+.ai-single-wrap{{display:flex;justify-content:center;}}
+.ai-single-card{{background:#fafbfc;border-radius:10px;padding:14px;position:relative;max-width:640px;width:100%;text-align:center;}}
+.ai-single-img{{width:100%;max-height:65vh;object-fit:contain;border-radius:8px;background:#14161a;display:block;margin:0 auto;}}
+.ai-single-position{{font-size:12px;color:var(--muted);margin-bottom:6px;}}
+.ai-single-card .ai-card-chips{{justify-content:center;}}
+.ai-single-card .ai-delete-btn{{margin-top:10px;}}
 a{{color:var(--accent);}}
 </style></head><body>
 
@@ -5381,30 +5534,27 @@ a{{color:var(--accent);}}
   <p class="hint">{total_labeled} labeled sample(s) total, across {len(classified_counts)} label(s). Bundles
   as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
   your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
-  {export_html}
+  <div class="toolbar">{export_html}{delete_all_html}</div>
 </div>
 
 <div class="card">
-  <p class="hint">Pick a label from the row below, then click one or more images to select them (or
-  "Select all shown"), then click the label — it applies to every image you've selected at once. Sorted
-  oldest-first so a run of near-identical overnight frames sits together and can be classified in one go.
+  <p class="hint">{instructions_html}
   Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
   <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
   <form class="toolbar" action="/ai-classify" method="get">
     <select name="show" onchange="this.form.submit()">{show_options}</select>
+    <input type="hidden" name="view" value="{view}">
     <button type="submit" class="btn">Filter</button>
-    <button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>
-    <button type="button" class="btn" onclick="selectAll(false)">Clear selection</button>
+    {view_toggle_html}
+    {grid_controls_html}
   </form>
   <div class="toolbar">{label_buttons_html}</div>
   <p id="classifyStatus"></p>
 </div>
 
-<div class="ai-grid" id="aiGrid">
-{cards_html}
-</div>
-
-<div class="pager">{prev_link_html}{next_link_html}</div>
+{'<div class="ai-grid" id="aiGrid">' + cards_html + '</div><div class="pager">' + prev_link_html + next_link_html + '</div>'
+ if view == "grid" else
+ '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
 
 <script>
 function selectAll(check) {{
@@ -5436,6 +5586,94 @@ function applyLabel(label) {{
       status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
     }})
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
+}}
+function deleteSelected() {{
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
+  const status = document.getElementById('classifyStatus');
+  if (ids.length === 0) {{
+    status.textContent = 'Select at least one image first.';
+    return;
+  }}
+  if (!confirm('Delete ' + ids.length + ' selected image(s)? This cannot be undone.')) return;
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete?ids=' + encodeURIComponent(ids.join(',')))
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+        return;
+      }}
+      ids.forEach(id => {{
+        const el = document.getElementById('ai-card-' + id);
+        if (el) el.remove();
+      }});
+      const totalEl = document.getElementById('aiTotalCount');
+      const unlabeledEl = document.getElementById('aiUnlabeledCount');
+      if (totalEl) totalEl.textContent = data.total_count;
+      if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
+      status.textContent = 'Deleted ' + data.deleted + ' image(s).';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
+}}
+function deleteAllClassified(count) {{
+  if (!count) return;
+  if (!confirm('Delete ALL ' + count + ' classified image(s)? This cannot be undone and does not ' +
+               'affect unclassified samples.')) return;
+  const status = document.getElementById('classifyStatus');
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete-classified')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+        return;
+      }}
+      status.textContent = 'Deleted ' + data.deleted + ' classified image(s). Reloading...';
+      window.location.reload();
+    }})
+    .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
+}}
+function applyLabelSingle(label) {{
+  const card = document.getElementById('singleCard');
+  if (!card) return;
+  const id = card.dataset.id;
+  const status = document.getElementById('classifyStatus');
+  status.textContent = 'Saving...';
+  fetch('/ai-classify-save?ids=' + encodeURIComponent(id) + '&label=' + encodeURIComponent(label))
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+        return;
+      }}
+      // "all samples": a classified image stays in this same list (just
+      // relabeled), so move forward or the same image would show forever.
+      // "unclassified only": it drops OUT of the list, so staying at the
+      // same index naturally shows whatever shifted into that slot next.
+      const nextIdx = ('{show}' === 'all') ? {sidx} + 1 : {sidx};
+      window.location = '/ai-classify?show={show}&view=single&idx=' + nextIdx;
+    }})
+    .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
+}}
+function deleteSingle() {{
+  const card = document.getElementById('singleCard');
+  if (!card) return;
+  const id = card.dataset.id;
+  if (!confirm('Delete this image? This cannot be undone.')) return;
+  const status = document.getElementById('classifyStatus');
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete?ids=' + encodeURIComponent(id))
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+        return;
+      }}
+      // A deleted image always drops out of every list, so staying at the
+      // same index shows whatever shifted into that slot next.
+      window.location = '/ai-classify?show={show}&view=single&idx={sidx}';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
 }}
 function trainModel() {{
   const status = document.getElementById('trainStatus');
