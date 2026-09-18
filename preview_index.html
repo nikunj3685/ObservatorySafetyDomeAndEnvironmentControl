@@ -41,7 +41,8 @@ h1{font-size:21px;margin:2px 0 2px;}
      Hardware Pins & Addresses, then ASCOM Device Names (kept right after
      Hardware Pins since device naming is really just another facet of
      "how this hardware is set up"); column 3 is Dome & Heater, All Sky
-     Camera, then Service Control. Deliberately NOT css grid rows -
+     Camera, AI Learning (right after All Sky since it depends on it),
+     then Service Control. Deliberately NOT css grid rows -
      grid would force every item in the same row to match the tallest
      one, so a group in one column growing taller (e.g. Dome & Heater
      picking up new fields) used to stretch an unrelated, shorter group
@@ -517,6 +518,32 @@ a{color:var(--accent-safety);}
       doesn't end up with two overlapping info boxes.</p>
       <button type="submit" class="btn btn-neutral">Save All Sky</button>
     </form>
+  </div>
+
+  <div class="settings-group" id="ai-learning-settings">
+    <h3>AI Learning</h3>
+    <p class="hint">Collects training data for later, manually-classified sky-condition models —
+    right now this only saves a raw All Sky frame plus the full sensor reading, on a timer, whenever
+    All Sky Camera (above) is also enabled and configured. Nothing is trained or used in the safety
+    decision yet; there's no classification page to review these on yet either — this is just the
+    data-collection groundwork for that.</p>
+    <form action="/save-ai-learning" method="get">
+      <label><input type="checkbox" name="aiLearningEnable" >
+      Enable AI Learning data capture</label>
+      <label>Capture interval (minutes)</label>
+      <input type="number" name="aiCaptureIntervalMin" min="1" value="15" class="narrow-number">
+      <label>Keep UNLABELED samples for this many days (0 = never auto-delete)</label>
+      <input type="number" name="aiUnlabeledRetentionDays" min="0" value="45" class="narrow-number">
+      <p class="hint">Only unlabeled samples ever get auto-deleted by age — once you classify one it's
+      curated training data and is kept regardless of how old it gets.</p>
+      <label>Classification labels (comma-separated)</label>
+      <input type="text" name="aiLabelClasses" value="Clear,Cloudy,Rain">
+      <p class="hint">Edit this list any time — new labels just become new choices whenever the
+      classification page (a later phase) exists.</p>
+      <button type="submit" class="btn btn-neutral">Save AI Learning</button>
+    </form>
+    <p class="hint">Samples collected so far: <b>0</b> (0 not yet
+    classified).</p>
   </div>
 
   <div class="settings-group" id="service-control">
