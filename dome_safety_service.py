@@ -48,6 +48,7 @@ dome_config.json next to this script - edit by hand or through the web
 page at http://<pi-ip>:11112/ and http://<pi-ip>:11112/config.
 """
 
+import io
 import json
 import math
 import os
@@ -60,7 +61,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, available_timezones
 
 import requests
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 
 import board
 import RPi.GPIO as GPIO
@@ -119,6 +120,7 @@ HEATER_PWM_WINDOW_SEC = 4.0  # same time-proportioning technique as the ESP32 - 
                              # mass is far too slow to care about switching frequency
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dome_config.json")
+STATUS_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "status_history.json")
 
 DEFAULT_SETTINGS = {
     "schedule": {
@@ -189,6 +191,17 @@ DEFAULT_SETTINGS = {
         "tz_name": "UTC",
         "night_threshold_deg": -12.0,          # nautical twilight, matches the ESP32 default
         "clear_sky_delta_threshold_c": 15.0,   # matches CLEAR_SKY_DELTA_THRESHOLD_C on the ESP32
+        # Which sensor supplies the "ambient" side of the MLX90614's
+        # ambient-vs-sky clear/cloud delta: "bme280" (outside air - the
+        # default, and the most accurate proxy for true outside temperature
+        # if it's installed), "dht11" (box air - less accurate, but usable
+        # if BME280 isn't installed), or "mlx_ambient" (the MLX90614's own
+        # onboard ambient sensor - reads warmer box/enclosure air since
+        # only its IR eye faces the sky, but always available since it's
+        # tied to the same sensor as the sky reading itself). If the
+        # selected sensor is unavailable/stale, the check reports Unknown
+        # rather than silently substituting a different sensor.
+        "ambient_sensor_source": "bme280",
     },
     "heater": {
         "freeze_threshold_c": 0.0,
@@ -251,6 +264,28 @@ DEFAULT_SETTINGS = {
         "enabled": False,
         "image_location": "",
         "page_url": "",
+        # Writes a plain-text file every poll cycle with the current
+        # sensor readings, one line at a time, at this exact path -
+        # matching Allsky's own Settings -> Overlay -> "Extra Text File"
+        # field (paste the SAME path into both places - this default
+        # assumes this script lives at /home/pi/pi-safety-aggregator/,
+        # matching this project's own layout; adjust it under Settings if
+        # yours lives somewhere else). Allsky reads that file itself and
+        # displays its lines stacked under its other overlay info, right
+        # in its own capture routine - so Allsky's own live view/gallery,
+        # this page, and every saved log snapshot all end up showing the
+        # same baked-in text from one source, instead of us drawing our
+        # own box on top of a copy of the image after the fact. Only
+        # meaningful when Allsky runs on THIS Pi (a local path Allsky can
+        # read straight off disk) - clear it under Settings if not. Allsky
+        # has its own "Max Age Of Extra" setting that stops showing this
+        # file's content if it goes stale - nothing extra needed here for
+        # that.
+        "extra_text_file": "/home/pi/pi-safety-aggregator/allsky_extra.txt",
+        # Once Allsky's own overlay is doing the job, our own drawn box on
+        # /allsky-image and saved snapshots (see _overlay_sensor_info()) is
+        # redundant clutter on top of it - check this to skip drawing ours.
+        "extra_data_skip_own_overlay": False,
     },
     # User-editable display names for each sensor/actuator, shown on the
     # Hardware Pins form and everywhere that sensor's reading is tagged
@@ -434,6 +469,188 @@ def _log_sensor_snapshot():
     }
 
 
+def _format_sky_line(s, loc):
+    """One text line for the MLX90614 clear/cloud check, shared by
+    _write_allsky_extra_data() and _overlay_sensor_info() so both stay in
+    sync: the tri-state itself, then - whenever known - the raw sky
+    temperature, the ambient reference reading actually used, the
+    configured Clear-sky delta threshold, and the calculated delta
+    between them. Any piece that isn't currently known (e.g. Unknown
+    state with no fresh MLX reading at all) is simply left out rather
+    than shown as a blank or a crash."""
+    bits = [s["mlx_sky_state"]]
+    sky_c = s.get("mlx_sky_c")
+    ambient_c = s.get("mlx_ambient_ref_c")
+    delta = s.get("mlx_delta_c")
+    # The configured threshold is always a known setting, even when there's
+    # no live reading to judge it against - only show it once at least one
+    # of the actual readings is known, so a bare "Unknown" state doesn't
+    # get a lone, context-free threshold number tacked onto it.
+    threshold_c = loc.get("clear_sky_delta_threshold_c") if (sky_c is not None or ambient_c is not None) else None
+    if sky_c is not None:
+        bits.append(f"Sky {sky_c:.1f}C")
+    if ambient_c is not None:
+        bits.append(f"Ambient {ambient_c:.1f}C")
+    if threshold_c is not None:
+        bits.append(f"Threshold {threshold_c:.1f}C")
+    if delta is not None:
+        bits.append(f"Δ {delta:.1f}C")
+    if len(bits) == 1:
+        return bits[0]
+    return f"{bits[0]} (" + ", ".join(bits[1:]) + ")"
+
+
+def _write_allsky_extra_data():
+    """Best-effort write of the current sensor readings, one per line, into
+    the plain-text file configured at Settings -> All Sky Camera -> Extra
+    Text File. This is the SAME path you paste into Allsky's own Settings
+    -> Overlay -> "Extra Text File" field - Allsky reads that file itself,
+    in its own capture routine, and stacks its lines underneath its other
+    overlay info at capture time. So Allsky's own live view/gallery, this
+    page, and every saved log snapshot all end up showing the exact same
+    baked-in text from one source, rather than each place needing its own
+    copy of the logic (see _overlay_sensor_info() below, which is this
+    service's OWN after-the-fact alternative to this - the two are
+    independent and either or both can be used).
+
+    Just plain lines of text - no JSON, no variable names, no per-field
+    expiration - Allsky's own "Max Age Of Extra" setting (under its own
+    Settings page) is what stops it from showing this file's content if
+    it goes stale; nothing extra is needed here for that. A no-op
+    whenever the path isn't configured (the default).
+
+    Never raises - a failed write here must never affect this service's
+    own operation; Allsky just keeps showing whatever it last read."""
+    dest = get_setting("allsky").get("extra_text_file", "").strip()
+    if not dest:
+        return
+    try:
+        with sensor_lock:
+            s = dict(sensor_state)
+        now = time.time()
+        loc = get_setting("location")
+        try:
+            tz = ZoneInfo(loc.get("tz_name", "UTC"))
+        except Exception:
+            tz = timezone.utc
+
+        rain_fresh = s["rain_ok"] and (now - s["rain_last_poll"] <= STALE_AFTER_SEC)
+        cloud_fresh = s["cloud_ok"] and (now - s["cloud_last_poll"] <= STALE_AFTER_SEC)
+        env_fresh = s["env_temp_c"] is not None and (
+            (now - s["bme_last_poll"] <= STALE_AFTER_SEC) if s["env_source"] == "BME280"
+            else (now - s["dht_last_poll"] <= STALE_AFTER_SEC) if s["env_source"] == "DHT11" else False)
+        box_fresh = now - s["dht_last_poll"] <= STALE_AFTER_SEC
+
+        lines = [
+            _format_ampm(datetime.fromtimestamp(now, tz).strftime("%Y-%m-%d %I:%M:%S %p")),
+            f"Outside: {s['env_temp_c']:.1f}C {s['env_humidity']:.0f}%RH" if env_fresh else "Outside: N/A",
+            f"Box: {s['dht_temp_c']:.1f}C {s['dht_humidity']:.0f}%RH" if box_fresh else "Box: N/A",
+            f"Sky: {_format_sky_line(s, loc)}",
+            f"Rain: {('Rain' if s['rain_detected'] else 'Dry') if rain_fresh else 'Unknown'}",
+            f"ML Cloud: {s['cloud_class'] if cloud_fresh else 'Unknown'}",
+            f"Overall: {'SAFE' if s['overall_safe'] else 'UNSAFE'}",
+        ]
+
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = dest + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, dest)  # atomic - Allsky never sees a half-written file
+    except Exception as e:
+        print(f"[allsky] Failed to write the Extra Text File for Allsky's own overlay: {e}")
+
+
+def _overlay_sensor_info(image_bytes):
+    """Burns a timestamp + all key sensor readings onto the bottom-left
+    corner of an All Sky frame, as a solid (not alpha-blended, to sidestep
+    PIL RGBA-on-RGB pitfalls) dark box of white text - same drawing
+    technique already used for the OLED status screen (Image.new/
+    ImageDraw.Draw/ImageFont.load_default, see display_loop() above).
+    Used for BOTH the live dashboard image (via the /allsky-image route)
+    and saved Event Log snapshots (via _capture_allsky_image() below), so
+    every All Sky frame the user ever looks at carries the readings that
+    were current at the moment it was captured/served.
+
+    This is this service's OWN after-the-fact overlay - independent of
+    (and skippable via Settings -> All Sky Camera -> "Skip this service's
+    own drawn overlay" once) _write_allsky_extra_data() above, which feeds
+    Allsky's OWN overlay system instead so it can bake the same
+    information in at capture time.
+
+    Wrapped in a broad try/except that returns the ORIGINAL bytes
+    unchanged on any failure - a broken overlay must never break image
+    display or log capture."""
+    if get_setting("allsky").get("extra_data_skip_own_overlay"):
+        return image_bytes
+    try:
+        with sensor_lock:
+            s = dict(sensor_state)
+        now = time.time()
+        loc = get_setting("location")
+        tz_name = loc.get("tz_name", "UTC")
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+        timestamp_str = _format_ampm(
+            datetime.fromtimestamp(now, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
+
+        rain_fresh = s["rain_ok"] and (now - s["rain_last_poll"] <= STALE_AFTER_SEC)
+        cloud_fresh = s["cloud_ok"] and (now - s["cloud_last_poll"] <= STALE_AFTER_SEC)
+        env_fresh = s["env_temp_c"] is not None and (
+            (now - s["bme_last_poll"] <= STALE_AFTER_SEC) if s["env_source"] == "BME280"
+            else (now - s["dht_last_poll"] <= STALE_AFTER_SEC) if s["env_source"] == "DHT11" else False)
+        box_fresh = now - s["dht_last_poll"] <= STALE_AFTER_SEC
+
+        rain_display = ("Rain" if s["rain_detected"] else "Dry") if rain_fresh else "Unknown"
+        ml_cloud_display = s["cloud_class"] if cloud_fresh else "Unknown"
+        sky_display = _format_sky_line(s, loc)
+        overall_display = "SAFE" if s["overall_safe"] else "UNSAFE"
+
+        lines = [
+            timestamp_str,
+            f"Outside: {s['env_temp_c']:.1f}C {s['env_humidity']:.0f}%RH" if env_fresh else "Outside: N/A",
+            f"Box: {s['dht_temp_c']:.1f}C {s['dht_humidity']:.0f}%RH" if box_fresh else "Box: N/A",
+            f"Sky: {sky_display}",
+            f"Rain: {rain_display}",
+            f"ML Cloud: {ml_cloud_display}",
+            f"Overall: {overall_display}",
+        ]
+
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        line_h = 12
+        pad = 4
+        # The Sky line can run long (state + sky/ambient temps + threshold
+        # + delta) - size the box to the longest actual line rather than a
+        # fixed width, so it never overflows outside its own black
+        # background, capped so it never runs past the image's own edge.
+        try:
+            longest_line_px = max(draw.textlength(line, font=font) for line in lines)
+        except AttributeError:
+            # textlength() needs Pillow >= 8.0 - fall back to a fixed
+            # width on anything older rather than failing the overlay.
+            longest_line_px = 220 - pad * 2
+        box_w = min(int(longest_line_px) + pad * 2, img.width - 8)
+        box_h = pad * 2 + line_h * len(lines)
+        box_x0, box_y0 = 4, max(4, img.height - box_h - 4)
+        draw.rectangle((box_x0, box_y0, box_x0 + box_w, box_y0 + box_h), fill=(0, 0, 0))
+        for i, line in enumerate(lines):
+            color = (0, 255, 0) if (line.startswith("Overall:") and s["overall_safe"]) else \
+                    (255, 60, 60) if line.startswith("Overall:") else (255, 255, 255)
+            draw.text((box_x0 + pad, box_y0 + pad + i * line_h), line, font=font, fill=color)
+
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        return out.getvalue()
+    except Exception as e:
+        print(f"[allsky] Failed to overlay sensor info on image: {e}")
+        return image_bytes
+
+
 def _capture_allsky_image():
     """Best-effort copy of the CURRENT All Sky frame into logs/images/, for a
     log entry that wants one attached. Returns the saved filename (relative
@@ -450,13 +667,15 @@ def _capture_allsky_image():
         if allsky_is_url(loc):
             r = requests.get(loc, timeout=HTTP_TIMEOUT_SEC)
             r.raise_for_status()
-            with open(dest, "wb") as f:
-                f.write(r.content)
+            data = r.content
         else:
             if not os.path.isfile(loc):
                 return None
-            with open(loc, "rb") as src, open(dest, "wb") as dst:
-                dst.write(src.read())
+            with open(loc, "rb") as src:
+                data = src.read()
+        data = _overlay_sensor_info(data)
+        with open(dest, "wb") as f:
+            f.write(data)
         return fname
     except Exception as e:
         print(f"[logs] Failed to capture All Sky snapshot: {e}")
@@ -827,6 +1046,11 @@ sensor_state = {
     # gate_mlx_cloud above stays boolean (fail-safe: Unknown counts the same
     # as Cloudy for the SAFE/UNSAFE decision) - this is display-only detail.
     "mlx_sky_state": "Unknown", "mlx_sky_reason": "no reading yet",
+    # The ambient reading actually used for the clear/cloud delta (per the
+    # "ambient_sensor_source" setting), which sensor it came from, and the
+    # resulting delta - all display-only, recomputed every cycle alongside
+    # gate_mlx_cloud/mlx_sky_state above.
+    "mlx_ambient_ref_c": None, "mlx_ambient_ref_source": None, "mlx_delta_c": None,
 
     # "Previous status" for each safety-affecting check - what it read
     # before its most recent change, and when that change happened. Both
@@ -1060,28 +1284,70 @@ _prev_delayed_safe = False  # edge detection for the safe-report hold timer actu
 # without having to watch the page continuously. Only ever written from
 # recompute_overall_safe(), which runs on the single sensor_poll_loop
 # thread, so - like _raw_safe_since above - this doesn't need sensor_lock.
-_status_history = {}
+def _load_status_history():
+    """Best-effort load of the persisted status-change history. Returns {}
+    on a missing file or any read/parse error - a fresh, empty history is a
+    safe fallback (it just means every check looks "not yet confirmed"
+    until its first genuine change is observed again)."""
+    try:
+        if os.path.exists(STATUS_HISTORY_PATH):
+            with open(STATUS_HISTORY_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_status_history():
+    """Best-effort persist of the current status-change history. Never
+    raises - a failed write just means the next restart re-seeds from
+    scratch, which is no worse than the old in-memory-only behavior."""
+    try:
+        with open(STATUS_HISTORY_PATH, "w") as f:
+            json.dump(_status_history, f, indent=2)
+    except Exception:
+        pass
+
+
+_status_history = _load_status_history()
 
 
 def _track_status_change(key, current_value, now):
     """Records `current_value` under `key`; if it differs from the value
     last recorded under this key, that OLD value + the current timestamp
     become the new "previous status" - returned as (prev_value, prev_since).
-    The very FIRST time a key is seen (right after a restart, since this
-    history is in-memory only), there's nothing to compare against yet - so
-    rather than staying blank until a genuine change happens (which for a
-    slow-changing check like Rain or Day/Night could be hours), it's seeded
-    with the current reading itself, timestamped now: "this is what it's
-    read since coming up." A real change later still replaces it with the
-    true previous value and when that change actually happened."""
-    hist = _status_history.setdefault(key, {"last_seen": None, "prev": None, "since": None})
+    Persisted to disk (status_history.json) so the "previous status" shown
+    on the page reflects when a check actually last changed, not when the
+    service happened to last restart.
+
+    The very FIRST time a key is EVER seen (no history on disk at all for
+    it), there's nothing real to compare against yet, so nothing is
+    reported as "previous" - `confirmed` stays False and this returns
+    (None, None) until a genuine change is observed. On every later poll,
+    including the first poll after a restart, the freshly-read value is
+    compared against what was persisted before: if it matches, the old
+    prev/since/confirmed (from before the restart) are left exactly as
+    they were, so the displayed "Previously X at <time>" line survives
+    restarts unchanged; if it genuinely differs, that's a real transition
+    and prev/since are updated and saved to disk immediately."""
+    hist = _status_history.setdefault(
+        key, {"last_seen": None, "prev": None, "since": None, "confirmed": False})
+    changed = False
     if hist["last_seen"] is None:
-        hist["prev"] = current_value
-        hist["since"] = now
+        # First-ever observation for this key - just seed last_seen, don't
+        # claim a "previous" value that never actually happened.
+        hist["last_seen"] = current_value
+        changed = True
     elif current_value != hist["last_seen"]:
         hist["prev"] = hist["last_seen"]
         hist["since"] = now
-    hist["last_seen"] = current_value
+        hist["confirmed"] = True
+        hist["last_seen"] = current_value
+        changed = True
+    if changed:
+        _save_status_history()
+    if not hist.get("confirmed"):
+        return None, None
     return hist["prev"], hist["since"]
 
 
@@ -1157,20 +1423,34 @@ def recompute_overall_safe():
         # The MLX90614 normally lives inside the equipment enclosure (only
         # its IR eye has a clear view of the sky), so its own onboard
         # ambient-temperature sensor reads the box's air - which runs
-        # warmer than the true outside air. An inflated ambient widens the
-        # ambient-vs-sky delta past the "Clear" threshold even on a
-        # genuinely cloudy night (the failure mode this fixes). Use the
-        # BME280's true outside-air reading as the ambient reference
-        # whenever it's fresh; fall back to the MLX's own ambient sensor
-        # only if no BME280 reading is available (e.g. not installed).
+        # warmer than the true outside air, inflating the ambient-vs-sky
+        # delta past the "Clear" threshold even on a genuinely cloudy
+        # night. Which sensor actually supplies "ambient" is user-selected
+        # (Settings -> Safety Checks -> Ambient temperature source) rather
+        # than a fixed fallback chain - if the selected sensor isn't
+        # available, that's reported as Unknown below instead of silently
+        # substituting a different one.
         bme_fresh = sensor_state["bme_ok"] and (now - sensor_state["bme_last_poll"] <= STALE_AFTER_SEC)
-        if mlx_fresh:
-            ambient_ref_c = sensor_state["bme_temp_c"] if bme_fresh else sensor_state["mlx_ambient_c"]
+        dht_fresh = sensor_state["dht_ok"] and (now - sensor_state["dht_last_poll"] <= STALE_AFTER_SEC)
+        ambient_source = loc.get("ambient_sensor_source", "bme280")
+        if ambient_source == "dht11":
+            ambient_ref_c = sensor_state["dht_temp_c"] if dht_fresh else None
+        elif ambient_source == "mlx_ambient":
+            ambient_ref_c = sensor_state["mlx_ambient_c"] if mlx_fresh else None
+        else:  # "bme280" (default) - also the fallback for an unrecognized value
+            ambient_ref_c = sensor_state["bme_temp_c"] if bme_fresh else None
+        ambient_ref_source = ambient_source if ambient_ref_c is not None else None
+
+        if mlx_fresh and ambient_ref_c is not None:
             delta = ambient_ref_c - sensor_state["mlx_sky_c"]
             gate_mlx_cloud = delta >= loc["clear_sky_delta_threshold_c"]
         else:
+            delta = None
             gate_mlx_cloud = False
         sensor_state["gate_mlx_cloud"] = gate_mlx_cloud
+        sensor_state["mlx_ambient_ref_c"] = ambient_ref_c
+        sensor_state["mlx_ambient_ref_source"] = ambient_ref_source
+        sensor_state["mlx_delta_c"] = delta
         mlx_cloud_pass = gate_mlx_cloud if checks["mlx_cloud_enabled"] else True
         sensor_state["mlx_cloud_pass"] = mlx_cloud_pass
 
@@ -1179,6 +1459,8 @@ def recompute_overall_safe():
         # it on; "Unknown" (with a specific reason) in every other case, so
         # the page never has to guess between "genuinely cloudy" and "we
         # just don't know" the way a single Clear/not-Clear boolean would.
+        ambient_source_names = {"bme280": names["bme280"], "dht11": names["dht11"],
+                                 "mlx_ambient": f"{names['mlx90614']}'s onboard ambient sensor"}
         if not MLX_INSTALLED:
             sensor_state["mlx_sky_state"] = "Unknown"
             sensor_state["mlx_sky_reason"] = "disabled under Hardware Pins"
@@ -1188,6 +1470,11 @@ def recompute_overall_safe():
         elif not mlx_fresh:
             sensor_state["mlx_sky_state"] = "Unknown"
             sensor_state["mlx_sky_reason"] = "reading is stale"
+        elif ambient_ref_c is None:
+            sensor_state["mlx_sky_state"] = "Unknown"
+            sensor_state["mlx_sky_reason"] = (
+                f"{ambient_source_names.get(ambient_source, ambient_source)} (selected ambient "
+                "source) is unavailable")
         else:
             sensor_state["mlx_sky_state"] = "Clear" if gate_mlx_cloud else "Cloudy"
             sensor_state["mlx_sky_reason"] = ""
@@ -1196,8 +1483,12 @@ def recompute_overall_safe():
         if checks["mlx_cloud_enabled"]:
             prev = _log_status_change("log_mlx", sensor_state["mlx_sky_state"])
             if prev is not None:
+                delta_suffix = (f" (Δ {delta:.1f}°C, threshold "
+                                 f"{loc['clear_sky_delta_threshold_c']:.1f}°C)"
+                                 if delta is not None else "")
                 pending_logs.append(("Safety", f"Sky/ambient temperature check ({names['mlx90614']}) changed "
-                                                f"from {prev} to {sensor_state['mlx_sky_state']}", "info", "mlx"))
+                                                f"from {prev} to {sensor_state['mlx_sky_state']}"
+                                                f"{delta_suffix}", "info", "mlx"))
 
         # simpleCloudDetect ML classifier (new vs. the ESP32)
         cloud_fresh = sensor_state["cloud_ok"] and (now - sensor_state["cloud_last_poll"] <= STALE_AFTER_SEC)
@@ -1302,6 +1593,11 @@ def recompute_overall_safe():
         for category, message, severity, image_mode in pending_logs:
             want_image = image_flags.get(image_mode, False)
             _log_event(category, message, severity, sensors=snapshot, image=want_image)
+
+    # Every cycle, not just when something changed - Allsky's "extra data"
+    # file needs to stay current for whatever frame it captures next,
+    # regardless of whether any of OUR checks flipped this time.
+    _write_allsky_extra_data()
 
 
 _startup_connectivity_logged = False
@@ -2523,6 +2819,7 @@ def livestatus():
         "bme_pressure": s["bme_pressure"],
         "box_temp_c": s["dht_temp_c"], "box_humidity": s["dht_humidity"],
         "mlx_ambient_c": s["mlx_ambient_c"], "mlx_sky_c": s["mlx_sky_c"],
+        "mlx_delta_c": s["mlx_delta_c"], "mlx_ambient_ref_source": s["mlx_ambient_ref_source"],
         "rain_detected": s["rain_detected"],
         "cloud_class": s["cloud_class"], "cloud_confidence": s["cloud_confidence"],
         "cloud_ignored": s["cloud_ignored"],
@@ -2732,6 +3029,8 @@ def save_checks():
             s["location"]["night_threshold_deg"] = float(request.args["thresh"])
         if "delta" in request.args:
             s["location"]["clear_sky_delta_threshold_c"] = float(request.args["delta"])
+        if request.args.get("ambientSensor") in ("bme280", "dht11", "mlx_ambient"):
+            s["location"]["ambient_sensor_source"] = request.args["ambientSensor"]
         s["safety_safe_delay"]["enabled"] = "safedelay" in request.args
         if "safedelaymin" in request.args:
             s["safety_safe_delay"]["delay_minutes"] = float(request.args["safedelaymin"])
@@ -2832,6 +3131,9 @@ def save_allsky():
             s["allsky"]["image_location"] = request.args["imageLocation"].strip()
         if "pageUrl" in request.args:
             s["allsky"]["page_url"] = request.args["pageUrl"].strip()
+        if "extraTextFile" in request.args:
+            s["allsky"]["extra_text_file"] = request.args["extraTextFile"].strip()
+        s["allsky"]["extra_data_skip_own_overlay"] = "skipOwnOverlay" in request.args
     update_settings(patch)
     _log_event("Settings", "All Sky Camera settings saved")
     return "", 302, {"Location": "/#allsky-settings"}
@@ -2839,20 +3141,34 @@ def save_allsky():
 
 @app.route("/allsky-image", methods=["GET"])
 def allsky_image():
-    """Serves the configured All Sky image straight off this Pi's disk, for
-    the local-file-path case - an http(s):// image_location is never routed
-    through here at all, the page just points its <img> straight at that URL
-    instead (see allsky_is_url() / web_index())."""
+    """Serves the configured All Sky image with the sensor-info overlay
+    burned on - for BOTH the local-file-path case and the http(s):// URL
+    case. Always proxied through here (web_index() points the dashboard's
+    <img> at this route unconditionally, never straight at an external
+    URL) so the live dashboard image gets the same overlay as saved Event
+    Log snapshots, regardless of where the configured image actually
+    lives (see allsky_is_url())."""
     cfg = get_setting("allsky")
     if not cfg["enabled"]:
         return "All Sky is disabled in Settings", 404
     loc = cfg["image_location"]
-    if not loc or allsky_is_url(loc):
-        return "No local All Sky image file is configured", 404
-    if not os.path.isfile(loc):
-        return f"All Sky image not found at {loc}", 404
-    resp = send_file(loc, conditional=False)
-    # Always re-read from disk - this is a live camera feed, not a static
+    if not loc:
+        return "No All Sky image location is configured", 404
+    try:
+        if allsky_is_url(loc):
+            r = requests.get(loc, timeout=HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            data = r.content
+        else:
+            if not os.path.isfile(loc):
+                return f"All Sky image not found at {loc}", 404
+            with open(loc, "rb") as f:
+                data = f.read()
+    except Exception as e:
+        return f"Failed to fetch All Sky image: {e}", 502
+    data = _overlay_sensor_info(data)
+    resp = Response(data, mimetype="image/jpeg")
+    # Always re-fetch/re-read - this is a live camera feed, not a static
     # asset, and the whole point of the periodic JS refresh is a fresh frame.
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -3068,9 +3384,25 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if box_last_good:
         box_row += _field_row("", "", box_last_good, "prev-status")
 
-    sky_row = _field_row(mlx_dot, "🌌", f"""Sky: 🌡️ <b>{f"{s['mlx_sky_c']:.1f}&deg;C" if s['mlx_sky_c'] is not None else 'N/A'}</b> &nbsp;
+    # When the ambient reference for the clear/cloud delta is a sensor OTHER
+    # than the sky sensor's own onboard ambient (i.e. BME280 or DHT11 was
+    # selected under Settings), show that sensor's current reading, with its
+    # name, between the sky temperature and the MLX90614's own ambient
+    # reading - so it's clear at a glance which number the delta is actually
+    # using.
+    ambient_ref_source = s.get("mlx_ambient_ref_source")
+    ambient_ref_extra = ""
+    if ambient_ref_source in ("bme280", "dht11"):
+        ambient_ref_name = sensor_names["bme280"] if ambient_ref_source == "bme280" else sensor_names["dht11"]
+        ambient_ref_val = s.get("mlx_ambient_ref_c")
+        ambient_ref_extra = f""" &nbsp;
+  <span class="muted">{ambient_ref_name}:</span> <b>{f"{ambient_ref_val:.1f}&deg;C" if ambient_ref_val is not None else 'N/A'}</b>"""
+    mlx_delta_c = s.get("mlx_delta_c")
+    mlx_delta_suffix = f", &Delta; {mlx_delta_c:.1f}&deg;C" if mlx_delta_c is not None else ""
+
+    sky_row = _field_row(mlx_dot, "🌌", f"""Sky: 🌡️ <b>{f"{s['mlx_sky_c']:.1f}&deg;C" if s['mlx_sky_c'] is not None else 'N/A'}</b>{ambient_ref_extra} &nbsp;
   🌬️ <b>{f"{s['mlx_ambient_c']:.1f}&deg;C" if s['mlx_ambient_c'] is not None else 'N/A'}</b>
-  ({s['mlx_sky_state']}{f" &mdash; {s['mlx_sky_reason']}" if s['mlx_sky_state'] == 'Unknown' else ''})
+  ({s['mlx_sky_state']}{mlx_delta_suffix}{f" &mdash; {s['mlx_sky_reason']}" if s['mlx_sky_state'] == 'Unknown' else ''})
   <span class="tag">{sensor_names['mlx90614']}</span>{mlx_disabled_tag}""")
     mlx_prev = _prev_status_text(s["mlx_prev_state"], s["mlx_prev_since"], tz_name)
     if mlx_prev:
@@ -3192,12 +3524,14 @@ def web_index():
     allsky_enabled = allsky["enabled"]
     allsky_image_location = allsky["image_location"]
     allsky_page_url = allsky["page_url"]
-    # An http(s):// location is loaded by the browser directly from wherever
-    # it points (e.g. another device's own all-sky web server); anything
-    # else is treated as a local file path on this Pi and served through our
-    # own /allsky-image route instead.
-    allsky_img_base_src = (allsky_image_location if allsky_is_url(allsky_image_location)
-                            else "/allsky-image")
+    allsky_extra_text_file = allsky.get("extra_text_file", "")
+    allsky_skip_own_overlay = allsky.get("extra_data_skip_own_overlay", False)
+    # Always proxied through our own /allsky-image route - whether the
+    # configured location is a local file path on this Pi or an http(s)://
+    # URL for another device's all-sky web server - so the sensor-info
+    # overlay (timestamp + key readings) gets burned onto the image
+    # regardless of where it actually comes from. See allsky_image().
+    allsky_img_base_src = "/allsky-image"
     allsky_img_initial_src = f"{allsky_img_base_src}{'&' if '?' in allsky_img_base_src else '?'}_t={int(time.time())}"
     dome_snap = dome.snapshot()
     with sensor_lock:
@@ -3565,10 +3899,18 @@ a{{color:var(--accent-safety);}}
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="{loc['night_threshold_deg']}">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
       <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="{loc['clear_sky_delta_threshold_c']}">
-      <p class="hint">(Ambient − sky) must be at least this many degrees to call it "Clear" — ambient is the
-      BME280's outside-air reading when available (falls back to the MLX90614's own onboard ambient sensor
-      otherwise, since that sensor usually sits inside the enclosure and reads warmer box air, not true
-      outside air). Enable/disable the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <label>Ambient temperature source (for the delta above)</label>
+      <select name="ambientSensor">
+        <option value="bme280"{' selected' if loc['ambient_sensor_source'] == 'bme280' else ''}>{sensor_names['bme280']} (outside air)</option>
+        <option value="dht11"{' selected' if loc['ambient_sensor_source'] == 'dht11' else ''}>{sensor_names['dht11']} (box air)</option>
+        <option value="mlx_ambient"{' selected' if loc['ambient_sensor_source'] == 'mlx_ambient' else ''}>{sensor_names['mlx90614']}'s own onboard ambient sensor</option>
+      </select>
+      <p class="hint">(Ambient − sky) must be at least this many degrees to call it "Clear" — ambient comes from
+      whichever sensor is selected above, not a fixed fallback chain. BME280 (outside air) is the most accurate
+      choice if it's installed; the MLX90614's own onboard ambient sensor is always available but usually sits
+      inside the enclosure and reads warmer box air, not true outside air. If the selected sensor is
+      unavailable, this check reports Unknown rather than silently substituting a different one. Enable/disable
+      the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
       <label><input type="checkbox" name="mlcloud" {"checked" if checks['ml_cloud_enabled'] else ""}> Simple Cloud Detect ML check</label>
       <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
       <input type="text" name="mlcloudignore" value="{checks['ml_cloud_ignore_classes']}" placeholder="e.g. Glare, Fogged Lens">
@@ -3778,6 +4120,22 @@ a{{color:var(--accent-safety);}}
        placeholder="http://192.168.1.50/allsky/">
       <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
       it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
+
+      <label>Extra Text File path (only if Allsky runs on THIS Pi — clear it otherwise)</label>
+      <input type="text" name="extraTextFile" value="{allsky_extra_text_file}"
+       placeholder="/home/pi/pi-safety-aggregator/allsky_extra.txt">
+      <p class="hint">Every poll cycle this service writes the current sensor readings (outside/box
+      temp+humidity, Sky state + delta, Rain, ML Cloud, overall SAFE/UNSAFE) — one per line — to this
+      exact path. Defaults to a file next to this script, assuming the usual install location — adjust it
+      above if this script actually lives somewhere else on your Pi. Paste this SAME path into Allsky's
+      own Settings → Overlay → "Extra Text File" field, and Allsky will stack these lines under its other
+      overlay info AT CAPTURE TIME — so Allsky's own live view/gallery, this page, and every saved log
+      snapshot all show the exact same baked-in text, from one source. Allsky's own "Max Age Of Extra"
+      setting handles hiding it if this service stops updating it. Leave blank to turn this off.</p>
+      <label><input type="checkbox" name="skipOwnOverlay" {"checked" if allsky_skip_own_overlay else ""}>
+      Skip this service's own drawn overlay on /allsky-image and saved snapshots</label>
+      <p class="hint">Check this once Allsky's own overlay (above) is showing the readings, so the image
+      doesn't end up with two overlapping info boxes.</p>
       <button type="submit" class="btn btn-neutral">Save All Sky</button>
     </form>
   </div>
