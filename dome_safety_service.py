@@ -57,6 +57,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, available_timezones
 
@@ -5126,6 +5127,55 @@ def ai_train_model():
                      "classes": model["classes"], "class_counts": model["class_counts"]})
 
 
+def _safe_export_folder_name(label):
+    """Label text is free-form (Settings -> AI Learning -> label list), so
+    turn it into something safe to use as a zip folder name rather than
+    trusting it directly - collapse anything that isn't alphanumeric,
+    space, hyphen, or underscore into a hyphen."""
+    cleaned = "".join(c if c.isalnum() or c in " -_" else "-" for c in label).strip()
+    return cleaned or "Unlabeled"
+
+
+def _ai_training_export_zip():
+    """Builds an in-memory .zip of every labeled AI Learning sample, one
+    folder per label (Clear/, Cloudy/, ...) - the same folder-per-class
+    layout Teachable Machine's own image uploader expects, so the export
+    can be dragged straight into (or added onto) that project to retrain
+    simpleCloudDetect on more of your own sky, class by class. Unlabeled
+    samples are skipped - there's nothing usable in them yet. Returns
+    (zip_bytes_io, labeled_count)."""
+    idx = _load_ai_training_index()
+    labeled = [s for s in idx["samples"] if s.get("label")]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for sample in labeled:
+            src = os.path.join(AI_TRAINING_IMAGES_DIR, sample.get("image", ""))
+            if not os.path.isfile(src):
+                continue  # index and disk can drift apart (e.g. manual cleanup) - skip, don't fail the whole export
+            folder = _safe_export_folder_name(sample["label"])
+            zf.write(src, arcname=f"{folder}/{sample['id']}.jpg")
+    buf.seek(0)
+    return buf, len(labeled)
+
+
+@app.route("/ai-classify-export", methods=["GET"])
+def ai_classify_export():
+    """Downloads every labeled sample as a single .zip, one folder per
+    label - the "grow the same Teachable Machine project over time" path
+    from the setup guide: simpleCloudDetect's exported model file itself
+    can't be appended to after export, but the underlying Teachable
+    Machine project can be reopened and fed more images per class, then
+    re-exported. This is a plain page navigation (not fetch), same as
+    /logs/image/<name> above, since the point is a file download."""
+    buf, count = _ai_training_export_zip()
+    if count == 0:
+        return ("No labeled samples yet — classify at least one image on this page first.", 400)
+    _log_event("Settings", f"AI Learning: exported {count} labeled sample(s) as a zip for retraining")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                      download_name=f"ai_training_export_{stamp}.zip")
+
+
 def _render_ai_classify_card(sample, tz):
     sid = sample["id"]
     sensors = sample.get("sensors") or {}
@@ -5233,6 +5283,15 @@ def ai_classify_page():
         lbl = sample.get("label")
         if lbl:
             classified_counts[lbl] = classified_counts.get(lbl, 0) + 1
+    total_labeled = sum(classified_counts.values())
+    # The export feeds simpleCloudDetect's *retraining* workflow, not this
+    # model - see the AI Learning section of the setup guide: its exported
+    # model file isn't appendable, but the Teachable Machine project behind
+    # it can be grown with more per-class images and re-exported, which is
+    # exactly the folder-per-label layout this zip produces.
+    export_html = (f'<a class="btn" href="/ai-classify-export">Download labeled images (.zip)</a>'
+                   if total_labeled else
+                   '<span class="btn ai-nav-btn-disabled">Download labeled images (.zip)</span>')
     eligibility_html = "".join(
         f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
@@ -5316,6 +5375,13 @@ a{{color:var(--accent);}}
   train): {eligibility_html}</p>
   <button type="button" class="btn" onclick="trainModel()">Train model now</button>
   <p id="trainStatus"></p>
+</div>
+
+<div class="card">
+  <p class="hint">{total_labeled} labeled sample(s) total, across {len(classified_counts)} label(s). Bundles
+  as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
+  your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
+  {export_html}
 </div>
 
 <div class="card">
