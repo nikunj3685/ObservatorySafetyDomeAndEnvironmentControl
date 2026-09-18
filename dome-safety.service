@@ -1,0 +1,25 @@
+[Unit]
+Description=Pi Safety Aggregator - Dome/SafetyMonitor/ObservingConditions Alpaca server + web dashboard
+After=network.target
+
+[Service]
+Type=simple
+# Change both if you cloned this somewhere other than the pi user's home
+# directory - WorkingDirectory must be wherever dome_safety_service.py
+# (and dome_config.json / status_history.json / logs/ / ai_training/,
+# all created next to it on first run) actually lives.
+User=pi
+WorkingDirectory=/home/pi/pi-safety-aggregator
+ExecStart=/usr/bin/python3 dome_safety_service.py
+Restart=on-failure
+RestartSec=5
+
+# Needed for the Settings page's Service Control "Restart service"/"Reboot
+# Pi" buttons (dome_safety_service.py shells out to sudo systemctl for
+# both) - see the passwordless-sudo visudo line in README.md/the Setup
+# Guide's Service Control section. Not needed for the service to run at
+# all, only for those two buttons to work from the web page.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

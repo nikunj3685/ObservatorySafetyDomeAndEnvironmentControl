@@ -1,0 +1,11 @@
+# Pin matches the one-line pip install in README.md's Setup section.
+# adafruit-circuitpython-* / rpi-lgpio talk to real GPIO/I2C hardware, so
+# this only installs cleanly on a Raspberry Pi (or with those hardware
+# libraries stubbed out, as the test suite under obs_test/ does).
+flask
+requests
+adafruit-circuitpython-bme280
+adafruit-circuitpython-mlx90614
+adafruit-circuitpython-dht
+adafruit-extended-bus
+rpi-lgpio

@@ -26,14 +26,14 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
 | `preview_index.html` | A static snapshot of the dashboard's rendered HTML, for reference/preview only (not served by the app). |
 | `safety_aggregator.py` | An earlier prototype that only fused an ESP32 weather station's SafetyMonitor with simpleCloudDetect over the network - superseded by `dome_safety_service.py`, which reads all sensors directly off this Pi's own GPIO/I2C instead. Kept for history. |
 | `docker-compose.clouddetect.yml` | Compose file for running simpleCloudDetect itself (pointed at Allsky's captured image) alongside this service. |
+| `requirements.txt` | Pinned pip dependency list - `pip install -r requirements.txt`. |
+| `dome-safety.service` | Ready-to-copy systemd unit file - see "Running as a systemd service" below. |
 | `test_bme_mlx.py`, `test_dht_reed.py`, `test_mlx_oled.py`, `test_mosfet.py`, `test_relay.py` | One-off hardware bring-up scripts used while wiring each sensor/actuator - not part of the running service. |
 
 ## Setup
 
 ```bash
-pip install flask requests adafruit-circuitpython-bme280 \
-            adafruit-circuitpython-mlx90614 adafruit-circuitpython-dht \
-            adafruit-extended-bus rpi-lgpio
+pip install -r requirements.txt
 python3 dome_safety_service.py
 ```
 
@@ -45,9 +45,11 @@ When **All Sky Camera** is enabled in Settings, this service can burn the curren
 
 ### Running as a systemd service
 
-Create a unit file (e.g. `/etc/systemd/system/dome-safety.service`) that runs `python3 dome_safety_service.py` as whatever user owns the GPIO/I2C devices, then:
+Copy the included `dome-safety.service` unit file into place (edit its `User=`/`WorkingDirectory=` first if this isn't cloned to `/home/pi/pi-safety-aggregator` and run as `pi`), then:
 
 ```bash
+sudo cp dome-safety.service /etc/systemd/system/dome-safety.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now dome-safety.service
 ```
 
