@@ -184,6 +184,15 @@ DEFAULT_SETTINGS = {
         # by default (feature off) since no such class exists until one is
         # trained and named in Teachable Machine.
         "ml_cloud_ignore_classes": "",
+        # Fifth gate, off by default: the from-scratch sky-condition model
+        # trained on the Classify page (see _train_ai_sky_model()). Its
+        # enable/disable toggle and its "which predicted labels count as
+        # SAFE" list both live on the AI Learning settings form instead of
+        # here (next to the model itself and its training data) - same
+        # convention as rain_enabled/mlx_cloud_enabled living on Hardware
+        # Pins. See recompute_overall_safe() for the fail-open fallback
+        # behavior when this is on but no valid trained model exists yet.
+        "ai_model_enabled": False,
     },
     "location": {
         "latitude_deg": 0.0,
@@ -305,6 +314,14 @@ DEFAULT_SETTINGS = {
         # (not built yet). 0 = never auto-delete unlabeled samples either.
         "unlabeled_retention_days": 45,
         "label_classes": "Clear, Partly Cloudy, Mostly Cloudy, Overcast, Rain, Snow, Freezing Rain, Ignore",
+        # Phase 4 (see safety_checks.ai_model_enabled): once a trained model
+        # exists and the gate is turned on, a predicted label counts as SAFE
+        # only if it's in this comma-separated, case-insensitive list -
+        # everything else (Cloudy, Rain, Snow, Ignore, ...) fails the gate.
+        # Deliberately conservative by default: only the single clearest
+        # label counts as safe until you've watched this against reality
+        # for a while and decide to widen it.
+        "safe_labels": "Clear",
     },
     # User-editable display names for each sensor/actuator, shown on the
     # Hardware Pins form and everywhere that sensor's reading is tagged
@@ -1344,11 +1361,19 @@ sensor_state = {
     "safe_hold_active": False,       # True while raw is SAFE but we're still waiting out the hold timer
     "safe_hold_remaining_sec": 0,
     "gate_daynight": False, "gate_rain": False, "gate_mlx_cloud": False, "gate_ml_cloud": False,
+    "gate_ai_model": True,
     # "Effective pass" for each gate - same as gate_* above, except a
     # disabled check always counts as passing (green), matching the fusion
     # logic's own "disabled = bypassed, never blocks SAFE" behavior. This is
     # what the status dot next to each reading is colored from.
     "daynight_pass": True, "rain_pass": True, "mlx_cloud_pass": True, "ml_cloud_pass": True,
+    "ai_model_pass": True,
+    # Phase 4 - AI Model gate status, independent of the ai_model_enabled
+    # toggle: "untrained" (no valid model file yet), "no_data" (a valid
+    # model exists but nothing fresh to predict from right now), or "active"
+    # (a real prediction was made this cycle). ai_model_predicted/
+    # ai_model_sample_count are None until status is "active".
+    "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_sample_count": None,
 
     # Tri-state MLX90614 sky reading for display - "Clear"/"Cloudy" only when
     # we actually have a fresh reading; "Unknown" (with a reason) otherwise.
@@ -1814,6 +1839,81 @@ def recompute_overall_safe():
                 pending_logs.append(("Safety", f"ML cloud detection changed from {prev} to {mlcloud_display}",
                                       "info", "mlcloud"))
 
+        # AI sky-condition model (Phase 4) - an optional fifth gate built on
+        # the from-scratch model trained on the Classify page (see
+        # _train_ai_sky_model()/_predict_ai_sky_class() above). Off by
+        # default (checks['ai_model_enabled']). Turning it on without a
+        # valid trained model yet - never trained, or the model file went
+        # missing/corrupt - is deliberately NOT treated as a failure of this
+        # gate: it FAILS OPEN (behaves exactly like the toggle being off) so
+        # a half-set-up AI Learning feature can never itself block the roof
+        # from opening. The same fail-open applies to a moment where none of
+        # the model's features happen to have fresh readings to predict
+        # from. ai_model_status (below) records WHICH of these situations is
+        # currently true, independent of the toggle, so the dashboard can
+        # keep showing "what would the model say right now" even while the
+        # gate itself is off - exactly the Phase 3 informational display,
+        # just now also the source of truth for the live gate above it.
+        ai_cfg = get_setting("ai_learning")
+        ai_model_wanted = checks.get("ai_model_enabled", False)
+        ai_model = _load_ai_sky_model()
+        ai_model_valid = bool(ai_model and ai_model.get("classes") and ai_model.get("class_stats"))
+        ai_predicted = None
+        if ai_model_valid:
+            ai_env_fresh = sensor_state["env_temp_c"] is not None and (
+                bme_fresh if sensor_state["env_source"] == "BME280"
+                else dht_fresh if sensor_state["env_source"] == "DHT11" else False)
+            ai_features = {
+                "environment_temp_c": sensor_state["env_temp_c"] if ai_env_fresh else None,
+                "environment_humidity": sensor_state["env_humidity"] if ai_env_fresh else None,
+                "box_temp_c": sensor_state["dht_temp_c"] if dht_fresh else None,
+                "box_humidity": sensor_state["dht_humidity"] if dht_fresh else None,
+                "mlx_sky_c": sensor_state["mlx_sky_c"] if mlx_fresh else None,
+                "mlx_ambient_ref_c": ambient_ref_c,
+                "mlx_delta_c": delta,
+            }
+            ai_predicted, _ai_scores = _predict_ai_sky_class(ai_model, ai_features)
+
+        if not ai_model_valid:
+            ai_model_status = "untrained"
+        elif ai_predicted is None:
+            ai_model_status = "no_data"
+        else:
+            ai_model_status = "active"
+        sensor_state["ai_model_status"] = ai_model_status
+        sensor_state["ai_model_predicted"] = ai_predicted
+        sensor_state["ai_model_sample_count"] = ai_model.get("sample_count") if ai_model_valid else None
+
+        if ai_model_wanted and ai_model_status == "active":
+            safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
+            gate_ai_model = ai_predicted.strip().lower() in safe_labels
+        else:
+            gate_ai_model = True  # fail open: toggle off, untrained, or no usable reading right now
+        sensor_state["gate_ai_model"] = gate_ai_model
+        ai_model_pass = gate_ai_model
+        sensor_state["ai_model_pass"] = ai_model_pass
+
+        # Edge-triggered notification, keyed off the toggle+status combined
+        # so flipping the toggle OR the model going from untrained -> active
+        # (or vice versa, e.g. its file gets deleted) each get their own
+        # log line - never silent, and never repeated every poll cycle.
+        ai_state_key = ai_model_status if ai_model_wanted else "disabled"
+        prev_ai_state = _log_status_change("log_ai_model_state", ai_state_key)
+        if prev_ai_state is not None:
+            ai_state_messages = {
+                "disabled": "AI Model gate turned off - back to the standard safety checks only",
+                "untrained": "AI Model gate is enabled but no trained model exists yet - falling back to "
+                              "the standard safety checks (train one on the Classify page)",
+                "no_data": "AI Model gate is enabled but has no fresh overlapping sensor readings to "
+                           "predict from right now - falling back to the standard safety checks",
+                "active": f"AI Model gate now has a usable trained model and is contributing to the "
+                          f"SAFE/UNSAFE decision (currently predicting {ai_predicted})",
+            }
+            ai_msg = ai_state_messages.get(ai_state_key)
+            if ai_msg:
+                pending_logs.append(("Safety", ai_msg,
+                                      "info" if ai_state_key in ("active", "disabled") else "warn", "never"))
+
         # Connectivity edges - ALL five polled sensors, regardless of
         # whether their safety CHECK is currently enabled (a loose wire
         # matters even on a sensor whose gate is toggled off right now).
@@ -1832,7 +1932,7 @@ def recompute_overall_safe():
             elif edge == "reconnected":
                 pending_logs.append(("Safety", f"{label} is responding again (reconnected)", "info", "never"))
 
-        auto_safe = daynight_pass and rain_pass and mlx_cloud_pass and ml_cloud_pass
+        auto_safe = daynight_pass and rain_pass and mlx_cloud_pass and ml_cloud_pass and ai_model_pass
         sensor_state["raw_safe"] = auto_safe
 
         # Fail-safe immediately on any UNSAFE transition, but require the raw
@@ -3129,6 +3229,8 @@ def livestatus():
             "rain": {"enabled": checks["rain_enabled"], "pass": s["gate_rain"]},
             "mlx_cloud": {"enabled": checks["mlx_cloud_enabled"], "pass": s["gate_mlx_cloud"]},
             "ml_cloud": {"enabled": checks["ml_cloud_enabled"], "pass": s["gate_ml_cloud"]},
+            "ai_model": {"enabled": checks.get("ai_model_enabled", False), "pass": s["gate_ai_model"],
+                         "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted")},
         },
         "solar_elevation_deg": s["solar_elevation_deg"],
         "daytime_now": s["daytime_now"],
@@ -3473,6 +3575,13 @@ def save_ai_learning():
                 pass
         if "aiLabelClasses" in request.args:
             s["ai_learning"]["label_classes"] = request.args["aiLabelClasses"].strip()
+        # Phase 4: the AI Model gate's enable/disable toggle lives here, next
+        # to the model itself, rather than on Safety Checks - same
+        # convention as rain_enabled/mlx_cloud_enabled living on Hardware
+        # Pins (see DEFAULT_SETTINGS["safety_checks"]["ai_model_enabled"]).
+        s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
+        if "aiSafeLabels" in request.args:
+            s["ai_learning"]["safe_labels"] = request.args["aiSafeLabels"].strip()
     update_settings(patch)
     _log_event("Settings", "AI Learning settings saved")
     return "", 302, {"Location": "/#ai-learning-settings"}
@@ -3747,29 +3856,38 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if mlx_prev:
         sky_row += _field_row("", "", mlx_prev, "prev-status")
 
-    # AI Learning Phase 3 - purely informational: shows what the trained
-    # sky-condition model (see _train_ai_sky_model()) would currently call
-    # it, for comparing against the fixed-threshold decision above over
-    # time. Absent entirely until a model has actually been trained on the
-    # Classify page, and never feeds into the SAFE/UNSAFE decision itself.
+    # AI Learning - Phase 3 built the model+prediction (see
+    # _train_ai_sky_model()/_predict_ai_sky_class()); Phase 4 wired it into
+    # the SAFE/UNSAFE decision as an optional fifth gate (checks
+    # ['ai_model_enabled'], off by default). Every value read below was
+    # already computed once, this same poll cycle, in recompute_overall_
+    # safe() - rendering here never re-predicts, so the dashboard can never
+    # show something different from what actually drove the decision.
+    ai_model_wanted = checks.get("ai_model_enabled", False)
+    ai_status = s.get("ai_model_status")
+    ai_predicted = s.get("ai_model_predicted")
     ai_model_row = ""
-    ai_model = _load_ai_sky_model()
-    if ai_model:
-        ai_features = {
-            "environment_temp_c": s["env_temp_c"] if env_fresh else None,
-            "environment_humidity": s["env_humidity"] if env_fresh else None,
-            "box_temp_c": s["dht_temp_c"] if box_fresh else None,
-            "box_humidity": s["dht_humidity"] if box_fresh else None,
-            "mlx_sky_c": s.get("mlx_sky_c"),
-            "mlx_ambient_ref_c": s.get("mlx_ambient_ref_c"),
-            "mlx_delta_c": s.get("mlx_delta_c"),
-        }
-        ai_predicted, _ai_scores = _predict_ai_sky_class(ai_model, ai_features)
-        if ai_predicted is not None:
-            ai_model_row = _field_row("", "🤖", f"""Model prediction: <b>{ai_predicted}</b>
-  <span class="muted">(trained on {ai_model['sample_count']} classified samples on the
-  <a href="/ai-classify">Classify page</a> - informational only, not used in the SAFE/UNSAFE decision)</span>""",
-                                       "prev-status")
+    if ai_status == "active":
+        ai_dot = _status_dot(
+            s.get("ai_model_pass", True), ai_model_wanted,
+            f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
+            f"{ai_predicted}).",
+            f"AI Model check: passing — model predicts {ai_predicted}.",
+            f"AI Model check: FAILING — model predicts {ai_predicted}.",
+        )
+        using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
+                      else "informational only, not used in the SAFE/UNSAFE decision")
+        ai_model_row = _field_row(ai_dot, "🤖", f"""Model prediction: <b>{ai_predicted}</b>
+  <span class="muted">(trained on {s.get('ai_model_sample_count')} classified samples on the
+  <a href="/ai-classify">Classify page</a> - {using_note})</span>""")
+    elif ai_model_wanted and ai_status == "untrained":
+        ai_model_row = _field_row("", "⚠️",
+            "AI Model gate is enabled but no trained model exists yet — falling back to the standard "
+            "safety checks. <a href=\"/ai-classify\">Train one on the Classify page</a>.", "warn-text")
+    elif ai_model_wanted and ai_status == "no_data":
+        ai_model_row = _field_row("", "⚠️",
+            "AI Model gate is enabled but has no fresh sensor data to predict from right now — falling "
+            "back to the standard safety checks.", "warn-text")
 
     rain_row = _field_row(rain_dot, "☔", f"""Rain: <b>{'WET' if s['rain_detected'] else 'DRY'}</b> <span class="tag">{sensor_names['rain']}</span>{' <span class="muted">(disabled)</span>' if not checks['rain_enabled'] else ''}""")
     rain_prev = _prev_status_text(s["rain_prev_state"], s["rain_prev_since"], tz_name,
@@ -3811,6 +3929,29 @@ def clouddetect_link_for(req):
     return f"http://{host}:11111/setup/v1/safetymonitor/0/setup"
 
 
+def _ai_model_banner_html(s, checks):
+    """Phase 4's prominent, hard-to-miss notification: shown right at the
+    top of the page (appended onto the same warningBanner element the
+    'REDUCED SAFETY CHECKS' banner uses) whenever the AI Model gate is
+    turned on but isn't actually able to contribute to the SAFE/UNSAFE
+    decision right now - either because no valid trained model exists yet,
+    or because there's no fresh overlapping sensor data to predict from
+    this moment. Both cases fail open (see recompute_overall_safe()) - this
+    banner exists purely so that fallback is never silent. Empty string
+    whenever the gate is off, or is actually active."""
+    if not checks.get("ai_model_enabled"):
+        return ""
+    status = s.get("ai_model_status")
+    if status == "untrained":
+        return ("<div class='banner banner-warn'>🤖 <b>AI Model gate is enabled but not trained yet</b> "
+                "&mdash; falling back to the standard safety checks. "
+                "<a href='/ai-classify'>Train a model on the Classify page</a>.</div>")
+    if status == "no_data":
+        return ("<div class='banner banner-warn'>🤖 <b>AI Model gate has no fresh sensor data to predict "
+                "from right now</b> &mdash; falling back to the standard safety checks.</div>")
+    return ""
+
+
 @app.route("/fragments", methods=["GET"])
 def web_fragments():
     """Small pre-rendered HTML snippets + a few raw values, polled by the
@@ -3841,6 +3982,7 @@ def web_fragments():
     if disabled:
         warning_html = (f"<div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> "
                          f"{', '.join(disabled)} disabled &mdash; see <a href='/config'>Settings</a></div>")
+    warning_html += _ai_model_banner_html(s, checks)
 
     override_label = {"AUTO": "Auto (sensor-based)", "FORCE_SAFE": "Forced SAFE — sensors ignored",
                        "FORCE_UNSAFE": "Forced UNSAFE — sensors ignored"}[override_mode]
@@ -3901,10 +4043,10 @@ def web_index():
     ai_capture_interval_min = ai_learning.get("capture_interval_min", 15)
     ai_unlabeled_retention_days = ai_learning.get("unlabeled_retention_days", 0)
     ai_label_classes = ai_learning.get("label_classes", "")
+    ai_safe_labels = ai_learning.get("safe_labels", "Clear")
     # Cheap-enough stat for the Settings page: how many samples are sitting
-    # there right now, and how many still need a human to look at them - no
-    # labeling page to send anyone to yet (that's the next phase), so this is
-    # the only visible sign the capture side is actually doing something.
+    # there right now, and how many still need a human to look at them -
+    # they're reviewed and classified on the /ai-classify page.
     _ai_idx_for_stats = _load_ai_training_index()
     ai_sample_count = len(_ai_idx_for_stats["samples"])
     ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
@@ -3913,6 +4055,27 @@ def web_index():
         s = dict(sensor_state)
     with heater_lock:
         h = dict(heater_state)
+
+    # Phase 4 - one plain-language line under the AI Model fields describing
+    # exactly what's happening right now: off entirely, on but waiting for a
+    # model to exist, on but momentarily starved of fresh sensor data, or
+    # genuinely active and contributing to the decision. recompute_overall_
+    # safe() already logged an Event Log entry for whichever of these is
+    # true right now if it just changed - this is the same information,
+    # always visible, not just at the moment it changes.
+    if checks.get("ai_model_enabled"):
+        _ai_status_hints = {
+            "untrained": "Enabled, but no trained model exists yet — falling back to the standard safety "
+                         "checks. Train one on the <a href=\"/ai-classify\">Classify page</a> first.",
+            "no_data": "Enabled, but there's no fresh overlapping sensor data to predict from right now — "
+                       "falling back to the standard safety checks.",
+            "active": f"Active — currently predicting <b>{s['ai_model_predicted']}</b>, trained on "
+                      f"{s.get('ai_model_sample_count')} classified samples.",
+        }
+        ai_model_status_hint = _ai_status_hints.get(s.get("ai_model_status"), "")
+    else:
+        ai_model_status_hint = ("Off — a trained model (if any) still shows on the dashboard for comparison "
+                                 "only and never affects the SAFE/UNSAFE decision.")
 
     # Link to simpleCloudDetect's own web UI - built from whatever host/IP the
     # browser used to reach THIS page (so it works from any device on the LAN,
@@ -3944,6 +4107,7 @@ def web_index():
     if disabled:
         warning_html = (f"<div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> "
                          f"{', '.join(disabled)} disabled &mdash; see <a href='/config'>Settings</a></div>")
+    warning_html += _ai_model_banner_html(s, checks)
 
     override_label = {"AUTO": "Auto (sensor-based)", "FORCE_SAFE": "Forced SAFE — sensors ignored",
                        "FORCE_UNSAFE": "Forced UNSAFE — sensors ignored"}[override_mode]
@@ -4271,7 +4435,9 @@ a{{color:var(--accent-safety);}}
     <p class="hint hint-warn">Turning any of these off removes that guard from the SAFE/UNSAFE decision
     entirely — a disabled check can never report UNSAFE on its own again.</p>
     <p class="hint">The Rain and MLX90614 check enable/disable toggles live under
-    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings.</p>
+    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings. The AI Model
+    check enable/disable toggle lives under <a href="#ai-learning-settings">AI Learning</a>, right next to
+    the trained model itself.</p>
     <form action="/save-checks" method="get">
       <label><input type="checkbox" name="daynight" {"checked" if checks['daynight_enabled'] else ""}> Day/Night check</label>
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="{loc['night_threshold_deg']}">
@@ -4520,11 +4686,11 @@ a{{color:var(--accent-safety);}}
 
   <div class="settings-group" id="ai-learning-settings">
     <h3>AI Learning</h3>
-    <p class="hint">Collects training data for later sky-condition models — while enabled, and whenever
+    <p class="hint">Collects training data for sky-condition models — while enabled, and whenever
     All Sky Camera (above) is also enabled and configured, saves a raw All Sky frame plus the full
     sensor reading on a timer. Review and manually classify what's been captured on the
-    <a href="/ai-classify">Classify page</a>. Nothing is trained or used in the safety decision yet —
-    that's a later phase, once enough labeled samples exist.</p>
+    <a href="/ai-classify">Classify page</a>, then train a model there once you have enough labeled
+    samples of at least two labels.</p>
     <form action="/save-ai-learning" method="get">
       <label><input type="checkbox" name="aiLearningEnable" {"checked" if ai_learning_enabled else ""}>
       Enable AI Learning data capture</label>
@@ -4536,8 +4702,13 @@ a{{color:var(--accent-safety);}}
       curated training data and is kept regardless of how old it gets.</p>
       <label>Classification labels (comma-separated)</label>
       <input type="text" name="aiLabelClasses" value="{ai_label_classes}">
-      <p class="hint">Edit this list any time — new labels just become new choices whenever the
-      classification page (a later phase) exists.</p>
+      <p class="hint">Edit this list any time — new labels just become new choices on the Classify page.</p>
+      <hr>
+      <label><input type="checkbox" name="aiModelEnable" {"checked" if checks.get('ai_model_enabled') else ""}>
+      Use the trained model in the SAFE/UNSAFE decision</label>
+      <label>Predicted labels that count as SAFE (comma-separated, case-insensitive)</label>
+      <input type="text" name="aiSafeLabels" value="{ai_safe_labels}" placeholder="e.g. Clear">
+      <p class="hint">{ai_model_status_hint}</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
     <p class="hint">Samples collected so far: <b>{ai_sample_count}</b> ({ai_unlabeled_count} not yet
@@ -5058,6 +5229,20 @@ def ai_classify_page():
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
 
     ai_model = _load_ai_sky_model()
+    checks = get_setting("safety_checks")
+    ai_model_wanted = checks.get("ai_model_enabled", False)
+    # Phase 4 note: whether the gate toggle is on changes what this model
+    # actually DOES, so say so right here where it gets trained, not just on
+    # the dashboard - a fresh model is otherwise easy to train and then
+    # forget you still need to flip the switch under Settings to use it.
+    usage_note = (
+        "Its live prediction is <b>actively used in the SAFE/UNSAFE decision</b> "
+        "(see <a href='/#ai-learning-settings'>Settings</a> to change the SAFE labels or turn this off)."
+        if ai_model_wanted else
+        "Its live prediction shows on the <a href='/'>dashboard</a>'s Safety Monitor card for comparison "
+        "only — it does not yet affect the SAFE/UNSAFE decision "
+        "(<a href='/#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
+    )
     if ai_model:
         try:
             trained_tz_str = _format_ampm(datetime.fromtimestamp(ai_model["trained_at"], tz).strftime(
@@ -5066,9 +5251,11 @@ def ai_classify_page():
             trained_tz_str = "unknown time"
         model_breakdown = ", ".join(f"{c}: {n}" for c, n in sorted(ai_model["class_counts"].items()))
         model_status_html = (f"Model trained <b>{trained_tz_str}</b> on <b>{ai_model['sample_count']}</b> "
-                              f"classified samples ({model_breakdown}). Its live prediction shows on the "
-                              f"<a href='/'>dashboard</a>'s Safety Monitor card, for comparison only — it does "
-                              f"not affect the SAFE/UNSAFE decision.")
+                              f"classified samples ({model_breakdown}). {usage_note}")
+    elif ai_model_wanted:
+        model_status_html = ("<b>⚠️ No model has been trained yet</b>, but the AI Model gate is turned on "
+                              "under Settings — it's currently falling back to the standard safety checks "
+                              "until you train one here.")
     else:
         model_status_html = "No model has been trained yet."
 
