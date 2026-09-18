@@ -3644,9 +3644,11 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .allsky-img-wrap img{{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;}}
 @media (min-width:741px){{
   /* Three independent vertical stacks, not a shared grid: column 1 is
-     Location & Timezone, Safety Checks, Logging, then ASCOM Device Names;
-     column 2 is Hardware Pins & Addresses; column 3 is Dome & Heater, All
-     Sky Camera, then Service Control. Deliberately NOT css grid rows -
+     Location & Timezone, Safety Checks, then Logging; column 2 is
+     Hardware Pins & Addresses, then ASCOM Device Names (kept right after
+     Hardware Pins since device naming is really just another facet of
+     "how this hardware is set up"); column 3 is Dome & Heater, All Sky
+     Camera, then Service Control. Deliberately NOT css grid rows -
      grid would force every item in the same row to match the tallest
      one, so a group in one column growing taller (e.g. Dome & Heater
      picking up new fields) used to stretch an unrelated, shorter group
@@ -3968,23 +3970,6 @@ a{{color:var(--accent-safety);}}
     <p class="hint" id="clearImagesStatus"></p>
   </div>
 
-  <div class="settings-group" id="device-names">
-    <h3>ASCOM Device Names</h3>
-    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
-    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
-    clients only re-read this list occasionally, so a change may not show up there until the client itself
-    refreshes it.</p>
-    <form action="/save-device-names" method="get">
-      <label>Safety Monitor</label>
-      <input type="text" name="safetyName" value="{device_names['safety']}">
-      <label>Dome</label>
-      <input type="text" name="domeName" value="{device_names['dome']}">
-      <label>Observing Conditions</label>
-      <input type="text" name="obsName" value="{device_names['obs']}">
-      <button type="submit" class="btn btn-neutral">Save device names</button>
-    </form>
-  </div>
-
   </div>
   <div class="settings-col">
 
@@ -4062,6 +4047,23 @@ a{{color:var(--accent-safety);}}
         <div class="pin-field"><span class="pin-label">Sensor Name</span><input type="text" name="oledName" value="{sensor_names['oled']}" class="sensor-name-input"></div>
       </div>
       <button type="submit" class="btn btn-neutral">Save pins</button>
+    </form>
+  </div>
+
+  <div class="settings-group" id="device-names">
+    <h3>ASCOM Device Names</h3>
+    <p class="hint">What shows up in an ASCOM/Alpaca client's device chooser list (e.g. N.I.N.A., SGP) for
+    each of the three devices this service exposes. Purely cosmetic — takes effect immediately, but most
+    clients only re-read this list occasionally, so a change may not show up there until the client itself
+    refreshes it.</p>
+    <form action="/save-device-names" method="get">
+      <label>Safety Monitor</label>
+      <input type="text" name="safetyName" value="{device_names['safety']}">
+      <label>Dome</label>
+      <input type="text" name="domeName" value="{device_names['dome']}">
+      <label>Observing Conditions</label>
+      <input type="text" name="obsName" value="{device_names['obs']}">
+      <button type="submit" class="btn btn-neutral">Save device names</button>
     </form>
   </div>
 
