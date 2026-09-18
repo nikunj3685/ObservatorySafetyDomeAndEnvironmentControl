@@ -279,7 +279,9 @@ a{color:var(--accent-safety);}
     <p class="hint hint-warn">Turning any of these off removes that guard from the SAFE/UNSAFE decision
     entirely — a disabled check can never report UNSAFE on its own again.</p>
     <p class="hint">The Rain and MLX90614 check enable/disable toggles live under
-    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings.</p>
+    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings. The AI Model
+    check enable/disable toggle lives under <a href="#ai-learning-settings">AI Learning</a>, right next to
+    the trained model itself.</p>
     <form action="/save-checks" method="get">
       <label><input type="checkbox" name="daynight" checked> Day/Night check</label>
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="-12.0">
@@ -522,11 +524,11 @@ a{color:var(--accent-safety);}
 
   <div class="settings-group" id="ai-learning-settings">
     <h3>AI Learning</h3>
-    <p class="hint">Collects training data for later sky-condition models — while enabled, and whenever
+    <p class="hint">Collects training data for sky-condition models — while enabled, and whenever
     All Sky Camera (above) is also enabled and configured, saves a raw All Sky frame plus the full
     sensor reading on a timer. Review and manually classify what's been captured on the
-    <a href="/ai-classify">Classify page</a>. Nothing is trained or used in the safety decision yet —
-    that's a later phase, once enough labeled samples exist.</p>
+    <a href="/ai-classify">Classify page</a>, then train a model there once you have enough labeled
+    samples of at least two labels.</p>
     <form action="/save-ai-learning" method="get">
       <label><input type="checkbox" name="aiLearningEnable" >
       Enable AI Learning data capture</label>
@@ -538,8 +540,13 @@ a{color:var(--accent-safety);}
       curated training data and is kept regardless of how old it gets.</p>
       <label>Classification labels (comma-separated)</label>
       <input type="text" name="aiLabelClasses" value="Clear, Partly Cloudy, Mostly Cloudy, Overcast, Rain, Snow, Freezing Rain, Ignore">
-      <p class="hint">Edit this list any time — new labels just become new choices whenever the
-      classification page (a later phase) exists.</p>
+      <p class="hint">Edit this list any time — new labels just become new choices on the Classify page.</p>
+      <hr>
+      <label><input type="checkbox" name="aiModelEnable" >
+      Use the trained model in the SAFE/UNSAFE decision</label>
+      <label>Predicted labels that count as SAFE (comma-separated, case-insensitive)</label>
+      <input type="text" name="aiSafeLabels" value="Clear" placeholder="e.g. Clear">
+      <p class="hint">Off — a trained model (if any) still shows on the dashboard for comparison only and never affects the SAFE/UNSAFE decision.</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
     <p class="hint">Samples collected so far: <b>0</b> (0 not yet
