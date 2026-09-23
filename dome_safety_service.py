@@ -5230,6 +5230,25 @@ def ai_train_model():
                      "classes": model["classes"], "class_counts": model["class_counts"]})
 
 
+@app.route("/ai-reset-model", methods=["GET"])
+def ai_reset_model():
+    """Deletes the trained sky model file itself - independent of the
+    training images/index, which "Delete selected"/"Delete ALL classified
+    images" already never touch. For when you want to start the model over
+    from scratch (a bad training run, a camera/mount move that changes what
+    "normal" looks like) without losing the classified samples that would
+    still be useful for the next one. A missing/already-absent model file
+    is a harmless no-op, same philosophy as the delete-samples routes."""
+    existed = os.path.exists(AI_MODEL_PATH)
+    if existed:
+        try:
+            os.remove(AI_MODEL_PATH)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Failed to remove the trained model file: {e}"})
+        _log_event("Settings", "AI Learning: trained model reset (classified samples were kept)")
+    return jsonify({"ok": True, "existed": existed})
+
+
 def _safe_export_folder_name(label):
     """Label text is free-form (Settings -> AI Learning -> label list), so
     turn it into something safe to use as a zip folder name rather than
@@ -5545,6 +5564,12 @@ def ai_classify_page():
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
 
     ai_model = _load_ai_sky_model()
+    reset_model_html = (f'<button type="button" class="btn ai-delete-btn" '
+                         f'onclick="if(confirm(\'Reset the trained model? Classified samples are kept '
+                         f'- you can train a new one from them any time.\')) resetModel()">'
+                         f'Reset trained model</button>'
+                         if ai_model else
+                         '<span class="btn ai-nav-btn-disabled">Reset trained model</span>')
     checks = get_setting("safety_checks")
     ai_model_wanted = checks.get("ai_model_enabled", False)
     # Phase 4 note: whether the gate toggle is on changes what this model
@@ -5629,6 +5654,7 @@ a{{color:var(--accent);}}
   <p class="hint">Classified so far, per label (need at least {AI_MODEL_MIN_SAMPLES_PER_CLASS} of each to
   train): {eligibility_html}</p>
   <button type="button" class="btn" onclick="trainModel()">Train model now</button>
+  {reset_model_html}
   <p id="trainStatus"></p>
 </div>
 
@@ -5791,6 +5817,21 @@ function trainModel() {{
         'to see the updated breakdown, or check the dashboard for its live prediction.';
     }})
     .catch(err => {{ status.textContent = 'Failed to train: ' + err; }});
+}}
+function resetModel() {{
+  const status = document.getElementById('trainStatus');
+  status.textContent = 'Resetting...';
+  fetch('/ai-reset-model')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to reset: unknown error';
+        return;
+      }}
+      status.textContent = 'Trained model reset - classified samples were kept. Reload this page, or ' +
+        'train a new one whenever you\\'re ready.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to reset: ' + err; }});
 }}
 </script>
 </body></html>"""
