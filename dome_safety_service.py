@@ -3659,12 +3659,19 @@ def allsky_check():
         return jsonify({"ok": True, "version": str(mtime)})
 
 
-def _status_dot(effective_pass, enabled, tooltip_off, tooltip_ok, tooltip_fail):
-    """A small green/red circle for a safety-check reading, with a hover
-    tooltip explaining exactly why it's that color: green when the check
+def _status_dot(effective_pass, enabled, tooltip_off, tooltip_ok, tooltip_fail, neutral_when_disabled=False):
+    """A small circle for a safety-check reading, with a hover tooltip
+    explaining exactly why it's that color. By default (neutral_when_
+    disabled=False, every existing caller below): green when the check
     currently passes or is disabled (a disabled check always counts as
     passing, same as the fusion logic treats it), red when it's enabled AND
-    actively failing/vetoing SAFE."""
+    actively failing/vetoing SAFE - unchanged from before.
+
+    neutral_when_disabled=True instead shows grey while disabled, even if
+    the underlying reading would otherwise look "safe" - for a check like
+    the AI Model gate, where "disabled" doesn't mean the reading is good,
+    it means the reading isn't being counted at all, and a green dot there
+    falsely implied it was. Still green/red as before once enabled."""
     if not enabled:
         tip = tooltip_off
     elif effective_pass:
@@ -3672,7 +3679,10 @@ def _status_dot(effective_pass, enabled, tooltip_off, tooltip_ok, tooltip_fail):
     else:
         tip = tooltip_fail
     tip = tip.replace('"', "&quot;")
-    cls = "dot-safe" if effective_pass else "dot-unsafe"
+    if not enabled and neutral_when_disabled:
+        cls = "dot-neutral"
+    else:
+        cls = "dot-safe" if effective_pass else "dot-unsafe"
     return f'<span class="status-dot {cls}" title="{tip}"></span>'
 
 
@@ -3876,6 +3886,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
             f"{ai_predicted}).",
             f"AI Model check: passing — model predicts {ai_predicted}.",
             f"AI Model check: FAILING — model predicts {ai_predicted}.",
+            neutral_when_disabled=True,
         )
         using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
                       else "informational only, not used in the SAFE/UNSAFE decision")
@@ -4258,6 +4269,7 @@ fieldset:disabled{{opacity:.5;}}
      vertical-align:middle;cursor:help;box-shadow:0 0 0 1px rgba(0,0,0,.08);flex-shrink:0;}}
 .dot-safe{{background:var(--safe);}}
 .dot-unsafe{{background:var(--unsafe);}}
+.dot-neutral{{background:var(--muted);}}
 /* Every Safety Monitor reading is a 3-column grid row: a dot slot, an icon
    slot, then the text. Each <p> is its own grid, but they all share the
    same column widths, so the dots line up with each other, the icons line
