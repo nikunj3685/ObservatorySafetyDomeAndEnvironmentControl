@@ -4026,6 +4026,15 @@ def web_fragments():
 
     dome_state = dome_snap["state"]
 
+    # How many AI Learning samples are waiting to be classified - shown in
+    # the page subtitle's "Classify (N)" link and in Settings -> AI
+    # Learning, both of which need this on every poll (not just full page
+    # load) so the count doesn't sit stale until a manual refresh while new
+    # samples keep getting captured in the background.
+    _ai_idx_for_stats = _load_ai_training_index()
+    ai_sample_count = len(_ai_idx_for_stats["samples"])
+    ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
+
     return jsonify({
         "dome_state": dome_state,
         "dome_enabled": features["dome_enabled"],
@@ -4040,6 +4049,8 @@ def web_fragments():
         "heater_target_percent": h["target_power_percent"],
         "safe_hold_active": s["safe_hold_active"],
         "safe_hold_remaining_sec": s["safe_hold_remaining_sec"],
+        "ai_sample_count": ai_sample_count,
+        "ai_unlabeled_count": ai_unlabeled_count,
     })
 
 
@@ -4331,7 +4342,7 @@ a{{color:var(--accent-safety);}}
 </style></head><body>
 
 <h1>🔭 Observatory Control</h1>
-<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify ({ai_unlabeled_count})</a></p>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (<span id="classifyCount">{ai_unlabeled_count}</span>)</a></p>
 {location_banner_html}
 <div class="grid">
 <div class="card safety{'' if allsky_enabled else ' full-width'}">
@@ -4764,7 +4775,8 @@ a{{color:var(--accent-safety);}}
       <p class="hint">{ai_model_status_hint}</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
-    <p class="hint">Samples collected so far: <b>{ai_sample_count}</b> ({ai_unlabeled_count} not yet
+    <p class="hint">Samples collected so far: <b id="aiSampleCount">{ai_sample_count}</b>
+    (<span id="aiUnlabeledCount">{ai_unlabeled_count}</span> not yet
     classified) — <a href="/ai-classify">go classify them &rarr;</a></p>
   </div>
 
@@ -4891,6 +4903,13 @@ function poll(){{
       slider.disabled=(d.heater_mode!=='MANUAL');
       if(pwrOut) pwrOut.textContent=d.heater_target_percent;
     }}
+
+    var ccEl=document.getElementById('classifyCount');
+    if(ccEl) ccEl.textContent=d.ai_unlabeled_count;
+    var ascEl=document.getElementById('aiSampleCount');
+    if(ascEl) ascEl.textContent=d.ai_sample_count;
+    var aucEl=document.getElementById('aiUnlabeledCount');
+    if(aucEl) aucEl.textContent=d.ai_unlabeled_count;
   }});
 }}
 setInterval(poll,3000);
