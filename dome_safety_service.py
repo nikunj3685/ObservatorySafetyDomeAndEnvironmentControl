@@ -380,16 +380,25 @@ DEFAULT_SETTINGS = {
     # "keep forever" - both default to a finite window so the Pi's SD card
     # doesn't fill up unattended.
     #
+    # capture_images_enabled - the master switch: while False, NO log entry
+    # ever gets an image attached, no matter what the five image_on_* flags
+    # below say (they're only consulted when this is True). Defaults to
+    # True so behavior is unchanged for anyone upgrading - the five
+    # per-event flags were already the only thing gating image capture.
+    #
     # image_on_* - independently toggleable, per event type, whether that
-    # Logs entry captures an All Sky snapshot. All default to True so a
-    # freshly-set-up system can see "what did the sky actually look like
-    # when this sensor's reading changed" for every one of the five safety
-    # events while everything is still being shaken out; once it's clearly
+    # Logs entry captures an All Sky snapshot (only while capture_images_
+    # enabled above is also True). All default to True so a freshly-set-up
+    # system can see "what did the sky actually look like when this
+    # sensor's reading changed" for every one of the five safety events
+    # while everything is still being shaken out; once it's clearly
     # behaving as expected, any of the five can be switched off from
-    # Settings to stop accumulating images for that event.
+    # Settings to stop accumulating images for that event, or the master
+    # switch can be turned off to stop all image capture in one place.
     "logging": {
         "image_retention_days": 30,
         "log_retention_days": 90,
+        "capture_images_enabled": True,
         "image_on_daynight_change": True,
         "image_on_rain_change": True,
         "image_on_mlx_change": True,
@@ -2017,8 +2026,9 @@ def recompute_overall_safe():
             "mlcloud": logging_cfg["image_on_mlcloud_change"],
             "overall": logging_cfg["image_on_overall_flip"],
         }
+        capture_images_enabled = logging_cfg.get("capture_images_enabled", True)
         for category, message, severity, image_mode in pending_logs:
-            want_image = image_flags.get(image_mode, False)
+            want_image = capture_images_enabled and image_flags.get(image_mode, False)
             _log_event(category, message, severity, sensors=snapshot, image=want_image)
 
     # Every cycle, not just when something changed - Allsky's "extra data"
@@ -3518,11 +3528,25 @@ def save_logging():
             s["logging"]["image_retention_days"] = max(1, int(request.args["imgdays"]))
         if "logdays" in request.args:
             s["logging"]["log_retention_days"] = max(1, int(request.args["logdays"]))
-        s["logging"]["image_on_daynight_change"] = "imgDaynight" in request.args
-        s["logging"]["image_on_rain_change"] = "imgRain" in request.args
-        s["logging"]["image_on_mlx_change"] = "imgMlx" in request.args
-        s["logging"]["image_on_mlcloud_change"] = "imgMlcloud" in request.args
-        s["logging"]["image_on_overall_flip"] = "imgOverall" in request.args
+        master_on = "imgMaster" in request.args
+        s["logging"]["capture_images_enabled"] = master_on
+        # The five per-event checkboxes live inside a <fieldset> that's
+        # marked disabled (via HTML `disabled`, not just greyed out) in the
+        # page whenever the master switch above is off - and a browser
+        # never submits a disabled form control at all, checked or not. So
+        # when the master is off, none of these five keys are present in
+        # request.args regardless of their actual saved state, and treating
+        # their absence as "uncheck it" would silently wipe out whatever
+        # they were set to. Only touch them when the fieldset was actually
+        # enabled at submit time (master_on) - otherwise leave them exactly
+        # as they already are, ready to resume when the master is flipped
+        # back on.
+        if master_on:
+            s["logging"]["image_on_daynight_change"] = "imgDaynight" in request.args
+            s["logging"]["image_on_rain_change"] = "imgRain" in request.args
+            s["logging"]["image_on_mlx_change"] = "imgMlx" in request.args
+            s["logging"]["image_on_mlcloud_change"] = "imgMlcloud" in request.args
+            s["logging"]["image_on_overall_flip"] = "imgOverall" in request.args
     update_settings(patch)
     _log_event("Settings", "Logging settings saved")
     return "", 302, {"Location": "/#logging-settings"}
@@ -4544,6 +4568,13 @@ a{{color:var(--accent-safety);}}
       cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
       above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
       <hr class="sep">
+      <label><input type="checkbox" name="imgMaster" id="imgMasterCheck"
+       onchange="document.getElementById('imgPerEventFields').disabled=!this.checked"
+       {"checked" if logging_cfg.get('capture_images_enabled', True) else ""}> Take images with logs</label>
+      <p class="hint">Master switch for every image below — while off, NO log entry ever gets an All Sky
+      snapshot attached, regardless of the per-event settings underneath. Turn it back on to go back to
+      whatever those five were already set to.</p>
+      <fieldset id="imgPerEventFields" {"" if logging_cfg.get('capture_images_enabled', True) else "disabled"}>
       <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
       checking "what did the sky actually look like when this changed" while a new setup is being shaken
       out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
@@ -4562,6 +4593,7 @@ a{{color:var(--accent-safety);}}
       <div class="setting-row">
         <label><input type="checkbox" name="imgOverall" {"checked" if logging_cfg['image_on_overall_flip'] else ""}> Overall SAFE/UNSAFE change</label>
       </div>
+      </fieldset>
       <button type="submit" class="btn btn-neutral">Save logging settings</button>
     </form>
     <hr class="sep">
