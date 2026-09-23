@@ -173,7 +173,23 @@ DEFAULT_SETTINGS = {
     "safety_checks": {
         "daynight_enabled": True,
         "rain_enabled": False,       # off until the RG-9 is actually wired to GPIO17
-        "mlx_cloud_enabled": True,   # the ESP32's own ambient-vs-sky delta check
+        # mlx_cloud_enabled controls the MLX90614 HARDWARE only - whether it's
+        # installed and polled at all (see MLX_INSTALLED below, and its
+        # checkbox on Hardware Pins). It deliberately does NOT decide whether
+        # the sensor's reading counts toward SAFE/UNSAFE - that's
+        # mlx_gate_enabled just below. Keeping these separate means turning
+        # the sensor's GATE off (e.g. to make room for the AI Model check
+        # instead) never stops the sensor being read - which matters because
+        # the AI model's own predictions are trained on this same sensor's
+        # numbers, and would starve without them.
+        "mlx_cloud_enabled": True,
+        # Whether the MLX90614's ambient-vs-sky delta reading counts toward
+        # the SAFE/UNSAFE decision. Independent of mlx_cloud_enabled above -
+        # see the comment there. Lives on the Safety Checks settings form,
+        # next to ai_model_enabled below, so both of the "is the sky clear"
+        # checks (sensor-based and AI-model-based) sit together; you can
+        # enable either, both, or neither.
+        "mlx_gate_enabled": True,
         "ml_cloud_enabled": True,    # simpleCloudDetect's ML classifier - new vs. the ESP32
         # Comma-separated simpleCloudDetect class name(s) (case-insensitive)
         # to treat as "ignore this frame" - e.g. a custom Teachable Machine
@@ -187,12 +203,12 @@ DEFAULT_SETTINGS = {
         "ml_cloud_ignore_classes": "",
         # Fifth gate, off by default: the from-scratch sky-condition model
         # trained on the Classify page (see _train_ai_sky_model()). Its
-        # enable/disable toggle and its "which predicted labels count as
-        # SAFE" list both live on the AI Learning settings form instead of
-        # here (next to the model itself and its training data) - same
-        # convention as rain_enabled/mlx_cloud_enabled living on Hardware
-        # Pins. See recompute_overall_safe() for the fail-open fallback
-        # behavior when this is on but no valid trained model exists yet.
+        # "which predicted labels count as SAFE" list lives on the AI
+        # Learning settings form, next to the model itself and its training
+        # data, but this toggle lives here on Safety Checks, next to
+        # mlx_gate_enabled above - see recompute_overall_safe() for the
+        # fail-open fallback behavior when this is on but no valid trained
+        # model exists yet (or it has no fresh data to predict from).
         "ai_model_enabled": False,
     },
     "location": {
@@ -1787,7 +1803,7 @@ def recompute_overall_safe():
         sensor_state["mlx_ambient_ref_c"] = ambient_ref_c
         sensor_state["mlx_ambient_ref_source"] = ambient_ref_source
         sensor_state["mlx_delta_c"] = delta
-        mlx_cloud_pass = gate_mlx_cloud if checks["mlx_cloud_enabled"] else True
+        mlx_cloud_pass = gate_mlx_cloud if checks["mlx_gate_enabled"] else True
         sensor_state["mlx_cloud_pass"] = mlx_cloud_pass
 
         # Tri-state read for display, separate from the boolean gate above:
@@ -1816,7 +1832,7 @@ def recompute_overall_safe():
             sensor_state["mlx_sky_reason"] = ""
         sensor_state["mlx_prev_state"], sensor_state["mlx_prev_since"] = \
             _track_status_change("mlx_cloud", sensor_state["mlx_sky_state"], now)
-        if checks["mlx_cloud_enabled"]:
+        if checks["mlx_gate_enabled"]:
             prev = _log_status_change("log_mlx", sensor_state["mlx_sky_state"])
             if prev is not None:
                 delta_suffix = (f" (Δ {delta:.1f}°C, threshold "
@@ -3229,7 +3245,7 @@ def livestatus():
         "gates": {
             "daynight": {"enabled": checks["daynight_enabled"], "pass": s["gate_daynight"]},
             "rain": {"enabled": checks["rain_enabled"], "pass": s["gate_rain"]},
-            "mlx_cloud": {"enabled": checks["mlx_cloud_enabled"], "pass": s["gate_mlx_cloud"]},
+            "mlx_cloud": {"enabled": checks["mlx_gate_enabled"], "pass": s["gate_mlx_cloud"]},
             "ml_cloud": {"enabled": checks["ml_cloud_enabled"], "pass": s["gate_ml_cloud"]},
             "ai_model": {"enabled": checks.get("ai_model_enabled", False), "pass": s["gate_ai_model"],
                          "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted")},
@@ -3440,10 +3456,16 @@ def reboot_pi():
 def save_checks():
     def patch(s):
         s["safety_checks"]["daynight_enabled"] = "daynight" in request.args
-        # rain_enabled / mlx_cloud_enabled are no longer set here - those
-        # checkboxes moved to the Hardware Pins form (see save_pins), next to
-        # each sensor's wiring settings. Deliberately not touched by this
-        # form anymore so saving Safety Checks can't silently reset them.
+        # rain_enabled / mlx_cloud_enabled (the MLX90614 HARDWARE flag, not
+        # its gate) are not set here - those checkboxes live on the Hardware
+        # Pins form (see save_pins), next to each sensor's wiring settings.
+        # Deliberately not touched by this form anymore so saving Safety
+        # Checks can't silently reset them. mlx_gate_enabled and
+        # ai_model_enabled below are different - they only decide what
+        # counts toward SAFE/UNSAFE, not any sensor's wiring, so they live
+        # and are saved here instead.
+        s["safety_checks"]["mlx_gate_enabled"] = "mlxGateEnable" in request.args
+        s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
         if "mlcloudignore" in request.args:
             s["safety_checks"]["ml_cloud_ignore_classes"] = request.args["mlcloudignore"].strip()
@@ -3577,11 +3599,12 @@ def save_ai_learning():
                 pass
         if "aiLabelClasses" in request.args:
             s["ai_learning"]["label_classes"] = request.args["aiLabelClasses"].strip()
-        # Phase 4: the AI Model gate's enable/disable toggle lives here, next
-        # to the model itself, rather than on Safety Checks - same
-        # convention as rain_enabled/mlx_cloud_enabled living on Hardware
-        # Pins (see DEFAULT_SETTINGS["safety_checks"]["ai_model_enabled"]).
-        s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
+        # ai_model_enabled (whether the trained model counts toward the
+        # SAFE/UNSAFE decision) is NOT saved here anymore - it moved to the
+        # Safety Checks form/route (see save_checks()) alongside the other
+        # gate-inclusion toggles. Leaving it here would silently reset it to
+        # False every time this form is saved, since this form no longer has
+        # that checkbox.
         if "aiSafeLabels" in request.args:
             s["ai_learning"]["safe_labels"] = request.args["aiSafeLabels"].strip()
     update_settings(patch)
@@ -3809,11 +3832,12 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
 
     mlx_reason_suffix = f" ({s['mlx_sky_reason']})" if s["mlx_sky_state"] == "Unknown" else ""
     mlx_dot = _status_dot(
-        s["mlx_cloud_pass"], checks["mlx_cloud_enabled"],
+        s["mlx_cloud_pass"], checks["mlx_gate_enabled"],
         f"{sensor_names['mlx90614']} clear-sky check: disabled — not currently used in the SAFE/UNSAFE "
         f"decision (currently reads {s['mlx_sky_state']}).",
         f"{sensor_names['mlx90614']} clear-sky check: passing — ambient-vs-sky delta indicates Clear.",
         f"{sensor_names['mlx90614']} clear-sky check: FAILING — reads {s['mlx_sky_state']}{mlx_reason_suffix}.",
+        neutral_when_disabled=True,
     )
     rain_dot = _status_dot(
         s["rain_pass"], checks["rain_enabled"],
@@ -3987,7 +4011,7 @@ def web_fragments():
         disabled.append("Day/Night")
     if not checks["rain_enabled"]:
         disabled.append("Rain")
-    if not checks["mlx_cloud_enabled"]:
+    if not checks["mlx_gate_enabled"]:
         disabled.append("MLX Cloud")
     if not checks["ml_cloud_enabled"]:
         disabled.append("ML Cloud")
@@ -4088,7 +4112,8 @@ def web_index():
         ai_model_status_hint = _ai_status_hints.get(s.get("ai_model_status"), "")
     else:
         ai_model_status_hint = ("Off — a trained model (if any) still shows on the dashboard for comparison "
-                                 "only and never affects the SAFE/UNSAFE decision.")
+                                 "only and never affects the SAFE/UNSAFE decision. Enable it under "
+                                 "<a href=\"#safety-checks\">Settings → Safety Checks</a>.")
 
     # Link to simpleCloudDetect's own web UI - built from whatever host/IP the
     # browser used to reach THIS page (so it works from any device on the LAN,
@@ -4112,7 +4137,7 @@ def web_index():
         disabled.append("Day/Night")
     if not checks["rain_enabled"]:
         disabled.append("Rain")
-    if not checks["mlx_cloud_enabled"]:
+    if not checks["mlx_gate_enabled"]:
         disabled.append("MLX Cloud")
     if not checks["ml_cloud_enabled"]:
         disabled.append("ML Cloud")
@@ -4448,14 +4473,22 @@ a{{color:var(--accent-safety);}}
     <h3>Safety Checks</h3>
     <p class="hint hint-warn">Turning any of these off removes that guard from the SAFE/UNSAFE decision
     entirely — a disabled check can never report UNSAFE on its own again.</p>
-    <p class="hint">The Rain and MLX90614 check enable/disable toggles live under
-    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings. The AI Model
-    check enable/disable toggle lives under <a href="#ai-learning-settings">AI Learning</a>, right next to
-    the trained model itself.</p>
+    <p class="hint">The Rain sensor's enable/disable toggle lives under <a href="#hardware-pins">Hardware
+    Pins</a>, right next to its wiring settings. The Sky Sensor (MLX90614) and AI Model toggles below are
+    different: the MLX90614's own HARDWARE (wiring) toggle still lives on <a href="#hardware-pins">Hardware
+    Pins</a> too, but the two checkboxes below independently decide whether each one's reading *counts
+    toward* the SAFE/UNSAFE decision — so you can, for example, feed the AI Model from the MLX90614's
+    readings without letting the sensor's own simple threshold check veto SAFE by itself, or the reverse.
+    Use either one, both, or neither.</p>
     <form action="/save-checks" method="get">
       <label><input type="checkbox" name="daynight" {"checked" if checks['daynight_enabled'] else ""}> Day/Night check</label>
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="{loc['night_threshold_deg']}">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
+      <label><input type="checkbox" name="mlxGateEnable" {"checked" if checks['mlx_gate_enabled'] else ""}> Sky Sensor (MLX90614) clear-sky check</label>
+      <p class="hint">Include the {sensor_names['mlx90614']}'s ambient-vs-sky delta reading in the
+      SAFE/UNSAFE decision. Requires the sensor itself to be enabled and wired under
+      <a href="#hardware-pins">Hardware Pins</a> — turning that off makes this read Unknown regardless of
+      this setting.</p>
       <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="{loc['clear_sky_delta_threshold_c']}">
       <label>Ambient temperature source (for the delta above)</label>
       <select name="ambientSensor">
@@ -4476,6 +4509,11 @@ a{{color:var(--accent-safety);}}
       the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
       classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
       (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
+      <label><input type="checkbox" name="aiModelEnable" {"checked" if checks.get('ai_model_enabled') else ""}> AI Model check</label>
+      <p class="hint">Include the trained AI model's prediction in the SAFE/UNSAFE decision. Falls back to
+      the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
+      predict from. Train the model and set which predicted labels count as SAFE on the
+      <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
       <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
@@ -4718,8 +4756,9 @@ a{{color:var(--accent-safety);}}
       <input type="text" name="aiLabelClasses" value="{ai_label_classes}">
       <p class="hint">Edit this list any time — new labels just become new choices on the Classify page.</p>
       <hr>
-      <label><input type="checkbox" name="aiModelEnable" {"checked" if checks.get('ai_model_enabled') else ""}>
-      Use the trained model in the SAFE/UNSAFE decision</label>
+      <p class="hint">Whether the trained model's prediction counts toward the SAFE/UNSAFE decision is set
+      on <a href="#safety-checks">Settings → Safety Checks</a> now, next to the other checks it's grouped
+      with — this section only configures the model itself.</p>
       <label>Predicted labels that count as SAFE (comma-separated, case-insensitive)</label>
       <input type="text" name="aiSafeLabels" value="{ai_safe_labels}" placeholder="e.g. Clear">
       <p class="hint">{ai_model_status_hint}</p>
