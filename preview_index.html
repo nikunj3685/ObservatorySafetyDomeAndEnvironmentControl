@@ -110,6 +110,7 @@ fieldset:disabled{opacity:.5;}
      vertical-align:middle;cursor:help;box-shadow:0 0 0 1px rgba(0,0,0,.08);flex-shrink:0;}
 .dot-safe{background:var(--safe);}
 .dot-unsafe{background:var(--unsafe);}
+.dot-neutral{background:var(--muted);}
 /* Every Safety Monitor reading is a 3-column grid row: a dot slot, an icon
    slot, then the text. Each <p> is its own grid, but they all share the
    same column widths, so the dots line up with each other, the icons line
@@ -146,8 +147,8 @@ a{color:var(--accent-safety);}
 </style></head><body>
 
 <h1>🔭 Observatory Control</h1>
-<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (0)</a></p>
-<div class='banner banner-warn top-banner'>📍 <b>Location not set</b> — latitude/longitude are still at the 0&deg;,0&deg; placeholder, so the Day/Night sun-elevation gate is computing nonsense for your actual site. <a href='#settings'>Set your real coordinates in Settings</a>.</div>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (<span id="classifyCount">2</span>)</a></p>
+
 <div class="grid">
 <div class="card safety full-width">
   <h2><span class="title">🛡️ Safety Monitor <span id="safeState" class="badge badge-unsafe">UNSAFE</span></span></h2>
@@ -160,18 +161,21 @@ a{color:var(--accent-safety);}
   </div>
   <div id="warningBanner"><div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> Rain disabled &mdash; see <a href='/config'>Settings</a></div></div>
   <hr class="sep">
-  <div id="daynightBlock"><p class="field field-grid warn-text"><span class="col-dot"><span class="status-dot dot-safe" title="Day/Night check: passing."></span></span><span class="col-icon">⚠️</span><span class="col-text">Clock not synced — treated as daytime/unsafe</span></p></div>
+  <div id="daynightBlock"><p class="field field-grid muted"><span class="col-dot"></span><span class="col-icon">🕐</span><span class="col-text">Wednesday, September 23, 2026 12:30:00 P.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="Day/Night check: FAILING — it's daytime (sun elevation 49.5&deg; &gt; threshold -12.0&deg;)."></span></span><span class="col-icon">☀️</span><span class="col-text"><b>Daytime</b> <span class='muted'>(sun elevation 49.5&deg;, threshold -12.0&deg;)</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Dusk <b>07:50 P.M.</b> &nbsp;&middot;&nbsp; Dawn <b>05:46 A.M.</b></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Daytime</b> at 2026-09-23 07:30 A.M.</span></p></div>
   <hr class="sep">
-  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="MLX90614 clear-sky check: passing — ambient-vs-sky delta indicates Clear."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>N/A</b> &nbsp;
-  🌬️ <b>N/A</b>
-  (Unknown &mdash; no reading yet)
-  <span class="tag">MLX90614</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Simple Cloud Detect ML check: passing — reports Unknown and is reachable."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Unknown</b> <span class="muted">(0%)</span>
-  &nbsp; <a href="http://localhost:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>N/A</b> &nbsp;
-  💧 <b>N/A</b> &nbsp;
-  🎚️ <b>N/A</b>
-  <span class="tag">NONE</span> <span class="tag tag-warn">⚠ Disconnected</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">📦</span><span class="col-text">Box: 🌡️ <b>N/A</b> &nbsp;
-  💧 <b>N/A</b>
-  <span class="tag">DHT11</span> <span class="tag tag-warn">⚠ Disconnected</span></span></p></div>
+  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="MLX90614 clear-sky check: passing — ambient-vs-sky delta indicates Clear."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>-14.2&deg;C</b> &nbsp;
+  <span class="muted">BME280:</span> <b>18.4&deg;C</b> &nbsp;
+  🌬️ <b>8.5&deg;C</b>
+  (Clear, &Delta; 32.6&deg;C)
+  <span class="tag">MLX90614</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Cloudy</b> at 2026-09-23 10:30 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-neutral" title="AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts Clear)."></span></span><span class="col-icon">🤖</span><span class="col-text">Model prediction: <b>Clear</b>
+  <span class="muted">(trained on 10 classified samples on the
+  <a href="/ai-classify">Classify page</a> - informational only, not used in the SAFE/UNSAFE decision)</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>WET</b> at 2026-09-23 09:30 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Simple Cloud Detect ML check: passing — reports Clear and is reachable."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Clear</b> <span class="muted">(1%)</span>
+  &nbsp; <a href="http://localhost:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Overcast</b> at 2026-09-23 11:00 A.M.</span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>18.4&deg;C</b> &nbsp;
+  💧 <b>55.2%</b> &nbsp;
+  🎚️ <b>1012 hPa</b>
+  <span class="tag">BME280</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">📦</span><span class="col-text">Box: 🌡️ <b>19.8&deg;C</b> &nbsp;
+  💧 <b>48.0%</b>
+  <span class="tag">DHT11</span></span></p></div>
   <p class="hint">Enable/disable individual checks and the SAFE-report hold delay under
   <a href="#safety-checks">Settings → Safety Checks</a>.</p>
 </div>
@@ -179,7 +183,7 @@ a{color:var(--accent-safety);}
 
 
 <div class="card dome" id="dome">
-  <h2><span class="title">🚪 Dome <span id="domeState" class="badge badge-fault">UNKNOWN</span></span></h2>
+  <h2><span class="title">🚪 Dome <span id="domeState" class="badge badge-open">OPEN</span></span></h2>
   
   
   
@@ -265,9 +269,9 @@ a{color:var(--accent-safety);}
   <div class="settings-group" id="location-timezone">
     <h3>Location &amp; Timezone</h3>
     <form action="/save-location" method="get">
-      <label>Latitude (deg, north +)</label><input type="text" name="lat" value="0.0">
-      <label>Longitude (deg, east +)</label><input type="text" name="lon" value="0.0">
-      <label>Timezone</label><select name="tz"><option value='UTC' selected>UTC</option><option value='America/New_York'>America/New_York</option><option value='America/Chicago'>America/Chicago</option><option value='America/Denver'>America/Denver</option><option value='America/Phoenix'>America/Phoenix</option><option value='America/Los_Angeles'>America/Los_Angeles</option><option value='America/Anchorage'>America/Anchorage</option><option value='Pacific/Honolulu'>Pacific/Honolulu</option><option value='America/Halifax'>America/Halifax</option><option value='America/St_Johns'>America/St_Johns</option><option value='America/Mexico_City'>America/Mexico_City</option><option value='America/Sao_Paulo'>America/Sao_Paulo</option><option value='America/Argentina/Buenos_Aires'>America/Argentina/Buenos_Aires</option><option value='Europe/London'>Europe/London</option><option value='Europe/Paris'>Europe/Paris</option><option value='Europe/Athens'>Europe/Athens</option><option value='Atlantic/Reykjavik'>Atlantic/Reykjavik</option><option value='Europe/Moscow'>Europe/Moscow</option><option value='Africa/Lagos'>Africa/Lagos</option><option value='Africa/Nairobi'>Africa/Nairobi</option><option value='Africa/Johannesburg'>Africa/Johannesburg</option><option value='Asia/Dubai'>Asia/Dubai</option><option value='Asia/Riyadh'>Asia/Riyadh</option><option value='Europe/Istanbul'>Europe/Istanbul</option><option value='Asia/Kolkata'>Asia/Kolkata</option><option value='Asia/Karachi'>Asia/Karachi</option><option value='Asia/Dhaka'>Asia/Dhaka</option><option value='Asia/Kathmandu'>Asia/Kathmandu</option><option value='Asia/Shanghai'>Asia/Shanghai</option><option value='Asia/Tokyo'>Asia/Tokyo</option><option value='Asia/Seoul'>Asia/Seoul</option><option value='Asia/Singapore'>Asia/Singapore</option><option value='Asia/Jakarta'>Asia/Jakarta</option><option value='Asia/Bangkok'>Asia/Bangkok</option><option value='Asia/Manila'>Asia/Manila</option><option value='Australia/Sydney'>Australia/Sydney</option><option value='Australia/Brisbane'>Australia/Brisbane</option><option value='Australia/Adelaide'>Australia/Adelaide</option><option value='Australia/Perth'>Australia/Perth</option><option value='Pacific/Auckland'>Pacific/Auckland</option></select>
+      <label>Latitude (deg, north +)</label><input type="text" name="lat" value="40.0">
+      <label>Longitude (deg, east +)</label><input type="text" name="lon" value="-74.0">
+      <label>Timezone</label><select name="tz"><option value='UTC'>UTC</option><option value='America/New_York' selected>America/New_York</option><option value='America/Chicago'>America/Chicago</option><option value='America/Denver'>America/Denver</option><option value='America/Phoenix'>America/Phoenix</option><option value='America/Los_Angeles'>America/Los_Angeles</option><option value='America/Anchorage'>America/Anchorage</option><option value='Pacific/Honolulu'>Pacific/Honolulu</option><option value='America/Halifax'>America/Halifax</option><option value='America/St_Johns'>America/St_Johns</option><option value='America/Mexico_City'>America/Mexico_City</option><option value='America/Sao_Paulo'>America/Sao_Paulo</option><option value='America/Argentina/Buenos_Aires'>America/Argentina/Buenos_Aires</option><option value='Europe/London'>Europe/London</option><option value='Europe/Paris'>Europe/Paris</option><option value='Europe/Athens'>Europe/Athens</option><option value='Atlantic/Reykjavik'>Atlantic/Reykjavik</option><option value='Europe/Moscow'>Europe/Moscow</option><option value='Africa/Lagos'>Africa/Lagos</option><option value='Africa/Nairobi'>Africa/Nairobi</option><option value='Africa/Johannesburg'>Africa/Johannesburg</option><option value='Asia/Dubai'>Asia/Dubai</option><option value='Asia/Riyadh'>Asia/Riyadh</option><option value='Europe/Istanbul'>Europe/Istanbul</option><option value='Asia/Kolkata'>Asia/Kolkata</option><option value='Asia/Karachi'>Asia/Karachi</option><option value='Asia/Dhaka'>Asia/Dhaka</option><option value='Asia/Kathmandu'>Asia/Kathmandu</option><option value='Asia/Shanghai'>Asia/Shanghai</option><option value='Asia/Tokyo'>Asia/Tokyo</option><option value='Asia/Seoul'>Asia/Seoul</option><option value='Asia/Singapore'>Asia/Singapore</option><option value='Asia/Jakarta'>Asia/Jakarta</option><option value='Asia/Bangkok'>Asia/Bangkok</option><option value='Asia/Manila'>Asia/Manila</option><option value='Australia/Sydney'>Australia/Sydney</option><option value='Australia/Brisbane'>Australia/Brisbane</option><option value='Australia/Adelaide'>Australia/Adelaide</option><option value='Australia/Perth'>Australia/Perth</option><option value='Pacific/Auckland'>Pacific/Auckland</option></select>
       <p class="hint">Night threshold and clear-sky delta thresholds have moved to
       <a href="#safety-checks">Safety Checks</a> below, next to the checks they control.</p>
       <button type="submit" class="btn btn-neutral">Save location</button>
@@ -278,14 +282,22 @@ a{color:var(--accent-safety);}
     <h3>Safety Checks</h3>
     <p class="hint hint-warn">Turning any of these off removes that guard from the SAFE/UNSAFE decision
     entirely — a disabled check can never report UNSAFE on its own again.</p>
-    <p class="hint">The Rain and MLX90614 check enable/disable toggles live under
-    <a href="#hardware-pins">Hardware Pins</a>, right next to those sensors' wiring settings. The AI Model
-    check enable/disable toggle lives under <a href="#ai-learning-settings">AI Learning</a>, right next to
-    the trained model itself.</p>
+    <p class="hint">The Rain sensor's enable/disable toggle lives under <a href="#hardware-pins">Hardware
+    Pins</a>, right next to its wiring settings. The Sky Sensor (MLX90614) and AI Model toggles below are
+    different: the MLX90614's own HARDWARE (wiring) toggle still lives on <a href="#hardware-pins">Hardware
+    Pins</a> too, but the two checkboxes below independently decide whether each one's reading *counts
+    toward* the SAFE/UNSAFE decision — so you can, for example, feed the AI Model from the MLX90614's
+    readings without letting the sensor's own simple threshold check veto SAFE by itself, or the reverse.
+    Use either one, both, or neither.</p>
     <form action="/save-checks" method="get">
       <label><input type="checkbox" name="daynight" checked> Day/Night check</label>
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="-12.0">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
+      <label><input type="checkbox" name="mlxGateEnable" checked> Sky Sensor (MLX90614) clear-sky check</label>
+      <p class="hint">Include the MLX90614's ambient-vs-sky delta reading in the
+      SAFE/UNSAFE decision. Requires the sensor itself to be enabled and wired under
+      <a href="#hardware-pins">Hardware Pins</a> — turning that off makes this read Unknown regardless of
+      this setting.</p>
       <label>Clear-sky delta threshold (deg C)</label><input type="text" name="delta" value="15.0">
       <label>Ambient temperature source (for the delta above)</label>
       <select name="ambientSensor">
@@ -306,6 +318,11 @@ a{color:var(--accent-safety);}
       the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
       classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
       (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
+      <label><input type="checkbox" name="aiModelEnable" > AI Model check</label>
+      <p class="hint">Include the trained AI model's prediction in the SAFE/UNSAFE decision. Falls back to
+      the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
+      predict from. Train the model and set which predicted labels count as SAFE on the
+      <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
       <label><input type="checkbox" name="safedelay" > Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="5">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
@@ -325,6 +342,13 @@ a{color:var(--accent-safety);}
       cleanup, deleting All Sky snapshots and old weekly log files once they're older than the day counts
       above. See the <a href="/logs">Logs page</a> to browse what's been recorded.</p>
       <hr class="sep">
+      <label><input type="checkbox" name="imgMaster" id="imgMasterCheck"
+       onchange="document.getElementById('imgPerEventFields').disabled=!this.checked"
+       checked> Take images with logs</label>
+      <p class="hint">Master switch for every image below — while off, NO log entry ever gets an All Sky
+      snapshot attached, regardless of the per-event settings underneath. Turn it back on to go back to
+      whatever those five were already set to.</p>
+      <fieldset id="imgPerEventFields" >
       <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
       checking "what did the sky actually look like when this changed" while a new setup is being shaken
       out — turn any of these off once it's clearly behaving as expected, to stop collecting images for it.</p>
@@ -343,6 +367,7 @@ a{color:var(--accent-safety);}
       <div class="setting-row">
         <label><input type="checkbox" name="imgOverall" checked> Overall SAFE/UNSAFE change</label>
       </div>
+      </fieldset>
       <button type="submit" class="btn btn-neutral">Save logging settings</button>
     </form>
     <hr class="sep">
@@ -530,7 +555,7 @@ a{color:var(--accent-safety);}
     <a href="/ai-classify">Classify page</a>, then train a model there once you have enough labeled
     samples of at least two labels.</p>
     <form action="/save-ai-learning" method="get">
-      <label><input type="checkbox" name="aiLearningEnable" >
+      <label><input type="checkbox" name="aiLearningEnable" checked>
       Enable AI Learning data capture</label>
       <label>Capture interval (minutes)</label>
       <input type="number" name="aiCaptureIntervalMin" min="1" value="15" class="narrow-number">
@@ -542,14 +567,16 @@ a{color:var(--accent-safety);}
       <input type="text" name="aiLabelClasses" value="Clear, Partly Cloudy, Mostly Cloudy, Overcast, Rain, Snow, Freezing Rain, Ignore">
       <p class="hint">Edit this list any time — new labels just become new choices on the Classify page.</p>
       <hr>
-      <label><input type="checkbox" name="aiModelEnable" >
-      Use the trained model in the SAFE/UNSAFE decision</label>
+      <p class="hint">Whether the trained model's prediction counts toward the SAFE/UNSAFE decision is set
+      on <a href="#safety-checks">Settings → Safety Checks</a> now, next to the other checks it's grouped
+      with — this section only configures the model itself.</p>
       <label>Predicted labels that count as SAFE (comma-separated, case-insensitive)</label>
       <input type="text" name="aiSafeLabels" value="Clear" placeholder="e.g. Clear">
-      <p class="hint">Off — a trained model (if any) still shows on the dashboard for comparison only and never affects the SAFE/UNSAFE decision.</p>
+      <p class="hint">Off — a trained model (if any) still shows on the dashboard for comparison only and never affects the SAFE/UNSAFE decision. Enable it under <a href="#safety-checks">Settings → Safety Checks</a>.</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
-    <p class="hint">Samples collected so far: <b>0</b> (0 not yet
+    <p class="hint">Samples collected so far: <b id="aiSampleCount">12</b>
+    (<span id="aiUnlabeledCount">2</span> not yet
     classified) — <a href="/ai-classify">go classify them &rarr;</a></p>
   </div>
 
@@ -676,6 +703,13 @@ function poll(){
       slider.disabled=(d.heater_mode!=='MANUAL');
       if(pwrOut) pwrOut.textContent=d.heater_target_percent;
     }
+
+    var ccEl=document.getElementById('classifyCount');
+    if(ccEl) ccEl.textContent=d.ai_unlabeled_count;
+    var ascEl=document.getElementById('aiSampleCount');
+    if(ascEl) ascEl.textContent=d.ai_sample_count;
+    var aucEl=document.getElementById('aiUnlabeledCount');
+    if(aucEl) aucEl.textContent=d.ai_unlabeled_count;
   });
 }
 setInterval(poll,3000);

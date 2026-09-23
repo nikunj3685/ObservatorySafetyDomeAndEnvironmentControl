@@ -10,14 +10,14 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
   3. MLX90614 ambient-vs-sky clear/cloud delta
   4. [simpleCloudDetect](https://github.com/chvvkumar/simpleclouddetect)'s ML sky classification, from an all-sky camera feed - optionally, one or more of its classification classes (e.g. a custom "Glare" class trained on frames a nearby light washes out) can be configured to be ignored entirely, keeping the last trusted reading instead of reacting to that frame
   5. AI Model (off by default) - a sky-condition model trained on your own classified All Sky images; fails open (never blocks SAFE) if it's turned on before a model exists or when it has no fresh reading to predict from
-  A manual Force-SAFE / Force-UNSAFE override can bypass all five at once.
+  A manual Force-SAFE / Force-UNSAFE override can bypass all five at once. A sensor's "installed/polled" toggle (Hardware Pins) is independent from whether its reading *counts toward* the decision (Safety Checks) - e.g. the MLX90614 can keep feeding the AI Model gate while its own simple threshold check is excluded, or the reverse.
 - **Dome** drives a roof relay + reed switch as a simple OPEN/CLOSED/MOVING state machine, with optional safety-auto-close/open and a rain-auto-close feature.
 - A dew/frost **heater** (not part of the SafetyMonitor decision - equipment protection is a separate concern from observing safety) runs AUTO ramped power based on freeze/dew-point math, or a manual power slider.
 - **ObservingConditions** exposes the raw BME280 / MLX90614 / DHT11 / simpleCloudDetect readings to any ASCOM client.
-- A web dashboard (`http://<pi-ip>:11112/`) shows live status - including a "Previously …" line for each reading showing when it last changed, tracked in `status_history.json` so it reflects the true last-change time even across a service restart - and a Settings page covering location/timezone, safety checks, schedule, hardware pins/addresses, sensor and ASCOM device names, the All Sky camera, AI Learning, and log retention.
+- A web dashboard (`http://<pi-ip>:11112/`) shows live status - including a "Previously **X** at *date* *time*" line for each reading showing when it last changed (both the date and time, so a value from yesterday isn't mistaken for one from five minutes ago), tracked in `status_history.json` so it reflects the true last-change time even across a service restart - and a Settings page covering location/timezone, safety checks, schedule, hardware pins/addresses, sensor and ASCOM device names, the All Sky camera, AI Learning, and log retention. Everything on the dashboard - dome/heater state, sensor readings, the Classify page link's unlabeled count - refreshes every 3 seconds on its own, no manual reload needed.
 - An All Sky camera view (local file or URL) on the dashboard, optionally overlaid with the current sensor readings (outside/box temp+humidity, Sky state with sky/ambient temp + threshold + delta, Rain, ML Cloud class, overall SAFE/UNSAFE) - either drawn by this service itself, or fed to Allsky's own overlay via a shared Extra Text File so the same readings show up in Allsky's own gallery/view too, not just here.
-- **AI Learning** (`/ai-classify`) captures raw All Sky frames + sensor snapshots on a timer, lets you manually classify them (Clear, Cloudy, Rain, etc.), trains a from-scratch sky-condition model from your classifications, and - once you trust it - can feed that model's prediction into the SafetyMonitor's optional fifth gate above. See "AI Learning" below.
-- An event log (`/logs`) records every safety-relevant state change (sensor connect/disconnect, gate flips, overall SAFE/UNSAFE, dome/heater actions, manual overrides), optionally attaching an All Sky snapshot per event type (also carrying the sensor-info overlay, when enabled) - independently configurable from Settings.
+- **AI Learning** (`/ai-classify`) captures raw All Sky frames + sensor snapshots on a timer, lets you manually classify them (Clear, Cloudy, Rain, etc.), trains a from-scratch sky-condition model from your classifications, and - once you trust it - can feed that model's prediction into the SafetyMonitor's optional fifth gate above. The Classify page shows the newest captures first and auto-advances to the next batch once every image on screen has been labeled or deleted, "Select ALL" applies a label or delete across every page matching the current filter (not just what's visible), and "Reset trained model" wipes just the model - keeping every classified sample - for a clean retrain after a bad run or a camera/mount change. See "AI Learning" below.
+- An event log (`/logs`) records every safety-relevant state change (sensor connect/disconnect, gate flips, overall SAFE/UNSAFE, dome/heater actions, manual overrides), optionally attaching an All Sky snapshot per event type (also carrying the sensor-info overlay, when enabled) - independently configurable from Settings, plus a single master switch to turn image-attaching off entirely regardless of the five per-event toggles.
 
 ## Files
 
@@ -30,9 +30,20 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
 | `docker-compose.clouddetect.yml` | Compose file for running simpleCloudDetect itself (pointed at Allsky's captured image) alongside this service. |
 | `requirements.txt` | Pinned pip dependency list - `pip install -r requirements.txt`. |
 | `dome-safety.service` | Ready-to-copy systemd unit file - see "Running as a systemd service" below. |
+| `install.sh` | One-shot installer - system packages, I2C enable, pip install, and a `dome-safety.service` generated for wherever you actually cloned this and whichever user runs it. `sudo bash install.sh`. |
 | `test_bme_mlx.py`, `test_dht_reed.py`, `test_mlx_oled.py`, `test_mosfet.py`, `test_relay.py` | One-off hardware bring-up scripts used while wiring each sensor/actuator - not part of the running service. |
 
 ## Setup
+
+**Quick install (recommended, on the Pi itself):**
+
+```bash
+sudo bash install.sh
+```
+
+Installs the system + Python dependencies, enables I2C, and sets up `dome-safety.service` to run on boot - see "Running as a systemd service" below for what it does and the one-time `visudo` step it prints at the end. Safe to re-run any time, including after a `git pull`.
+
+**Manual / just trying it out:**
 
 ```bash
 pip install -r requirements.txt
@@ -53,7 +64,7 @@ Once trained, the model's prediction shows up on the dashboard as informational-
 
 ### Running as a systemd service
 
-Copy the included `dome-safety.service` unit file into place (edit its `User=`/`WorkingDirectory=` first if this isn't cloned to `/home/pi/pi-safety-aggregator` and run as `pi`), then:
+`install.sh` does this for you - it generates and installs `dome-safety.service` with the correct `User=`/`WorkingDirectory=` for wherever you actually cloned this and whichever user ran `sudo`, then enables and starts it. To do it by hand instead, copy the included `dome-safety.service` template into place (edit its `User=`/`WorkingDirectory=` first if this isn't cloned to `/home/pi/pi-safety-aggregator` and run as `pi`), then:
 
 ```bash
 sudo cp dome-safety.service /etc/systemd/system/dome-safety.service
@@ -67,4 +78,4 @@ After changing `dome_safety_service.py`, deploy by copying the new file to the P
 sudo systemctl restart dome-safety.service
 ```
 
-Passwordless sudo for restart/reboot (used by the Settings page's Service Control buttons) needs a one-time `visudo` entry - see the hint text on that section of the Settings page for the exact line.
+Passwordless sudo for restart/reboot (used by the Settings page's Service Control buttons) needs a one-time `visudo` entry - `install.sh` prints the exact line for your setup at the end of its run; otherwise see the hint text on that section of the Settings page.
