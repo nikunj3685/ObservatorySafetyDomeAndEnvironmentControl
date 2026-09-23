@@ -5191,13 +5191,27 @@ def ai_classify_save():
     button" workflow, so a whole run of near-identical overnight frames
     can be classified together instead of one at a time. Returns JSON
     (not a redirect) since the page calls this via fetch() and updates
-    itself in place rather than reloading."""
-    ids = [i for i in request.args.get("ids", "").split(",") if i]
+    itself in place rather than reloading.
+
+    `all=unclassified` or `all=all` selects EVERY sample matching that
+    filter (not just whatever's on the current page) instead of an
+    explicit `ids` list - the Classify page's "Select ALL" button, which
+    spans every page rather than just the ~24 checkboxes currently
+    rendered. Looked up fresh right here rather than the page sending a
+    (potentially huge, and possibly stale by the time the button is
+    clicked) id list, so it always reflects whatever's actually in the
+    index at the moment the action runs."""
     label = request.args.get("label", "").strip()
+    all_filter = request.args.get("all")
+    idx = _load_ai_training_index()
+    if all_filter in ("unclassified", "all"):
+        ids = [s["id"] for s in idx["samples"]
+               if all_filter == "all" or s.get("label") is None]
+    else:
+        ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids or not label:
         return jsonify({"ok": False, "error": "missing ids or label"}), 400
 
-    idx = _load_ai_training_index()
     now = time.time()
     by_id = {s["id"]: s for s in idx["samples"]}
     matched = 0
@@ -5334,8 +5348,21 @@ def ai_classify_delete():
     the Classify page's "Delete selected" action, on either grid-view's
     checkbox selection or the one-by-one view's single current image.
     Works on labeled and unlabeled samples alike. JSON, not a redirect,
-    for the same reason as /ai-classify-save."""
-    ids = [i for i in request.args.get("ids", "").split(",") if i]
+    for the same reason as /ai-classify-save.
+
+    `all=unclassified` or `all=all` deletes EVERY sample matching that
+    filter instead of an explicit `ids` list - see /ai-classify-save's
+    docstring for why this is looked up fresh here rather than sent by
+    the page. `all=all` here is a blunter version of the existing
+    /ai-classify-delete-classified (which only ever touches LABELED
+    samples) - this one respects whichever filter is showing."""
+    all_filter = request.args.get("all")
+    if all_filter in ("unclassified", "all"):
+        idx = _load_ai_training_index()
+        ids = [s["id"] for s in idx["samples"]
+               if all_filter == "all" or s.get("label") is None]
+    else:
+        ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids:
         return jsonify({"ok": False, "error": "missing ids"}), 400
     removed = _delete_ai_training_samples(ids)
@@ -5517,14 +5544,27 @@ def ai_classify_page():
                          f'<a class="btn" href="/ai-classify?show={show}&amp;view=grid&amp;page=0">▦ Grid view</a>')
 
     # Bulk-select controls only make sense against a grid of checkboxes.
+    # "Select ALL" spans every sample matching the current filter across
+    # every page, not just the ~24 checkboxes actually rendered right now -
+    # selectAllMatching() below flips the page into a mode where the next
+    # label click or Delete selected acts on ALL of them (looked up fresh
+    # server-side, see /ai-classify-save and /ai-classify-delete), not just
+    # whatever happens to be checked in the DOM.
+    select_all_matching_html = (
+        f'<button type="button" class="btn" onclick="selectAllMatching(\'{show}\', {total_filtered})">'
+        f'Select ALL ({total_filtered})</button>'
+        if total_filtered else
+        '<span class="btn ai-nav-btn-disabled">Select ALL (0)</span>')
     grid_controls_html = ('<button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>'
+                           f'{select_all_matching_html}'
                            '<button type="button" class="btn" onclick="selectAll(false)">Clear selection</button>'
                            '<button type="button" class="btn ai-delete-btn" onclick="deleteSelected()">Delete selected</button>'
                            if view == "grid" else "")
 
     instructions_html = (
-        'Pick a label from the row below, then click one or more images to select them (or '
-        '"Select all shown"), then click the label — it applies to every image you\'ve selected at once, '
+        'Pick a label from the row below, then click one or more images to select them ("Select all '
+        'shown" picks just this page; <b>Select ALL</b> spans every page matching the current filter), '
+        'then click the label — it applies to every image you\'ve selected at once, '
         'or use <b>Delete selected</b> to remove them instead. Sorted oldest-first so a run of '
         'near-identical overnight frames sits together and can be classified in one go.'
         if view == "grid" else
@@ -5685,12 +5725,40 @@ a{{color:var(--accent);}}
  '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
 
 <script>
+// true once "Select ALL" (spanning every page, not just what's on screen)
+// has been clicked - cleared by either "Select all shown" or "Clear
+// selection", both of which narrow the scope back to just this page.
+var selectAllMode = false;
 function selectAll(check) {{
+  selectAllMode = false;
   document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = check);
 }}
+function selectAllMatching(show, total) {{
+  if (!total) return;
+  selectAllMode = true;
+  document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = true);
+  document.getElementById('classifyStatus').textContent =
+    'All ' + total + ' matching image(s) selected (not just this page) - click a label or Delete ' +
+    'selected to apply to all of them.';
+}}
 function applyLabel(label) {{
-  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
   const status = document.getElementById('classifyStatus');
+  if (selectAllMode) {{
+    status.textContent = 'Saving...';
+    fetch('/ai-classify-save?all={show}&label=' + encodeURIComponent(label))
+      .then(r => r.json())
+      .then(data => {{
+        if (!data.ok) {{
+          status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+          return;
+        }}
+        status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '". Reloading...';
+        window.location.reload();
+      }})
+      .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
+    return;
+  }}
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
   if (ids.length === 0) {{
     status.textContent = 'Select at least one image first.';
     return;
@@ -5716,8 +5784,24 @@ function applyLabel(label) {{
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
 }}
 function deleteSelected() {{
-  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
   const status = document.getElementById('classifyStatus');
+  if (selectAllMode) {{
+    if (!confirm('Delete ALL matching image(s)? This cannot be undone.')) return;
+    status.textContent = 'Deleting...';
+    fetch('/ai-classify-delete?all={show}')
+      .then(r => r.json())
+      .then(data => {{
+        if (!data.ok) {{
+          status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+          return;
+        }}
+        status.textContent = 'Deleted ' + data.deleted + ' image(s). Reloading...';
+        window.location.reload();
+      }})
+      .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
+    return;
+  }}
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
   if (ids.length === 0) {{
     status.textContent = 'Select at least one image first.';
     return;
