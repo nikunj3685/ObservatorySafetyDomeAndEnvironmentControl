@@ -1546,12 +1546,12 @@ def _format_ampm(s):
 
 
 def _prev_status_text(prev_value, prev_since, tz_name, label_map=None):
-    """'Previously <b>X</b> at 03:42 P.M.' for the light-gray history line
-    next to a safety-affecting reading, or "" if that check hasn't actually
-    changed yet since the service started (nothing to show). label_map
-    translates a stored raw value (e.g. True/False) into a display word
-    (e.g. "Daytime"/"Nighttime"); omit it for checks that already store a
-    display-ready string (e.g. "Clear"/"Cloudy"/"Unknown")."""
+    """'Previously <b>X</b> at 2026-09-23 03:42 P.M.' for the light-gray
+    history line next to a safety-affecting reading, or "" if that check
+    hasn't actually changed yet since the service started (nothing to
+    show). label_map translates a stored raw value (e.g. True/False) into
+    a display word (e.g. "Daytime"/"Nighttime"); omit it for checks that
+    already store a display-ready string (e.g. "Clear"/"Cloudy"/"Unknown")."""
     if prev_value is None or prev_since is None:
         return ""
     display = label_map.get(prev_value, prev_value) if label_map else prev_value
@@ -1559,17 +1559,22 @@ def _prev_status_text(prev_value, prev_since, tz_name, label_map=None):
 
 
 def _format_prev_time(ts, tz_name):
-    """epoch seconds -> '03:42 P.M.' in the given IANA timezone - same
-    style used for the rest of the page's local-time strings. Used for the
-    light-gray "previous status" line next to each safety-affecting
-    reading; returns "" if there's no timestamp yet (nothing to show)."""
+    """epoch seconds -> '2026-09-23 03:42 P.M.' in the given IANA timezone -
+    same %Y-%m-%d date style already used elsewhere on the page (AI Learning
+    card timestamps, the All Sky overlay). Used for every "at <time>" line
+    next to a stale/previous reading - the light-gray "Previously X"
+    history line, and the "Last good reading" line shown once a sensor goes
+    stale - so it's unambiguous how long ago that reading actually was,
+    not just what time of day. Without the date, a value from yesterday and
+    one from five minutes ago at the same clock time were indistinguishable.
+    Returns "" if there's no timestamp yet (nothing to show)."""
     if ts is None:
         return ""
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
-    return _format_ampm(datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).strftime("%I:%M %p"))
+    return _format_ampm(datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %I:%M %p"))
 
 
 def _fmt_mmss(total_seconds):
