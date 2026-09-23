@@ -5492,11 +5492,13 @@ def ai_classify_page():
     unlabeled_count = sum(1 for s in all_samples if s.get("label") is None)
 
     filtered = list(all_samples) if show == "all" else [s for s in all_samples if s.get("label") is None]
-    # Oldest first - works through the backlog in order (so nothing quietly
-    # ages out under the unlabeled-retention setting before anyone sees it)
-    # and keeps visually-similar consecutive frames from the same night
-    # next to each other, for the "select a run, label them together" flow.
-    filtered.sort(key=lambda s: s.get("ts", 0))
+    # Newest first - the most recent capture is what you actually want to
+    # check right after it's taken (e.g. "did the sky just clear up?"),
+    # and it's what a person expects Prev/Next to walk through in order.
+    # Visually-similar consecutive frames from the same night still end up
+    # next to each other either way, so the "select a run, label them
+    # together" flow is unaffected by which end you start from.
+    filtered.sort(key=lambda s: s.get("ts", 0), reverse=True)
 
     start = page * AI_CLASSIFY_PAGE_SIZE
     page_samples = filtered[start:start + AI_CLASSIFY_PAGE_SIZE]
@@ -5725,6 +5727,20 @@ a{{color:var(--accent);}}
  '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
 
 <script>
+// Grid view only (null in single view, where #aiGrid doesn't exist): the
+// URL of the next page, or null if this is already the last one - used to
+// auto-advance once every card visible on THIS page has been classified
+// or deleted, instead of leaving an empty grid until Next is clicked.
+const aiNextPageUrl = {(f"'/ai-classify?show={show}&view=grid&page={page + 1}'" if has_next else "null")};
+function maybeAutoAdvance() {{
+  const grid = document.getElementById('aiGrid');
+  if (!grid || !aiNextPageUrl) return;
+  if (grid.querySelectorAll('.ai-card').length > 0) return;
+  const status = document.getElementById('classifyStatus');
+  if (status) status.textContent += ' Loading the next batch...';
+  window.location = aiNextPageUrl;
+}}
+
 // true once "Select ALL" (spanning every page, not just what's on screen)
 // has been clicked - cleared by either "Select all shown" or "Clear
 // selection", both of which narrow the scope back to just this page.
@@ -5780,6 +5796,7 @@ function applyLabel(label) {{
       if (totalEl) totalEl.textContent = data.total_count;
       if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
       status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
+      maybeAutoAdvance();
     }})
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
 }}
@@ -5824,6 +5841,7 @@ function deleteSelected() {{
       if (totalEl) totalEl.textContent = data.total_count;
       if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
       status.textContent = 'Deleted ' + data.deleted + ' image(s).';
+      maybeAutoAdvance();
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
 }}
