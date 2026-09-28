@@ -4885,6 +4885,7 @@ def render_daynight_html(s, night_threshold_deg, daynight_enabled, tz_name="UTC"
             "Day/Night check: passing.",
             "Day/Night check: FAILING — system clock isn't synced, so this is fail-safe treated as "
             "daytime/unsafe until it syncs.",
+            neutral_when_disabled=True,
         )
     elif s["daytime_now"]:
         dot = _status_dot(
@@ -4894,6 +4895,7 @@ def render_daynight_html(s, night_threshold_deg, daynight_enabled, tz_name="UTC"
             "Day/Night check: passing.",
             f"Day/Night check: FAILING — it's daytime (sun elevation {s['solar_elevation_deg']:.1f}&deg; "
             f"&gt; threshold {night_threshold_deg:.1f}&deg;).",
+            neutral_when_disabled=True,
         )
     else:
         dot = _status_dot(
@@ -4903,6 +4905,7 @@ def render_daynight_html(s, night_threshold_deg, daynight_enabled, tz_name="UTC"
             f"Day/Night check: passing — it's nighttime (sun elevation {s['solar_elevation_deg']:.1f}&deg; "
             f"&le; threshold {night_threshold_deg:.1f}&deg;).",
             "Day/Night check: FAILING.",
+            neutral_when_disabled=True,
         )
     clock_html = _field_row("", "🕐", s['local_now_str'], "muted") if s["local_now_str"] else ""
     html = clock_html + _field_row(dot, "⚠️", "Clock not synced — treated as daytime/unsafe", "warn-text")
@@ -4998,6 +5001,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         f"({sensor_names['rain']} currently reads {'WET' if s['rain_detected'] else 'DRY'}).",
         f"Rain check: passing — {sensor_names['rain']} reads DRY.",
         f"Rain check: FAILING — {sensor_names['rain']} reads WET.",
+        neutral_when_disabled=True,
     )
     ml_cloud_dot = _status_dot(
         s["ml_cloud_pass"], checks["ml_cloud_enabled"],
@@ -5006,6 +5010,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         f"Simple Cloud Detect ML check: passing — reports {s['cloud_class']} and is reachable.",
         f"Simple Cloud Detect ML check: FAILING — reports {s['cloud_class']}, or the service is "
         f"unreachable/its reading is stale.",
+        neutral_when_disabled=True,
     )
 
     outside_row = _field_row("", "🌤️", f"""Environment: 🌡️ <b>{f"{s['env_temp_c']:.1f}&deg;C" if (env_fresh and s['env_temp_c'] is not None) else 'N/A'}</b> &nbsp;
