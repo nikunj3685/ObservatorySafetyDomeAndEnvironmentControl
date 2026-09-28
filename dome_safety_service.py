@@ -5072,7 +5072,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         )
         using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
                       else "informational only, not used in the SAFE/UNSAFE decision")
-        ai_model_row = _field_row(ai_dot, "🤖", f"""Model prediction: <b>{ai_predicted}</b>
+        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_predicted}</b>
   <span class="muted">(trained on {s.get('ai_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {using_note})</span>""")
     elif ai_model_wanted and ai_status == "untrained":
@@ -5106,7 +5106,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
                              else "informational only, not used in the SAFE/UNSAFE decision")
         cloud_confidence = s.get("cloud_model_confidence")
         confidence_str = f" ({cloud_confidence * 100:.0f}%)" if cloud_confidence is not None else ""
-        cloud_model_row = _field_row(cloud_dot, "📷", f"""Cloud model prediction: <b>{cloud_predicted}</b>{confidence_str}
+        cloud_model_row = _field_row(cloud_dot, "📷", f"""AI Cloud Detect(All Sky): <b>{cloud_predicted}</b>{confidence_str}
   <span class="muted">(trained on {s.get('cloud_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {cloud_using_note})</span>""")
     elif cloud_model_wanted and cloud_status == "tflite_missing":
