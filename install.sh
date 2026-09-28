@@ -123,22 +123,39 @@ if ! pip3 install --break-system-packages -r requirements.txt 2>/tmp/pip_err.log
 fi
 rm -f /tmp/pip_err.log
 
-echo "==> Installing tflite-runtime + numpy (optional - powers the Cloud Image"
+echo "==> Installing a tflite runtime + numpy (optional - powers the Cloud Image"
 echo "    Model gate; everything else works fine without it)..."
 # Deliberately separate from the requirements.txt install above and
 # deliberately best-effort: not every Pi OS/Python combination has a
 # prebuilt wheel for tflite-runtime, and that must never take down the
 # whole install over one optional gate. A failure here just means that
 # gate stays off (fails open) until you install this by hand later.
+#
+# tflite-runtime itself hasn't had a release since Oct 2023 (2.14.0) and
+# only ever published wheels for Python 3.8-3.11 - a Pi OS running
+# anything newer (increasingly the default as Raspberry Pi OS moves on)
+# has no matching distribution at all. Try it first anyway (still what
+# apt's python3-tflite-runtime and a lot of existing setups provide),
+# then fall back to ai-edge-litert - Google's actively maintained
+# successor, a drop-in for this project's Interpreter usage (see
+# dome_safety_service.py's import block) that does publish current
+# wheels (Python 3.10-3.14, linux aarch64 included as of 2.2.0/Aug 2026).
 if pip3 install --break-system-packages tflite-runtime numpy >/tmp/pip_tflite.log 2>&1; then
     :  # installed fine
 elif grep -q "break-system-packages" /tmp/pip_tflite.log \
      && pip3 install tflite-runtime numpy >/tmp/pip_tflite.log 2>&1; then
     :  # installed fine on the older-pip fallback
+elif pip3 install --break-system-packages ai-edge-litert numpy >/tmp/pip_tflite.log 2>&1; then
+    echo "    (tflite-runtime has no wheel for this Pi's Python version - installed"
+    echo "    ai-edge-litert instead, which this project treats as equivalent.)"
+elif grep -q "break-system-packages" /tmp/pip_tflite.log \
+     && pip3 install ai-edge-litert numpy >/tmp/pip_tflite.log 2>&1; then
+    echo "    (tflite-runtime has no wheel for this Pi's Python version - installed"
+    echo "    ai-edge-litert instead, which this project treats as equivalent.)"
 else
-    echo "    (skipped - no compatible wheel found for this Pi; the Cloud Image"
-    echo "    Model gate will show as unavailable until you install this some"
-    echo "    other way. Everything else is unaffected.)"
+    echo "    (skipped - no compatible wheel found for this Pi (tried both tflite-runtime"
+    echo "    and ai-edge-litert); the Cloud Image Model gate will show as unavailable"
+    echo "    until you install one some other way. Everything else is unaffected.)"
 fi
 rm -f /tmp/pip_tflite.log
 

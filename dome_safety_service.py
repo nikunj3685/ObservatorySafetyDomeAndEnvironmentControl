@@ -83,7 +83,21 @@ import adafruit_ssd1306
 # way every other optional sensor/feature in this file does.
 try:
     import numpy as np
-    from tflite_runtime.interpreter import Interpreter as _TFLiteInterpreter
+    try:
+        # tflite_runtime hasn't had a new release since Oct 2023 (2.14.0)
+        # and only ever published wheels for Python 3.8-3.11 - a Pi OS
+        # running anything newer has no matching distribution at all, no
+        # matter how you install it. Try it first anyway (still what a lot
+        # of existing Pi setups, and apt's python3-tflite-runtime, provide),
+        # then fall back to ai-edge-litert - Google's actively maintained
+        # successor package, API-compatible for this exact v1 Interpreter
+        # usage (same class, same constructor/methods - see
+        # https://ai.google.dev/edge/litert/migration), which does publish
+        # current wheels (Python 3.10-3.14, linux aarch64 included as of
+        # 2.2.0/Aug 2026).
+        from tflite_runtime.interpreter import Interpreter as _TFLiteInterpreter
+    except ImportError:
+        from ai_edge_litert.interpreter import Interpreter as _TFLiteInterpreter
     TFLITE_AVAILABLE = True
 except ImportError:
     np = None
@@ -1531,7 +1545,7 @@ def _predict_cloud_image(image_bytes):
     tf.keras.applications.mobilenet_v2.preprocess_input, exactly what
     cloud-training-server/train_server.py trains with."""
     if not TFLITE_AVAILABLE:
-        return None, "tflite-runtime not installed"
+        return None, "no tflite runtime installed"
     cached = _get_cloud_interpreter()
     if cached is None:
         return None, ("no trained model downloaded yet" if not _cloud_model_files_present()
@@ -2988,9 +3002,9 @@ def recompute_overall_safe():
         if prev_cloud_state is not None:
             cloud_state_messages = {
                 "disabled": "Cloud Image Model gate turned off - back to the standard safety checks only",
-                "tflite_missing": "Cloud Image Model gate is enabled but tflite-runtime isn't installed on "
+                "tflite_missing": "Cloud Image Model gate is enabled but no tflite runtime is installed on "
                                    "this Pi - falling back to the standard safety checks (pip3 install "
-                                   "tflite-runtime)",
+                                   "--break-system-packages tflite-runtime or ai-edge-litert)",
                 "untrained": "Cloud Image Model gate is enabled but no model has been downloaded yet - "
                              "falling back to the standard safety checks (train one on the Classify page)",
                 "no_image": "Cloud Image Model gate is enabled but has no current All Sky frame to classify "
@@ -5075,8 +5089,9 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
   <a href="/ai-classify">Classify page</a> - {cloud_using_note})</span>""")
     elif cloud_model_wanted and cloud_status == "tflite_missing":
         cloud_model_row = _field_row("", "⚠️",
-            "Cloud Image Model gate is enabled but tflite-runtime isn't installed on this Pi — falling "
-            "back to the standard safety checks.", "warn-text")
+            "Cloud Image Model gate is enabled but no tflite runtime is installed on this Pi — falling "
+            "back to the standard safety checks. Install tflite-runtime, or ai-edge-litert if that has no "
+            "wheel for this Pi's Python version.", "warn-text")
     elif cloud_model_wanted and cloud_status == "untrained":
         cloud_model_row = _field_row("", "⚠️",
             "Cloud Image Model gate is enabled but no model has been downloaded yet — falling back to "
@@ -5174,8 +5189,9 @@ def _cloud_model_banner_html(s, checks):
     status = s.get("cloud_model_status")
     if status == "tflite_missing":
         return ("<div class='banner banner-warn'>📷 <b>Cloud Image Model gate is enabled but "
-                "tflite-runtime isn't installed on this Pi</b> &mdash; falling back to the standard "
-                "safety checks.</div>")
+                "no tflite runtime is installed on this Pi</b> &mdash; falling back to the standard "
+                "safety checks. Install tflite-runtime, or ai-edge-litert if this Pi's Python version "
+                "has no tflite-runtime wheel.</div>")
     if status == "untrained":
         return ("<div class='banner banner-warn'>📷 <b>Cloud Image Model gate is enabled but not "
                 "trained yet</b> &mdash; falling back to the standard safety checks. "
@@ -5335,8 +5351,10 @@ def web_index():
     # above, but for the cloud-trained image model gate.
     if checks.get("cloud_model_enabled"):
         _cloud_status_hints = {
-            "tflite_missing": "Enabled, but tflite-runtime isn't installed on this Pi — falling back to the "
-                               "standard safety checks. Run <code>pip3 install tflite-runtime</code>.",
+            "tflite_missing": "Enabled, but no tflite runtime is installed on this Pi — falling back to the "
+                               "standard safety checks. Run <code>pip3 install --break-system-packages "
+                               "tflite-runtime</code>, or <code>ai-edge-litert</code> if that has no wheel "
+                               "for this Pi's Python version.",
             "untrained": "Enabled, but no model has been downloaded yet — falling back to the standard "
                          "safety checks. Train one on the <a href=\"/ai-classify\">Classify page</a> first.",
             "no_image": "Enabled, but there's no current All Sky frame to classify right now — falling "

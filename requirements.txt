@@ -14,13 +14,20 @@ adafruit-circuitpython-dht
 adafruit-extended-bus
 rpi-lgpio
 
-# tflite-runtime + numpy are DELIBERATELY NOT listed here, even though
-# they're needed for the optional Cloud Image Model gate (see
+# A tflite runtime + numpy are DELIBERATELY NOT listed here, even though
+# one is needed for the optional Cloud Image Model gate (see
 # cloud-training-server/ and Settings -> Safety Checks) - a missing wheel
 # for either on some Pi OS/Python combinations would otherwise fail this
 # ENTIRE `pip install -r requirements.txt`, taking the whole service down
 # with it over one optional feature. install.sh installs them as a
 # separate, best-effort step instead; without them, that gate simply fails
 # open with a clear status, same as any other missing optional dependency
-# in this project. To add it by hand: pip3 install --break-system-packages
-# tflite-runtime numpy
+# in this project. To add it by hand:
+#   pip3 install --break-system-packages tflite-runtime numpy
+# tflite-runtime hasn't had a release since Oct 2023 and only ever
+# published wheels for Python 3.8-3.11, so a newer Pi OS/Python has no
+# matching distribution at all ("Could not find a version that satisfies
+# the requirement tflite-runtime"). If you hit that, use Google's
+# actively maintained successor package instead - dome_safety_service.py
+# already tries it as a fallback automatically:
+#   pip3 install --break-system-packages ai-edge-litert numpy
