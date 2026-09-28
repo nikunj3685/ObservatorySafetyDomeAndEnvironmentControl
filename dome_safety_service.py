@@ -566,6 +566,12 @@ CLOUD_MODEL_CLASSES_PATH = os.path.join(CLOUD_MODEL_DIR, "classes.json")
 CLOUD_MODEL_META_PATH = os.path.join(CLOUD_MODEL_DIR, "meta.json")
 CLOUD_JOB_STATE_PATH = os.path.join(AI_TRAINING_DIR, "cloud_job.json")
 CLOUD_MODEL_IMG_SIZE = (224, 224)      # must match cloud-training-server/train_server.py's IMG_SIZE
+CLOUD_UPLOAD_RESIZE_MAX_DIM = 400      # long-edge cap for images going into the CLOUD TRAINING upload zip only
+                                        # (see _ai_training_export_zip's resize_max_dim) - comfortably above
+                                        # CLOUD_MODEL_IMG_SIZE's 224px (both training and live inference resize
+                                        # to exactly that anyway - see _predict_cloud_image()) so nothing is
+                                        # lost, while cutting a ~1000-image upload from gigabytes to tens of MB.
+                                        # The manual "Export as .zip" (Teachable Machine reuse) stays full-res.
 CLOUD_MODEL_PREDICT_INTERVAL_SEC = 60  # how often the live gate re-classifies the current All Sky frame
 CLOUD_TRAIN_POLL_INTERVAL_SEC = 15     # how often the background upload/poll thread checks job status
 CLOUD_TRAIN_TIMEOUT_SEC = 30 * 60      # give up and mark the job failed after this long either way
@@ -1602,7 +1608,8 @@ def _start_cloud_training(triggered_by="manual"):
     if not api_key:
         return False, "No cloud training server API key configured - set one under Settings → AI Learning."
 
-    zip_buf, labeled_count, sample_ids = _ai_training_export_zip(only_untrained=True)
+    zip_buf, labeled_count, sample_ids = _ai_training_export_zip(
+        only_untrained=True, resize_max_dim=CLOUD_UPLOAD_RESIZE_MAX_DIM)
     if labeled_count == 0:
         return False, ("No newly labeled samples to train on - either classify more on the Classify page, "
                         "or every classified sample has already been absorbed into a previous cloud training run.")
@@ -6425,7 +6432,7 @@ def _safe_export_folder_name(label):
     return cleaned or "Unlabeled"
 
 
-def _ai_training_export_zip(only_untrained=False):
+def _ai_training_export_zip(only_untrained=False, resize_max_dim=None):
     """Builds an in-memory .zip of labeled AI Learning samples, one folder
     per label (Clear/, Cloudy/, ...) - the same folder-per-class layout
     Teachable Machine's own image uploader expects, so the export can be
@@ -6440,6 +6447,23 @@ def _ai_training_export_zip(only_untrained=False):
     incremental training is that the Pi never has to re-upload those. A
     sample whose image has already been deleted ("image": None, once
     absorbed) is skipped either way, since there's nothing left to zip.
+
+    resize_max_dim, when set (the cloud-training upload path passes
+    CLOUD_UPLOAD_RESIZE_MAX_DIM; the manual download below leaves it
+    None), downscales each image so its LONGEST edge is at most this many
+    pixels before adding it to the zip - the original file on disk is
+    never touched, only the copy going into this zip. This is purely a
+    transfer-size optimization: both training (train_server.py's
+    image_dataset_from_directory(..., image_size=IMG_SIZE)) and live
+    inference (_predict_cloud_image()) resize every image down to
+    CLOUD_MODEL_IMG_SIZE (224x224) before it ever reaches the model
+    anyway, so shipping anything larger than that over the network buys
+    nothing - a live All Sky camera capture is full resolution too, and
+    is resized the exact same way at prediction time, so this keeps
+    training and inference seeing equivalent detail. A resize failure on
+    one image (corrupt file, unsupported format) falls back to including
+    that image at its original size rather than dropping it - the point
+    is a smaller upload, never a smaller training set.
 
     Returns (zip_bytes_io, sample_count, sample_ids) - sample_ids lists
     exactly which samples actually made it into the zip (skipping any
@@ -6460,7 +6484,27 @@ def _ai_training_export_zip(only_untrained=False):
             if not os.path.isfile(src):
                 continue  # index and disk can drift apart (e.g. manual cleanup) - skip, don't fail the whole export
             folder = _safe_export_folder_name(sample["label"])
-            zf.write(src, arcname=f"{folder}/{sample['id']}.jpg")
+            arcname = f"{folder}/{sample['id']}.jpg"
+            wrote_resized = False
+            if resize_max_dim:
+                try:
+                    with Image.open(src) as img:
+                        img = img.convert("RGB")
+                        w, h = img.size
+                        longest = max(w, h)
+                        if longest > resize_max_dim:
+                            scale = resize_max_dim / float(longest)
+                            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                                              Image.LANCZOS)
+                        out = io.BytesIO()
+                        img.save(out, format="JPEG", quality=85)
+                        zf.writestr(arcname, out.getvalue())
+                        wrote_resized = True
+                except Exception as e:
+                    print(f"[ai-learning] export: failed to resize {image_name} for upload, using "
+                          f"the original size instead - {e}")
+            if not wrote_resized:
+                zf.write(src, arcname=arcname)
             sample_ids.append(sample["id"])
     buf.seek(0)
     return buf, len(sample_ids), sample_ids
