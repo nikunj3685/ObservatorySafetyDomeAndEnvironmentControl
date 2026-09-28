@@ -2045,6 +2045,8 @@ sensor_state = {
     "rain_prev_state": None, "rain_prev_since": None,
     "mlx_prev_state": None, "mlx_prev_since": None,
     "mlcloud_prev_state": None, "mlcloud_prev_since": None,
+    "ai_model_prev_state": None, "ai_model_prev_since": None,
+    "cloud_model_prev_state": None, "cloud_model_prev_since": None,
 }
 
 
@@ -2538,6 +2540,15 @@ def recompute_overall_safe():
         sensor_state["ai_model_status"] = ai_model_status
         sensor_state["ai_model_predicted"] = ai_predicted
         sensor_state["ai_model_sample_count"] = ai_model.get("sample_count") if ai_model_valid else None
+        # "Previous status" history for the dashboard's light-gray line under
+        # this row - same pattern as mlx_cloud/ml_cloud above. Only tracked
+        # while there's an actual prediction to record (never while
+        # untrained/no_data), so "Previously X" always names a genuine past
+        # PREDICTION, never a transient "no data right now" gap - the prev
+        # value simply holds at whatever it last was through those gaps.
+        if ai_predicted is not None:
+            sensor_state["ai_model_prev_state"], sensor_state["ai_model_prev_since"] = \
+                _track_status_change("ai_model", ai_predicted, now)
 
         if ai_model_wanted and ai_model_status == "active":
             safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
@@ -2587,6 +2598,10 @@ def recompute_overall_safe():
         sensor_state["gate_cloud_model"] = gate_cloud_model
         cloud_model_pass = gate_cloud_model
         sensor_state["cloud_model_pass"] = cloud_model_pass
+        # Same "previous status" history as the AI Model gate above.
+        if cloud_predicted is not None:
+            sensor_state["cloud_model_prev_state"], sensor_state["cloud_model_prev_since"] = \
+                _track_status_change("cloud_model", cloud_predicted, now)
 
         # Same edge-triggered notification shape as the AI Model gate above.
         cloud_state_key = cloud_model_status if cloud_model_wanted else "disabled"
@@ -4648,6 +4663,9 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         ai_model_row = _field_row("", "⚠️",
             "AI Model gate is enabled but has no fresh sensor data to predict from right now — falling "
             "back to the standard safety checks.", "warn-text")
+    ai_model_prev = _prev_status_text(s["ai_model_prev_state"], s["ai_model_prev_since"], tz_name)
+    if ai_model_row and ai_model_prev:
+        ai_model_row += _field_row("", "", ai_model_prev, "prev-status")
 
     # Cloud-trained image model (Phase 5) - same shape as the AI Model row
     # above, reading whatever poll_cloud_model() last wrote this cycle.
@@ -4683,6 +4701,9 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         cloud_model_row = _field_row("", "⚠️",
             "Cloud Image Model gate is enabled but has no usable prediction right now — falling back to "
             "the standard safety checks.", "warn-text")
+    cloud_model_prev = _prev_status_text(s["cloud_model_prev_state"], s["cloud_model_prev_since"], tz_name)
+    if cloud_model_row and cloud_model_prev:
+        cloud_model_row += _field_row("", "", cloud_model_prev, "prev-status")
 
     rain_row = _field_row(rain_dot, "☔", f"""Rain: <b>{'WET' if s['rain_detected'] else 'DRY'}</b> <span class="tag">{sensor_names['rain']}</span>{' <span class="muted">(disabled)</span>' if not checks['rain_enabled'] else ''}""")
     rain_prev = _prev_status_text(s["rain_prev_state"], s["rain_prev_since"], tz_name,
