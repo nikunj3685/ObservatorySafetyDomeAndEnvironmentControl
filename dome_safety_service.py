@@ -6300,17 +6300,32 @@ def _render_ai_classify_card(sample, tz):
                 if ts else "Unknown time")
     chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
 
-    img_url = f"/ai-training-image/{sample['image']}?w=220"
-    full_url = f"/ai-training-image/{sample['image']}"
+    # A sample's image is deliberately deleted once it's been absorbed into
+    # a successful cloud training run (see _absorb_cloud_training_success())
+    # - the label + sensor snapshot are kept forever, only the heavy JPEG
+    # goes away. Show a plain placeholder instead of a broken-image icon
+    # for those - everything else about the card (label, time, chips,
+    # selection checkbox) still works exactly the same, since none of it
+    # depends on the image file existing.
+    if sample.get("image"):
+        img_url = f"/ai-training-image/{sample['image']}?w=220"
+        full_url = f"/ai-training-image/{sample['image']}"
+        image_html = f'<img src="{img_url}" loading="lazy" alt="All Sky frame">'
+        fullsize_html = (f'<a class="ai-fullsize-link" href="{full_url}" target="_blank" '
+                          f'onclick="event.stopPropagation()">🔍 full size</a>')
+    else:
+        image_html = ('<div class="ai-card-noimg">Image already used in cloud training '
+                       '(deleted to save space)</div>')
+        fullsize_html = ""
     return f"""<div class="ai-card" id="ai-card-{sid}">
   <label class="ai-card-select">
     <input type="checkbox" class="ai-pick" value="{sid}">
-    <img src="{img_url}" loading="lazy" alt="All Sky frame">
+    {image_html}
   </label>
   {label_badge_html}
   <div class="ai-card-time">{time_str}</div>
   <div class="ai-card-chips">{chips_html}</div>
-  <a class="ai-fullsize-link" href="{full_url}" target="_blank" onclick="event.stopPropagation()">🔍 full size</a>
+  {fullsize_html}
 </div>"""
 
 
@@ -6327,10 +6342,17 @@ def _render_ai_classify_single_card(sample, tz, position, total):
     time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
                 if ts else "Unknown time")
     chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
-    full_url = f"/ai-training-image/{sample['image']}"
+    # See _render_ai_classify_card()'s comment above - same reasoning here.
+    if sample.get("image"):
+        full_url = f"/ai-training-image/{sample['image']}"
+        image_html = f'<img class="ai-single-img" src="{full_url}" alt="All Sky frame">'
+    else:
+        image_html = ('<div class="ai-card-noimg ai-single-noimg">Image already used in cloud '
+                       'training (deleted to save space) - its label and sensor reading are '
+                       'still kept.</div>')
     return f"""<div class="ai-single-card" id="singleCard" data-id="{sid}">
   <div class="ai-single-position">Image {position + 1} of {total}</div>
-  <img class="ai-single-img" src="{full_url}" alt="All Sky frame">
+  {image_html}
   {label_badge_html}
   <div class="ai-card-time">{time_str}</div>
   <div class="ai-card-chips">{chips_html}</div>
@@ -6594,6 +6616,10 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .ai-card-select{{display:block;cursor:pointer;}}
 .ai-card-select img{{width:100%;border-radius:6px;display:block;background:#14161a;}}
 .ai-card-select input[type=checkbox]{{position:absolute;top:12px;left:12px;width:18px;height:18px;}}
+.ai-card-noimg{{width:100%;min-height:120px;border-radius:6px;background:#eceff1;color:var(--muted);
+                 font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;
+                 padding:10px;box-sizing:border-box;}}
+.ai-single-noimg{{max-height:none;min-height:160px;}}
 .ai-label-badge{{position:absolute;top:12px;right:12px;background:var(--accent);color:#fff;
                   border-radius:10px;padding:1px 9px;font-size:11.5px;font-weight:600;}}
 .ai-card-time{{font-size:11.5px;color:var(--muted);margin-top:6px;}}
