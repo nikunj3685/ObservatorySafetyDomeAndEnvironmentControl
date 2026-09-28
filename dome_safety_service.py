@@ -442,20 +442,23 @@ DEFAULT_SETTINGS = {
     # doesn't fill up unattended.
     #
     # capture_images_enabled - the master switch: while False, NO log entry
-    # ever gets an image attached, no matter what the five image_on_* flags
+    # ever gets an image attached, no matter what the seven image_on_* flags
     # below say (they're only consulted when this is True). Defaults to
-    # True so behavior is unchanged for anyone upgrading - the five
-    # per-event flags were already the only thing gating image capture.
+    # True so behavior is unchanged for anyone upgrading - the original
+    # five per-event flags were already the only thing gating image
+    # capture; image_on_ai_model_change/image_on_cloud_model_change were
+    # added later, alongside the AI Model / Cloud Image Model gates.
     #
     # image_on_* - independently toggleable, per event type, whether that
     # Logs entry captures an All Sky snapshot (only while capture_images_
     # enabled above is also True). All default to True so a freshly-set-up
     # system can see "what did the sky actually look like when this
-    # sensor's reading changed" for every one of the five safety events
-    # while everything is still being shaken out; once it's clearly
-    # behaving as expected, any of the five can be switched off from
-    # Settings to stop accumulating images for that event, or the master
-    # switch can be turned off to stop all image capture in one place.
+    # sensor's reading (or AI/Cloud model prediction) changed" for every
+    # one of the seven safety events while everything is still being
+    # shaken out; once it's clearly behaving as expected, any of the seven
+    # can be switched off from Settings to stop accumulating images for
+    # that event, or the master switch can be turned off to stop all image
+    # capture in one place.
     "logging": {
         "image_retention_days": 30,
         "log_retention_days": 90,
@@ -465,6 +468,8 @@ DEFAULT_SETTINGS = {
         "image_on_mlx_change": True,
         "image_on_mlcloud_change": True,
         "image_on_overall_flip": True,
+        "image_on_ai_model_change": True,
+        "image_on_cloud_model_change": True,
     },
 }
 
@@ -2782,9 +2787,10 @@ def recompute_overall_safe():
     logging_cfg = get_setting("logging")
 
     # (category, message, severity, image_mode) - image_mode is "never", or
-    # one of "daynight"/"rain"/"mlx"/"mlcloud"/"overall", each independently
-    # toggled on/off via the matching DEFAULT_SETTINGS["logging"]["image_on_
-    # *"] flag (checked below, after sensor_lock is released).
+    # one of "daynight"/"rain"/"mlx"/"mlcloud"/"overall"/"ai_model"/
+    # "cloud_model", each independently toggled on/off via the matching
+    # DEFAULT_SETTINGS["logging"]["image_on_*"] flag (checked below, after
+    # sensor_lock is released).
     pending_logs = []
 
     with sensor_lock:
@@ -2960,6 +2966,18 @@ def recompute_overall_safe():
             sensor_state["ai_model_prev_state"], sensor_state["ai_model_prev_since"] = \
                 _track_status_change("ai_model", ai_predicted, now)
 
+        # Prediction-change log line, independent of the gate toggle above
+        # (same "informational even when off" philosophy as the dashboard
+        # row) - fires only while the model is actually producing
+        # predictions (status "active"), same shape as the mlx/mlcloud
+        # reading-changed lines above. image_mode "ai_model" is its own
+        # independently-toggleable Settings -> Logging checkbox.
+        if ai_model_status == "active" and ai_predicted is not None:
+            prev_ai_pred = _log_status_change("log_ai_model_pred", ai_predicted)
+            if prev_ai_pred is not None:
+                pending_logs.append(("Safety", f"AI Sky Prediction(Sensor Based) changed from "
+                                                f"{prev_ai_pred} to {ai_predicted}", "info", "ai_model"))
+
         if ai_model_wanted and ai_model_status == "active":
             safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
             gate_ai_model = ai_predicted.strip().lower() in safe_labels
@@ -3012,6 +3030,16 @@ def recompute_overall_safe():
         if cloud_predicted is not None:
             sensor_state["cloud_model_prev_state"], sensor_state["cloud_model_prev_since"] = \
                 _track_status_change("cloud_model", cloud_predicted, now)
+
+        # Prediction-change log line, same shape and same independence from
+        # the gate toggle as the AI Model prediction-change line above.
+        # image_mode "cloud_model" is its own independently-toggleable
+        # Settings -> Logging checkbox.
+        if cloud_model_status == "active" and cloud_predicted is not None:
+            prev_cloud_pred = _log_status_change("log_cloud_model_pred", cloud_predicted)
+            if prev_cloud_pred is not None:
+                pending_logs.append(("Safety", f"AI Cloud Detect(All Sky) changed from "
+                                                f"{prev_cloud_pred} to {cloud_predicted}", "info", "cloud_model"))
 
         # Same edge-triggered notification shape as the AI Model gate above.
         cloud_state_key = cloud_model_status if cloud_model_wanted else "disabled"
@@ -3121,6 +3149,8 @@ def recompute_overall_safe():
             "mlx": logging_cfg["image_on_mlx_change"],
             "mlcloud": logging_cfg["image_on_mlcloud_change"],
             "overall": logging_cfg["image_on_overall_flip"],
+            "ai_model": logging_cfg.get("image_on_ai_model_change", True),
+            "cloud_model": logging_cfg.get("image_on_cloud_model_change", True),
         }
         capture_images_enabled = logging_cfg.get("capture_images_enabled", True)
         for category, message, severity, image_mode in pending_logs:
@@ -4648,7 +4678,7 @@ def save_logging():
         # marked disabled (via HTML `disabled`, not just greyed out) in the
         # page whenever the master switch above is off - and a browser
         # never submits a disabled form control at all, checked or not. So
-        # when the master is off, none of these five keys are present in
+        # when the master is off, none of these seven keys are present in
         # request.args regardless of their actual saved state, and treating
         # their absence as "uncheck it" would silently wipe out whatever
         # they were set to. Only touch them when the fieldset was actually
@@ -4661,6 +4691,8 @@ def save_logging():
             s["logging"]["image_on_mlx_change"] = "imgMlx" in request.args
             s["logging"]["image_on_mlcloud_change"] = "imgMlcloud" in request.args
             s["logging"]["image_on_overall_flip"] = "imgOverall" in request.args
+            s["logging"]["image_on_ai_model_change"] = "imgAiModel" in request.args
+            s["logging"]["image_on_cloud_model_change"] = "imgCloudModel" in request.args
     update_settings(patch)
     _log_event("Settings", "Logging settings saved")
     return "", 302, {"Location": "/#logging-settings"}
@@ -5822,7 +5854,7 @@ a{{color:var(--accent-safety);}}
        {"checked" if logging_cfg.get('capture_images_enabled', True) else ""}> Take images with logs</label>
       <p class="hint">Master switch for every image below — while off, NO log entry ever gets an All Sky
       snapshot attached, regardless of the per-event settings underneath. Turn it back on to go back to
-      whatever those five were already set to.</p>
+      whatever those seven were already set to.</p>
       <fieldset id="imgPerEventFields" {"" if logging_cfg.get('capture_images_enabled', True) else "disabled"}>
       <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
       checking "what did the sky actually look like when this changed" while a new setup is being shaken
@@ -5838,6 +5870,12 @@ a{{color:var(--accent-safety);}}
       </div>
       <div class="setting-row">
         <label><input type="checkbox" name="imgMlcloud" {"checked" if logging_cfg['image_on_mlcloud_change'] else ""}> ML cloud detection change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgAiModel" {"checked" if logging_cfg.get('image_on_ai_model_change', True) else ""}> AI Sky Prediction(Sensor Based) change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgCloudModel" {"checked" if logging_cfg.get('image_on_cloud_model_change', True) else ""}> AI Cloud Detect(All Sky) change</label>
       </div>
       <div class="setting-row">
         <label><input type="checkbox" name="imgOverall" {"checked" if logging_cfg['image_on_overall_flip'] else ""}> Overall SAFE/UNSAFE change</label>
