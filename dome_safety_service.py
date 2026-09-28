@@ -668,6 +668,36 @@ def _format_sky_line(s, loc):
     return f"{bits[0]} (" + ", ".join(bits[1:]) + ")"
 
 
+def _format_ai_model_line(s):
+    """One text line for the local AI Model's sky prediction (the
+    from-scratch GaussianNB model trained on labeled samples via the
+    Classify page) - shared by _write_allsky_extra_data() and
+    _overlay_sensor_info() so both stay in sync, same as
+    _format_sky_line() above. Shown whenever the model is actually
+    producing a prediction (status "active"), regardless of whether its
+    gate toggle is on - matching the dashboard's own "informational even
+    when off" behavior. Returns None (line simply omitted) whenever
+    there's nothing trained/active to show, rather than a stale or blank
+    value."""
+    if s.get("ai_model_status") != "active":
+        return None
+    return f"AI Model: {s.get('ai_model_predicted')}"
+
+
+def _format_cloud_model_line(s):
+    """Same idea as _format_ai_model_line() above, for the cloud-trained
+    image classifier (Phase 5) - reads whatever poll_cloud_model() last
+    wrote. Returns None whenever there's no downloaded model currently
+    producing predictions."""
+    if s.get("cloud_model_status") != "active":
+        return None
+    predicted = s.get("cloud_model_predicted")
+    confidence = s.get("cloud_model_confidence")
+    if confidence is not None:
+        return f"Cloud AI: {predicted} ({confidence * 100:.0f}%)"
+    return f"Cloud AI: {predicted}"
+
+
 def _write_allsky_extra_data():
     """Best-effort write of the current sensor readings, one per line, into
     the plain-text file configured at Settings -> All Sky Camera -> Extra
@@ -714,10 +744,13 @@ def _write_allsky_extra_data():
             f"Outside: {s['env_temp_c']:.1f}C {s['env_humidity']:.0f}%RH" if env_fresh else "Outside: N/A",
             f"Box: {s['dht_temp_c']:.1f}C {s['dht_humidity']:.0f}%RH" if box_fresh else "Box: N/A",
             f"Sky: {_format_sky_line(s, loc)}",
+            _format_ai_model_line(s),
+            _format_cloud_model_line(s),
             f"Rain: {('Rain' if s['rain_detected'] else 'Dry') if rain_fresh else 'Unknown'}",
             f"ML Cloud: {s['cloud_class'] if cloud_fresh else 'Unknown'}",
             f"Overall: {'SAFE' if s['overall_safe'] else 'UNSAFE'}",
         ]
+        lines = [line for line in lines if line is not None]
 
         parent = os.path.dirname(dest)
         if parent:
@@ -777,15 +810,21 @@ def _overlay_sensor_info(image_bytes):
         sky_display = _format_sky_line(s, loc)
         overall_display = "SAFE" if s["overall_safe"] else "UNSAFE"
 
+        ai_model_display = _format_ai_model_line(s)
+        cloud_model_display = _format_cloud_model_line(s)
+
         lines = [
             timestamp_str,
             f"Outside: {s['env_temp_c']:.1f}C {s['env_humidity']:.0f}%RH" if env_fresh else "Outside: N/A",
             f"Box: {s['dht_temp_c']:.1f}C {s['dht_humidity']:.0f}%RH" if box_fresh else "Box: N/A",
             f"Sky: {sky_display}",
+            ai_model_display,
+            cloud_model_display,
             f"Rain: {rain_display}",
             f"ML Cloud: {ml_cloud_display}",
             f"Overall: {overall_display}",
         ]
+        lines = [line for line in lines if line is not None]
 
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
