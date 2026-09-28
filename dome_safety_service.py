@@ -4719,7 +4719,19 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if mlcloud_prev:
         ml_row += _field_row("", "", mlcloud_prev, "prev-status")
 
-    return sky_row + ai_model_row + cloud_model_row + rain_row + ml_row + outside_row + box_row
+    # Grouped into four visually-separated sections (a light divider between
+    # each, matching the one already used between the Day/Night block above
+    # and this whole readings area): (1) Day/Night lives in its own block
+    # above this function entirely, unchanged; (2) every sky/cloud-condition
+    # reading together - the raw MLX90614 reading plus every prediction
+    # drawn from it or from the same camera feed (local AI Model, Cloud
+    # Image Model, Simple Cloud Detect) - since they're all answering the
+    # same underlying question ("what's the sky doing"); (3) Rain, on its
+    # own; (4) the two ambient temperature/humidity readings (Environment,
+    # Box) that aren't part of the SAFE/UNSAFE fusion at all.
+    group_divider = '<hr class="sep">'
+    sky_group = sky_row + ai_model_row + cloud_model_row + ml_row
+    return sky_group + group_divider + rain_row + group_divider + outside_row + box_row
 
 
 def render_heater_info_html(h, heater_enabled=True, mosfet_name="Heater MOSFET"):
