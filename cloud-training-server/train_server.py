@@ -11,20 +11,30 @@ All Sky frames (the exact same format the Classify page's "Export as
 id for completion, then downloads the finished model.
 
 Endpoints:
-    GET  /health                    - no auth; {"ok": true}, used by
+    GET    /health                  - no auth; {"ok": true}, used by
                                        install.ps1's self-test and by
                                        the Pi to check reachability
-    POST /train                     - multipart upload, field "file" =
+    POST   /train                   - multipart upload, field "file" =
                                        the labeled-images zip; returns
                                        {"job_id": ...} immediately and
                                        trains in a background thread
-    GET  /train/status/<job_id>     - {"status": "queued|training|done|
-                                       failed", "error": ... }
-    GET  /train/model/<job_id>      - once status is "done", downloads
+    GET    /train/status/<job_id>   - {"status": "queued|training|done|
+                                       failed", "mode": "fresh|
+                                       incremental", "error": ... }
+    GET    /train/model/<job_id>    - once status is "done", downloads
                                        a zip containing model.tflite
                                        and classes.json (the ordered
                                        label list the model's output
                                        indices correspond to)
+    DELETE /model                   - durably clears the persisted
+                                       current_model/ (see below), so
+                                       the NEXT /train starts fresh
+                                       instead of warm-starting. For
+                                       when the observatory has moved,
+                                       or the sky's baseline otherwise
+                                       changed enough that the old
+                                       model's learning is actively
+                                       wrong rather than just stale.
 
 Every route except /health requires an X-API-Key header matching the
 key install.ps1 generated into server_config.json. There is no user
@@ -32,10 +42,22 @@ database, no accounts, no TLS termination here - it's meant to sit
 behind either a LAN-only firewall rule or a private network (Tailscale
 etc.), never exposed directly to the public internet.
 
-Training never touches anything outside its own jobs/<job_id>/ folder,
-and never raises out of the background thread - a failed run just
-leaves that job's status as "failed" with the exception message
-attached, so one bad training set can't take the server itself down.
+Incremental training: the first-ever /train call (or the first one
+after a /model reset) trains a brand-new model from scratch, same as
+before. Every /train call after that WARM-STARTS from that run's model
+instead - fine-tuning only on the newly uploaded images, at a lower
+learning rate and for fewer epochs than a fresh run, so the Pi never
+has to re-upload (or even keep) images that already went into a
+previous training run. See _train_job()'s "incremental run" branch for
+the class-index remapping this requires, and _expand_head_for_new_
+classes() for how a genuinely new label gets room in the model without
+disturbing what it already learned about the old ones.
+
+Training never touches anything outside its own jobs/<job_id>/ folder
+(plus the persisted current_model/ - see above), and never raises out
+of the background thread - a failed run just leaves that job's status
+as "failed" with the exception message attached, so one bad training
+set can't take the server itself down.
 """
 import io
 import json
@@ -56,6 +78,15 @@ CONFIG_PATH = os.path.join(BASE_DIR, "server_config.json")
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 LOG_PATH = os.path.join(BASE_DIR, "train_server.log")
 
+# The persisted warm-start base for incremental training - the FULL Keras
+# model (not the .tflite exported per-job below, which is inference-only
+# and can't be resumed from). Lives outside JOBS_DIR/JOB_RETENTION_DAYS on
+# purpose: unlike a job's own temp files, this is meant to stick around
+# indefinitely until a /model reset explicitly clears it.
+CURRENT_MODEL_DIR = os.path.join(BASE_DIR, "current_model")
+CURRENT_MODEL_KERAS_PATH = os.path.join(CURRENT_MODEL_DIR, "model.keras")
+CURRENT_MODEL_CLASSES_PATH = os.path.join(CURRENT_MODEL_DIR, "classes.json")
+
 # How long a finished/failed job's extracted images + model stick around
 # before being swept on startup - training data shouldn't pile up on this
 # machine's disk forever just because nobody re-ran the installer.
@@ -70,6 +101,22 @@ BATCH_SIZE = 16
 EPOCHS = 12
 MIN_SAMPLES_PER_CLASS = 5   # matches AI_MODEL_MIN_SAMPLES_PER_CLASS on the Pi
 MIN_CLASSES = 2
+
+# Incremental (warm-started) runs use a gentler fit than a fresh one -
+# fine-tuning an already-good head on a small new batch (maybe only 10-30
+# images) at the same learning rate/epoch count as a from-scratch run
+# would overfit to whatever's in that one batch and forget what the rest
+# of the model already learned. The backbone stays frozen either way,
+# which limits the damage, but the head still needs its own, more
+# conservative settings for this path.
+INCREMENTAL_EPOCHS = 4
+INCREMENTAL_LEARNING_RATE = 1e-4
+
+# Below this many total newly uploaded images, skip the train/validation
+# split entirely rather than handing Keras a validation set of 1-2 images
+# per class - not just unhelpful, but small enough to be actively
+# misleading (or to crash on an unlucky split).
+MIN_IMAGES_FOR_VALIDATION_SPLIT = 40
 
 app = Flask(__name__)
 
@@ -197,6 +244,73 @@ def _extract_and_validate(zip_bytes, dest_dir):
     return counts
 
 
+def _load_current_model():
+    """Best-effort load of the persisted warm-start base (see
+    CURRENT_MODEL_DIR) - the full Keras model, not the per-job .tflite
+    export, since only the former can be resumed from. Returns
+    (model, classes), or (None, None) if there's no saved model yet, or
+    it fails to load for any reason - always treated as "start fresh",
+    never a hard error, same fallback philosophy as the Pi's own
+    _load_ai_sky_model()."""
+    if not (os.path.isfile(CURRENT_MODEL_KERAS_PATH) and os.path.isfile(CURRENT_MODEL_CLASSES_PATH)):
+        return None, None
+    try:
+        import tensorflow as tf
+        model = tf.keras.models.load_model(CURRENT_MODEL_KERAS_PATH)
+        with open(CURRENT_MODEL_CLASSES_PATH) as f:
+            classes = json.load(f)
+        return model, classes
+    except Exception as e:
+        _log(f"warm-start: failed to load current_model, starting fresh instead - {e}")
+        return None, None
+
+
+def _save_current_model(model, classes):
+    """Persists the full Keras model + its class list as the warm-start
+    base for the NEXT /train call. Writes to a temp directory and swaps
+    it into place with os.replace() so a crash mid-save (or a /train
+    request arriving mid-swap) never sees a half-written base."""
+    tmp_dir = CURRENT_MODEL_DIR + ".tmp"
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+    model.save(os.path.join(tmp_dir, "model.keras"))
+    with open(os.path.join(tmp_dir, "classes.json"), "w") as f:
+        json.dump(classes, f)
+    if os.path.isdir(CURRENT_MODEL_DIR):
+        shutil.rmtree(CURRENT_MODEL_DIR)
+    os.replace(tmp_dir, CURRENT_MODEL_DIR)
+
+
+def _expand_head_for_new_classes(model, old_classes, new_classes):
+    """Rebuilds ONLY the final Dense layer to accommodate new_classes (a
+    superset of old_classes, old ones in their original order/positions)
+    - every old class's learned weights carry over unchanged, only the
+    brand-new classes' output units start randomly initialized. Backbone
+    and every other layer are reused exactly as-is. This is what lets a
+    genuinely new label (one that never appeared in any previous training
+    upload) join an existing warm-started model instead of being stuck
+    forever with whatever classes the very first training run happened
+    to have."""
+    import tensorflow as tf
+    old_dense = model.layers[-1]
+    old_weights, old_biases = old_dense.get_weights()  # (features, old_n), (old_n,)
+    features_in = old_weights.shape[0]
+
+    new_dense = tf.keras.layers.Dense(len(new_classes), activation="softmax")
+    new_dense.build((None, features_in))
+    new_weights, new_biases = new_dense.get_weights()
+    for i, cls in enumerate(old_classes):
+        j = new_classes.index(cls)
+        new_weights[:, j] = old_weights[:, i]
+        new_biases[j] = old_biases[i]
+    new_dense.set_weights([new_weights, new_biases])
+
+    features = model.layers[-2].output  # whatever fed the old Dense layer (post-Dropout)
+    outputs = new_dense(features)
+    return tf.keras.Model(model.input, outputs)
+
+
 def _train_job(job_id, zip_bytes):
     job_path = _job_dir(job_id)
     images_dir = os.path.join(job_path, "images")
@@ -209,6 +323,7 @@ def _train_job(job_id, zip_bytes):
         _set("training")
         _log(f"job {job_id}: extracting upload")
         counts = _extract_and_validate(zip_bytes, images_dir)
+        total_images = sum(counts.values())
         _log(f"job {job_id}: training on {counts}")
 
         # Imported here, not at module load - keeps /health and simple
@@ -216,38 +331,96 @@ def _train_job(job_id, zip_bytes):
         # heavy import) has finished loading on a fresh server start.
         import tensorflow as tf
 
-        train_ds = tf.keras.utils.image_dataset_from_directory(
-            images_dir, image_size=IMG_SIZE, batch_size=BATCH_SIZE,
-            validation_split=0.2, subset="training", seed=1337,
-        )
-        val_ds = tf.keras.utils.image_dataset_from_directory(
-            images_dir, image_size=IMG_SIZE, batch_size=BATCH_SIZE,
-            validation_split=0.2, subset="validation", seed=1337,
-        )
-        class_names = train_ds.class_names
+        use_validation = total_images >= MIN_IMAGES_FOR_VALIDATION_SPLIT
+        if use_validation:
+            train_ds = tf.keras.utils.image_dataset_from_directory(
+                images_dir, image_size=IMG_SIZE, batch_size=BATCH_SIZE,
+                validation_split=0.2, subset="training", seed=1337,
+            )
+            val_ds = tf.keras.utils.image_dataset_from_directory(
+                images_dir, image_size=IMG_SIZE, batch_size=BATCH_SIZE,
+                validation_split=0.2, subset="validation", seed=1337,
+            )
+        else:
+            _log(f"job {job_id}: only {total_images} images uploaded (below "
+                 f"{MIN_IMAGES_FOR_VALIDATION_SPLIT}) - skipping the validation split")
+            train_ds = tf.keras.utils.image_dataset_from_directory(
+                images_dir, image_size=IMG_SIZE, batch_size=BATCH_SIZE,
+            )
+            val_ds = None
+        local_classes = train_ds.class_names  # this upload's own subfolders, alphabetical
         train_ds = train_ds.prefetch(tf.data.AUTOTUNE)
-        val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
+        if val_ds is not None:
+            val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
 
-        base = tf.keras.applications.MobileNetV2(
-            input_shape=IMG_SIZE + (3,), include_top=False, weights="imagenet",
-        )
-        base.trainable = False  # only the new head trains - see module docstring
+        base_model, base_classes = _load_current_model()
 
-        inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
-        x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
-        x = base(x, training=False)
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        x = tf.keras.layers.Dropout(0.2)(x)
-        outputs = tf.keras.layers.Dense(len(class_names), activation="softmax")(x)
-        model = tf.keras.Model(inputs, outputs)
-        model.compile(
-            optimizer="adam",
-            loss="sparse_categorical_crossentropy",
-            metrics=["accuracy"],
-        )
+        if base_model is None:
+            # ---- Fresh run: no warm-start base exists yet (first-ever
+            # training call, or the model was just reset via DELETE
+            # /model). Exactly the from-scratch build this always did. ----
+            mode = "fresh"
+            combined_classes = local_classes
+            _set("training", mode=mode)
 
-        _log(f"job {job_id}: fitting head ({len(class_names)} classes)")
-        model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=2)
+            backbone = tf.keras.applications.MobileNetV2(
+                input_shape=IMG_SIZE + (3,), include_top=False, weights="imagenet",
+            )
+            backbone.trainable = False  # only the new head trains - see module docstring
+            inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
+            x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
+            x = backbone(x, training=False)
+            x = tf.keras.layers.GlobalAveragePooling2D()(x)
+            x = tf.keras.layers.Dropout(0.2)(x)
+            outputs = tf.keras.layers.Dense(len(combined_classes), activation="softmax")(x)
+            model = tf.keras.Model(inputs, outputs)
+            model.compile(optimizer="adam", loss="sparse_categorical_crossentropy",
+                          metrics=["accuracy"])
+            epochs = EPOCHS
+            _log(f"job {job_id}: fitting a NEW model from scratch ({len(combined_classes)} classes)")
+        else:
+            # ---- Incremental run: warm-start from the persisted model,
+            # fine-tuning ONLY on these newly uploaded images - the Pi
+            # never has to re-upload (or even still have on disk) any
+            # image that already went into a previous run. ----
+            mode = "incremental"
+            combined_classes = list(base_classes)
+            for c in local_classes:
+                if c not in combined_classes:
+                    combined_classes.append(c)  # a genuinely new label - gets a new unit below
+            _set("training", mode=mode)
+
+            if combined_classes != list(base_classes):
+                new_labels = [c for c in combined_classes if c not in base_classes]
+                _log(f"job {job_id}: new label(s) since the last training run - "
+                     f"expanding the model's head for {new_labels}")
+                model = _expand_head_for_new_classes(base_model, base_classes, combined_classes)
+            else:
+                model = base_model
+
+            # This upload's own local label indices (alphabetical within
+            # ONLY the folders present in THIS zip) do not necessarily
+            # line up with the persisted model's stable class order -
+            # e.g. if this batch happens to skip a label the model
+            # already knows. Remap every label to combined_classes'
+            # indices before it reaches model.fit, or fine-tuning would
+            # silently train the wrong class.
+            remap = tf.constant([combined_classes.index(c) for c in local_classes], dtype=tf.int64)
+
+            def _remap(images, labels):
+                return images, tf.gather(remap, labels)
+
+            train_ds = train_ds.map(_remap)
+            if val_ds is not None:
+                val_ds = val_ds.map(_remap)
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=INCREMENTAL_LEARNING_RATE),
+                          loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+            epochs = INCREMENTAL_EPOCHS
+            _log(f"job {job_id}: fine-tuning the existing model ({len(combined_classes)} classes, "
+                 f"warm-started)")
+
+        model.fit(train_ds, validation_data=val_ds, epochs=epochs, verbose=2)
 
         _log(f"job {job_id}: converting to TFLite")
         converter = tf.lite.TFLiteConverter.from_keras_model(model)
@@ -256,10 +429,12 @@ def _train_job(job_id, zip_bytes):
         with open(os.path.join(job_path, "model.tflite"), "wb") as f:
             f.write(tflite_model)
         with open(os.path.join(job_path, "classes.json"), "w") as f:
-            json.dump(class_names, f)
+            json.dump(combined_classes, f)
 
-        _set("done", classes=class_names, error=None)
-        _log(f"job {job_id}: done ({class_names})")
+        _save_current_model(model, combined_classes)
+
+        _set("done", classes=combined_classes, mode=mode, error=None)
+        _log(f"job {job_id}: done ({mode}, {combined_classes})")
     except ValueError as e:
         # A data-quality problem (not enough images, bad zip, etc.) -
         # the same kind of message the Pi's own /ai-train-model route
@@ -276,7 +451,8 @@ def _train_job(job_id, zip_bytes):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "jobs_in_memory": len(jobs)})
+    has_current_model = os.path.isfile(CURRENT_MODEL_KERAS_PATH) and os.path.isfile(CURRENT_MODEL_CLASSES_PATH)
+    return jsonify({"ok": True, "jobs_in_memory": len(jobs), "has_current_model": has_current_model})
 
 
 @app.route("/train", methods=["POST"])
@@ -331,6 +507,28 @@ def train_model(job_id):
     buf.seek(0)
     return send_file(buf, mimetype="application/zip",
                       as_attachment=True, download_name=f"sky_model_{job_id}.zip")
+
+
+@app.route("/model", methods=["DELETE"])
+@require_api_key
+def reset_model():
+    """Durably clears the persisted warm-start base so the NEXT /train
+    call trains a brand-new model from scratch instead of fine-tuning
+    the old one. For when the observatory has moved, or the sky's
+    baseline has otherwise changed enough that the old model's learning
+    is actively wrong rather than merely stale. Does not touch any
+    in-flight or past job's own jobs/<job_id>/ files - those stay
+    downloadable (while not yet swept by JOB_RETENTION_DAYS) even after
+    a reset, only the warm-start base used for the NEXT run is affected."""
+    had_model = os.path.isdir(CURRENT_MODEL_DIR)
+    try:
+        if had_model:
+            shutil.rmtree(CURRENT_MODEL_DIR)
+    except Exception as e:
+        _log(f"reset_model: failed to remove {CURRENT_MODEL_DIR} - {e}")
+        return jsonify({"ok": False, "error": f"could not clear current model: {e}"}), 500
+    _log(f"reset_model: current_model cleared (existed before: {had_model}) - next /train will be fresh")
+    return jsonify({"ok": True, "had_model": had_model})
 
 
 if __name__ == "__main__":

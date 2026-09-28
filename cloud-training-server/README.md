@@ -16,7 +16,7 @@ in the parent folder of this repo, and hasn't been built yet.
 
 | File | Purpose |
 |---|---|
-| `train_server.py` | The server itself - Flask app exposing `/health`, `/train`, `/train/status/<id>`, `/train/model/<id>`. |
+| `train_server.py` | The server itself - Flask app exposing `/health`, `/train`, `/train/status/<id>`, `/train/model/<id>`, `DELETE /model`. |
 | `requirements.txt` | Python dependencies (Flask, TensorFlow, Pillow, waitress). |
 | `install.ps1` | One-shot Windows installer - see below. |
 | `uninstall.ps1` | Reverses everything `install.ps1` set up. |
@@ -130,3 +130,51 @@ internet either way.
   disk, then swept automatically on server startup - not because
   anything is time-sensitive, just so old training runs don't pile up
   forever.
+
+### Incremental (warm-started) training
+
+The first-ever `/train` call trains a brand-new model from scratch, same as
+always. Every `/train` call after that **warm-starts** from that run's
+model instead - fine-tuning only on the newly uploaded images, at a lower
+learning rate and for fewer epochs than a fresh run. In practice this
+means the Pi only ever needs to upload images that haven't already been
+absorbed into a previous training run; it doesn't need to keep re-sending
+(or even keep on disk) everything it's ever labeled.
+
+- If an upload's labels are the same set the model already knows, the
+  existing output layer is fine-tuned in place, `mode` in the job status
+  is `"incremental"`, and the label order (`classes.json`) stays exactly
+  as it was.
+- If an upload introduces a genuinely new label the model has never seen,
+  the model's final classification layer is transparently rebuilt one
+  unit larger - the new label is appended to the end of `classes.json`,
+  every previously-learned class keeps its exact same output position,
+  and only the new class's weights start randomly initialized. Nothing
+  else in the model (the frozen MobileNetV2 backbone, or any other
+  layer) is touched.
+- Below 40 total newly uploaded images, the training/validation split is
+  skipped entirely (too few images for a validation set to mean anything
+  or to reliably avoid crashing on an unlucky split) - training still
+  proceeds on the full upload.
+- `GET /train/status/<job_id>` includes a `mode` field (`"fresh"` or
+  `"incremental"`) alongside `status`, so the Pi (or you, checking by
+  hand) can see which kind of run just happened.
+
+### Resetting the model
+
+```powershell
+Invoke-RestMethod -Method Delete -Uri http://localhost:8787/model -Headers @{ "X-API-Key" = "<your key>" }
+```
+
+Durably clears the persisted warm-start base (`current_model/`), so the
+**next** `/train` call starts completely fresh instead of fine-tuning the
+old model. Use this if the observatory has physically moved, or the sky's
+baseline has otherwise changed enough that the old model's learning is
+actively wrong rather than merely stale - for example, a new camera
+location, a different light-pollution environment, or starting the whole
+labeling process over. This only clears the warm-start base; it does not
+delete any past job's downloadable `model.tflite`/`classes.json` files
+under `jobs/` (those are swept on their own 14-day schedule). A matching
+"Reset cloud model" control on the Pi side (calling this endpoint and
+also clearing its own locally downloaded copy) is planned but not yet
+built - for now, resetting is a manual call to this endpoint.
