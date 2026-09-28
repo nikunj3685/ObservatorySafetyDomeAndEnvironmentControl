@@ -9,3 +9,14 @@ adafruit-circuitpython-mlx90614
 adafruit-circuitpython-dht
 adafruit-extended-bus
 rpi-lgpio
+
+# tflite-runtime + numpy are DELIBERATELY NOT listed here, even though
+# they're needed for the optional Cloud Image Model gate (see
+# cloud-training-server/ and Settings -> Safety Checks) - a missing wheel
+# for either on some Pi OS/Python combinations would otherwise fail this
+# ENTIRE `pip install -r requirements.txt`, taking the whole service down
+# with it over one optional feature. install.sh installs them as a
+# separate, best-effort step instead; without them, that gate simply fails
+# open with a clear status, same as any other missing optional dependency
+# in this project. To add it by hand: pip3 install --break-system-packages
+# tflite-runtime numpy

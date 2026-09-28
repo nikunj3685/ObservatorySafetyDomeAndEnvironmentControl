@@ -123,6 +123,25 @@ if ! pip3 install --break-system-packages -r requirements.txt 2>/tmp/pip_err.log
 fi
 rm -f /tmp/pip_err.log
 
+echo "==> Installing tflite-runtime + numpy (optional - powers the Cloud Image"
+echo "    Model gate; everything else works fine without it)..."
+# Deliberately separate from the requirements.txt install above and
+# deliberately best-effort: not every Pi OS/Python combination has a
+# prebuilt wheel for tflite-runtime, and that must never take down the
+# whole install over one optional gate. A failure here just means that
+# gate stays off (fails open) until you install this by hand later.
+if pip3 install --break-system-packages tflite-runtime numpy >/tmp/pip_tflite.log 2>&1; then
+    :  # installed fine
+elif grep -q "break-system-packages" /tmp/pip_tflite.log \
+     && pip3 install tflite-runtime numpy >/tmp/pip_tflite.log 2>&1; then
+    :  # installed fine on the older-pip fallback
+else
+    echo "    (skipped - no compatible wheel found for this Pi; the Cloud Image"
+    echo "    Model gate will show as unavailable until you install this some"
+    echo "    other way. Everything else is unaffected.)"
+fi
+rm -f /tmp/pip_tflite.log
+
 # ---------------------------------------------------------------------
 # 4. systemd service
 # ---------------------------------------------------------------------

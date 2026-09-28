@@ -73,6 +73,22 @@ from adafruit_extended_bus import ExtendedI2C
 from PIL import Image, ImageDraw, ImageFont
 import adafruit_ssd1306
 
+# Optional - only needed for the cloud-trained image model gate (Phase 5,
+# see the "CLOUD-TRAINED IMAGE MODEL" section below). tflite-runtime is a
+# much smaller install than full TensorFlow, which is exactly why training
+# itself happens on a separate machine (see cloud-training-server/) and
+# only the lightweight .tflite inference runs here. Genuinely optional:
+# without it, that gate simply fails open with a clear status, the same
+# way every other optional sensor/feature in this file does.
+try:
+    import numpy as np
+    from tflite_runtime.interpreter import Interpreter as _TFLiteInterpreter
+    TFLITE_AVAILABLE = True
+except ImportError:
+    np = None
+    _TFLiteInterpreter = None
+    TFLITE_AVAILABLE = False
+
 # ==========================================================================
 # CONFIG — pins, addresses, network
 # ==========================================================================
@@ -210,6 +226,17 @@ DEFAULT_SETTINGS = {
         # fail-open fallback behavior when this is on but no valid trained
         # model exists yet (or it has no fresh data to predict from).
         "ai_model_enabled": False,
+        # Sixth gate, off by default: a genuine image classifier trained by
+        # the separate cloud-training-server (see cloud-training-server/ in
+        # this repo) from the SAME labeled Classify page samples as the AI
+        # Model above, but on the raw pixels instead of numeric sensor
+        # readings. Server URL/API key live on the AI Learning settings
+        # form next to the model itself; this toggle lives here with
+        # ai_model_enabled above for the same reason - see
+        # recompute_overall_safe() for the fail-open behavior (no model
+        # downloaded yet, tflite-runtime not installed, or no fresh camera
+        # frame to predict from).
+        "cloud_model_enabled": False,
     },
     "location": {
         "latitude_deg": 0.0,
@@ -339,6 +366,15 @@ DEFAULT_SETTINGS = {
         # label counts as safe until you've watched this against reality
         # for a while and decide to widen it.
         "safe_labels": "Clear",
+        # Cloud-trained image model (Phase 5) - the separate training
+        # server's URL (e.g. "http://192.168.1.50:8787/", from that
+        # machine's install.ps1 summary) and its generated API key. Both
+        # empty by default since there's no sensible default server.
+        # safe_labels above is reused for this model too (same label
+        # taxonomy, since it's trained from the same classified images) -
+        # no separate list needed.
+        "cloud_server_url": "",
+        "cloud_api_key": "",
     },
     # User-editable display names for each sensor/actuator, shown on the
     # Hardware Pins form and everywhere that sensor's reading is tagged
@@ -502,6 +538,27 @@ AI_MODEL_FEATURES = [
 ]
 AI_MODEL_MIN_SAMPLES_PER_CLASS = 5  # below this, a class's mean/std would be near-meaningless
 AI_MODEL_MIN_STD = 0.5  # floor on a feature's std-dev so a near-zero-variance class never blows up the Gaussian
+
+# Cloud-trained image model (Phase 5) - a genuine image classifier, unlike
+# the from-scratch numeric model above, trained on the RAW PIXELS of your
+# labeled Classify page samples by a separate, standalone training server
+# (see cloud-training-server/ in this repo) that you run on your own
+# Windows/Linux machine, since fitting an image model is too heavy for this
+# Pi to do itself. This service only uploads a training job and polls for
+# it (_start_cloud_training/_cloud_training_worker below); the resulting
+# model.tflite runs entirely LOCALLY for every live prediction
+# (poll_cloud_model), so the live gate never depends on that other machine
+# being reachable or even turned on.
+CLOUD_MODEL_DIR = os.path.join(AI_TRAINING_DIR, "cloud_model")
+CLOUD_MODEL_TFLITE_PATH = os.path.join(CLOUD_MODEL_DIR, "model.tflite")
+CLOUD_MODEL_CLASSES_PATH = os.path.join(CLOUD_MODEL_DIR, "classes.json")
+CLOUD_MODEL_META_PATH = os.path.join(CLOUD_MODEL_DIR, "meta.json")
+CLOUD_JOB_STATE_PATH = os.path.join(AI_TRAINING_DIR, "cloud_job.json")
+CLOUD_MODEL_IMG_SIZE = (224, 224)      # must match cloud-training-server/train_server.py's IMG_SIZE
+CLOUD_MODEL_PREDICT_INTERVAL_SEC = 60  # how often the live gate re-classifies the current All Sky frame
+CLOUD_TRAIN_POLL_INTERVAL_SEC = 15     # how often the background upload/poll thread checks job status
+CLOUD_TRAIN_TIMEOUT_SEC = 30 * 60      # give up and mark the job failed after this long either way
+CLOUD_HTTP_TIMEOUT_SEC = 20            # separate from HTTP_TIMEOUT_SEC (fast sensor polls) - uploads/downloads are bigger
 
 _log_write_lock = threading.Lock()
 _log_status_seen = {}      # key -> last-logged display value, for change detection
@@ -1135,6 +1192,337 @@ def _predict_ai_sky_class(model, features):
     return best_cls, scores
 
 
+# ==========================================================================
+# CLOUD-TRAINED IMAGE MODEL (Phase 5) - an optional sixth SAFE/UNSAFE gate,
+# built on a genuine image classifier from the separate cloud-training-
+# server (see the module docstring above CLOUD_MODEL_DIR). Three concerns,
+# kept deliberately separate:
+#   1. Kicking off a training job (_start_cloud_training) - uploads the
+#      SAME zip _ai_training_export_zip() already builds for the manual
+#      Teachable Machine export, to <server>/train.
+#   2. Watching that job to completion in the background
+#      (_cloud_training_worker) - polls /train/status, then downloads and
+#      unpacks the finished model.tflite + classes.json once it's done.
+#      Runs in its own daemon thread so a slow/unreachable training server
+#      never blocks the Classify page or the safety loop.
+#   3. Using whatever model is already on disk to classify the CURRENT sky
+#      (_predict_cloud_image/poll_cloud_model) - entirely LOCAL, no network
+#      call to the training server at all, so this gate's live behavior
+#      never depends on that other machine being reachable. tflite-runtime
+#      itself is optional (see TFLITE_AVAILABLE at the top of this file) -
+#      without it, or without a downloaded model yet, this fails open
+#      exactly like the AI Model gate above.
+# ==========================================================================
+def _load_cloud_job_state():
+    """Best-effort load of the current/last training job's state. Returns
+    a fresh idle state on a missing file or any read/parse error."""
+    try:
+        if os.path.exists(CLOUD_JOB_STATE_PATH):
+            with open(CLOUD_JOB_STATE_PATH, "r") as f:
+                state = json.load(f)
+            if isinstance(state, dict) and state.get("status"):
+                return state
+    except Exception:
+        pass
+    return {"status": "idle", "job_id": None, "error": None,
+             "started_at": None, "finished_at": None, "sample_count": None}
+
+
+def _save_cloud_job_state(state):
+    """Atomic (tmp + os.replace) persist - same reasoning as
+    _save_ai_training_index(): the Classify page's status poll reads this
+    concurrently with the background worker thread updating it. Never
+    raises."""
+    try:
+        os.makedirs(AI_TRAINING_DIR, exist_ok=True)
+        tmp = CLOUD_JOB_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, CLOUD_JOB_STATE_PATH)
+    except Exception as e:
+        print(f"[cloud-model] Failed to save training job state: {e}")
+
+
+def _load_cloud_model_meta():
+    """Best-effort load of the downloaded cloud model's metadata (when it
+    was trained, on how many samples, which classes) - display-only,
+    separate from classes.json (which the predictor itself reads). Returns
+    None if no model has been downloaded yet or the file is unreadable."""
+    try:
+        if os.path.exists(CLOUD_MODEL_META_PATH):
+            with open(CLOUD_MODEL_META_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _cloud_job_status_line(job):
+    """Plain-language one-liner for a training job state dict (from
+    _load_cloud_job_state()), for the Classify page's status area - both
+    the initial page render and the JS poll that keeps it live use this
+    same phrasing, via /ai-classify-cloud-status."""
+    status = job.get("status")
+    if status == "uploading":
+        return "Uploading labeled images to the cloud training server…"
+    if status == "training":
+        return f"Training on the cloud server (job {job.get('job_id')})… this can take several minutes."
+    if status == "done":
+        return "Last training job finished successfully - model downloaded and ready."
+    if status == "failed":
+        return f"Last training job failed: {job.get('error') or 'unknown error'}"
+    return ""  # "idle" - never trained via the cloud server yet, nothing to report
+
+
+def _cloud_model_files_present():
+    """Whether a usable downloaded model exists on disk right now - both
+    the .tflite file and its classes.json."""
+    return os.path.isfile(CLOUD_MODEL_TFLITE_PATH) and os.path.isfile(CLOUD_MODEL_CLASSES_PATH)
+
+
+# Cache for the loaded tflite Interpreter, keyed off model.tflite's mtime so
+# a freshly downloaded model is picked up automatically without a restart,
+# without rebuilding the (not-free) Interpreter on every single prediction.
+_cloud_interpreter_cache = {"mtime": None, "interpreter": None, "input_index": None,
+                             "output_index": None, "classes": None}
+
+
+def _get_cloud_interpreter():
+    """Lazily loads (and caches) the tflite Interpreter for the downloaded
+    cloud model. Returns None if tflite-runtime isn't installed, no model
+    exists yet, or the model files are corrupt - callers treat all three
+    identically (fail open)."""
+    if not TFLITE_AVAILABLE or not _cloud_model_files_present():
+        return None
+    try:
+        mtime = os.path.getmtime(CLOUD_MODEL_TFLITE_PATH)
+        if _cloud_interpreter_cache["interpreter"] is not None and _cloud_interpreter_cache["mtime"] == mtime:
+            return _cloud_interpreter_cache
+        with open(CLOUD_MODEL_CLASSES_PATH, "r") as f:
+            classes = json.load(f)
+        interpreter = _TFLiteInterpreter(model_path=CLOUD_MODEL_TFLITE_PATH)
+        interpreter.allocate_tensors()
+        input_index = interpreter.get_input_details()[0]["index"]
+        output_index = interpreter.get_output_details()[0]["index"]
+        _cloud_interpreter_cache.update({"mtime": mtime, "interpreter": interpreter,
+                                          "input_index": input_index, "output_index": output_index,
+                                          "classes": classes})
+        return _cloud_interpreter_cache
+    except Exception as e:
+        print(f"[cloud-model] Failed to load model.tflite: {e}")
+        return None
+
+
+def _predict_cloud_image(image_bytes):
+    """Runs the downloaded cloud model against one raw image (JPEG bytes,
+    straight off the All Sky camera, before any overlay is drawn). Returns
+    (label, confidence) on success, or (None, reason) - reason is a short
+    human-readable string so the caller can show WHY there's no prediction
+    rather than just nothing. Never raises. Preprocessing (resize to
+    CLOUD_MODEL_IMG_SIZE, scale to [-1, 1]) matches
+    tf.keras.applications.mobilenet_v2.preprocess_input, exactly what
+    cloud-training-server/train_server.py trains with."""
+    if not TFLITE_AVAILABLE:
+        return None, "tflite-runtime not installed"
+    cached = _get_cloud_interpreter()
+    if cached is None:
+        return None, ("no trained model downloaded yet" if not _cloud_model_files_present()
+                       else "model file unreadable")
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize(CLOUD_MODEL_IMG_SIZE)
+        arr = (np.asarray(img, dtype=np.float32) / 127.5) - 1.0
+        arr = np.expand_dims(arr, axis=0)
+        interpreter = cached["interpreter"]
+        interpreter.set_tensor(cached["input_index"], arr)
+        interpreter.invoke()
+        output = interpreter.get_tensor(cached["output_index"])[0]
+        best_idx = int(np.argmax(output))
+        classes = cached["classes"]
+        if best_idx >= len(classes):
+            return None, "model output doesn't match its own classes.json"
+        return classes[best_idx], float(output[best_idx])
+    except Exception as e:
+        return None, str(e)
+
+
+def _fetch_current_allsky_bytes():
+    """Fetches the CURRENT raw All Sky frame - same source/logic as
+    _capture_ai_training_sample() above, factored out so the cloud model's
+    live prediction (which needs a fresh frame on its own timer, not just
+    whenever a training sample happens to be captured) doesn't duplicate
+    it. Returns None (never raises) if All Sky isn't enabled/configured, or
+    the fetch/read fails."""
+    try:
+        allsky_cfg = get_setting("allsky")
+        if not allsky_cfg["enabled"] or not allsky_cfg["image_location"]:
+            return None
+        loc = allsky_cfg["image_location"]
+        if allsky_is_url(loc):
+            r = requests.get(loc, timeout=HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            return r.content
+        if not os.path.isfile(loc):
+            return None
+        with open(loc, "rb") as f:
+            return f.read()
+    except Exception as e:
+        print(f"[cloud-model] Failed to fetch the current All Sky frame: {e}")
+        return None
+
+
+def poll_cloud_model():
+    """Runs the cloud model's live, LOCAL prediction against the current
+    All Sky frame - called on its own throttled timer from
+    sensor_poll_loop(), same pattern as poll_clouddetect(). Writes the
+    result straight into sensor_state so recompute_overall_safe() just
+    reads whatever's there, mirroring the simpleCloudDetect gate's split
+    between polling and fusion. cloud_model_status, most to least specific:
+    "tflite_missing" (tflite-runtime isn't installed), "untrained" (no
+    model downloaded yet), "no_image" (All Sky isn't enabled/configured or
+    the frame fetch failed), "error" (a model exists but couldn't be read
+    or run), "active" (a real prediction was made this cycle). There's
+    deliberately no connectivity tracking here the way polled sensors get -
+    "no model trained yet" isn't a fault, just the expected state until
+    you've trained one."""
+    if not TFLITE_AVAILABLE:
+        status, predicted, confidence = "tflite_missing", None, None
+    elif not _cloud_model_files_present():
+        status, predicted, confidence = "untrained", None, None
+    else:
+        image_bytes = _fetch_current_allsky_bytes()
+        if image_bytes is None:
+            status, predicted, confidence = "no_image", None, None
+        else:
+            label, result = _predict_cloud_image(image_bytes)
+            if label is None:
+                print(f"[cloud-model] Prediction failed: {result}")
+                status, predicted, confidence = "error", None, None
+            else:
+                status, predicted, confidence = "active", label, result
+
+    meta = _load_cloud_model_meta()
+    with sensor_lock:
+        sensor_state["cloud_model_status"] = status
+        sensor_state["cloud_model_predicted"] = predicted
+        sensor_state["cloud_model_confidence"] = confidence
+        sensor_state["cloud_model_sample_count"] = meta.get("sample_count") if meta else None
+        sensor_state["cloud_model_last_predict"] = time.time()
+
+
+def _start_cloud_training():
+    """Kicks off a training job on the configured cloud-training-server:
+    uploads the SAME zip _ai_training_export_zip() builds for the manual
+    Teachable Machine export (one folder per label), then hands off to a
+    background thread to poll it to completion. Returns (True, None) once
+    the job is successfully queued, or (False, error_message) for anything
+    that fails before that point - never raises. Refuses to start a second
+    job while one is already in flight, since the training server is a
+    single machine and this app only persists one job's state at a time."""
+    current = _load_cloud_job_state()
+    if current.get("status") in ("uploading", "training"):
+        return False, "A training job is already in progress."
+
+    ai_cfg = get_setting("ai_learning")
+    server_url = (ai_cfg.get("cloud_server_url") or "").strip()
+    api_key = (ai_cfg.get("cloud_api_key") or "").strip()
+    if not server_url:
+        return False, "No cloud training server URL configured - set one under Settings → AI Learning."
+    if not api_key:
+        return False, "No cloud training server API key configured - set one under Settings → AI Learning."
+
+    zip_buf, labeled_count = _ai_training_export_zip()
+    if labeled_count == 0:
+        return False, "No labeled samples yet - classify at least one image on this page first."
+
+    _save_cloud_job_state({"status": "uploading", "job_id": None, "error": None,
+                            "started_at": time.time(), "finished_at": None, "sample_count": labeled_count})
+
+    threading.Thread(target=_cloud_training_worker,
+                      args=(server_url, api_key, zip_buf.getvalue(), labeled_count),
+                      daemon=True).start()
+    return True, None
+
+
+def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count):
+    """Background thread body for one training job: uploads the zip, polls
+    /train/status until it's done (or fails, or times out), then downloads
+    and unpacks the finished model. Every step persists its outcome to
+    CLOUD_JOB_STATE_PATH so the Classify page's status poll sees the
+    latest known state. Never raises - any exception here is caught and
+    recorded as a failed job instead of silently killing this daemon
+    thread."""
+    started_at = time.time()
+    base = server_url.rstrip("/")
+    headers = {"X-API-Key": api_key}
+
+    def _fail(error, job_id=None):
+        _save_cloud_job_state({"status": "failed", "job_id": job_id, "error": error,
+                                "started_at": started_at, "finished_at": time.time(),
+                                "sample_count": sample_count})
+        _log_event("Settings", f"Cloud training server: {error}", severity="warn")
+        print(f"[cloud-model] {error}")
+
+    try:
+        r = requests.post(f"{base}/train", headers=headers,
+                           files={"file": ("training_data.zip", zip_bytes, "application/zip")},
+                           timeout=CLOUD_HTTP_TIMEOUT_SEC)
+        if r.status_code == 401:
+            return _fail("Server rejected the API key - check it under Settings → AI Learning.")
+        r.raise_for_status()
+        job_id = r.json().get("job_id")
+        if not job_id:
+            return _fail("Server accepted the upload but didn't return a job ID.")
+    except Exception as e:
+        return _fail(f"Upload failed: {e}")
+
+    _save_cloud_job_state({"status": "training", "job_id": job_id, "error": None,
+                            "started_at": started_at, "finished_at": None, "sample_count": sample_count})
+    _log_event("Settings", f"Cloud training server: job {job_id} queued ({sample_count} labeled samples)")
+
+    deadline = started_at + CLOUD_TRAIN_TIMEOUT_SEC
+    while time.time() < deadline:
+        time.sleep(CLOUD_TRAIN_POLL_INTERVAL_SEC)
+        try:
+            r = requests.get(f"{base}/train/status/{job_id}", headers=headers, timeout=CLOUD_HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            status = r.json()
+        except Exception as e:
+            print(f"[cloud-model] Status poll failed (will retry): {e}")
+            continue
+
+        if status.get("status") == "failed":
+            return _fail(status.get("error") or "Training failed on the server (no details given).", job_id)
+
+        if status.get("status") == "done":
+            try:
+                r = requests.get(f"{base}/train/model/{job_id}", headers=headers, timeout=CLOUD_HTTP_TIMEOUT_SEC)
+                r.raise_for_status()
+                os.makedirs(CLOUD_MODEL_DIR, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+                    zf.extract("model.tflite", CLOUD_MODEL_DIR)
+                    zf.extract("classes.json", CLOUD_MODEL_DIR)
+                classes = status.get("classes") or []
+                meta = {"trained_at": time.time(), "sample_count": sample_count,
+                        "job_id": job_id, "classes": classes}
+                tmp = CLOUD_MODEL_META_PATH + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(meta, f, indent=2)
+                os.replace(tmp, CLOUD_MODEL_META_PATH)
+            except Exception as e:
+                return _fail(f"Training finished but the model download failed: {e}", job_id)
+
+            _save_cloud_job_state({"status": "done", "job_id": job_id, "error": None,
+                                    "started_at": started_at, "finished_at": time.time(),
+                                    "sample_count": sample_count})
+            _log_event("Settings", f"Cloud training server: job {job_id} finished - trained model downloaded "
+                                    f"({sample_count} labeled samples, classes: {', '.join(classes)})")
+            return
+        # else: "queued" or "training" - keep waiting.
+
+    _fail(f"Timed out after {CLOUD_TRAIN_TIMEOUT_SEC // 60} minutes waiting for training to finish on the "
+          f"server.", job_id)
+
+
 def _log_heater_mode_change():
     """Logs an AUTO<->MANUAL heater mode switch - called from both
     /heater-override and /heater-override-ajax right after heater_mode is
@@ -1388,19 +1776,23 @@ sensor_state = {
     "safe_hold_active": False,       # True while raw is SAFE but we're still waiting out the hold timer
     "safe_hold_remaining_sec": 0,
     "gate_daynight": False, "gate_rain": False, "gate_mlx_cloud": False, "gate_ml_cloud": False,
-    "gate_ai_model": True,
+    "gate_ai_model": True, "gate_cloud_model": True,
     # "Effective pass" for each gate - same as gate_* above, except a
     # disabled check always counts as passing (green), matching the fusion
     # logic's own "disabled = bypassed, never blocks SAFE" behavior. This is
     # what the status dot next to each reading is colored from.
     "daynight_pass": True, "rain_pass": True, "mlx_cloud_pass": True, "ml_cloud_pass": True,
-    "ai_model_pass": True,
+    "ai_model_pass": True, "cloud_model_pass": True,
     # Phase 4 - AI Model gate status, independent of the ai_model_enabled
     # toggle: "untrained" (no valid model file yet), "no_data" (a valid
     # model exists but nothing fresh to predict from right now), or "active"
     # (a real prediction was made this cycle). ai_model_predicted/
     # ai_model_sample_count are None until status is "active".
     "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_sample_count": None,
+    # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
+    # for the full set of status values), independent of cloud_model_enabled.
+    "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
+    "cloud_model_sample_count": None, "cloud_model_last_predict": 0.0,
 
     # Tri-state MLX90614 sky reading for display - "Clear"/"Cloudy" only when
     # we actually have a fresh reading; "Unknown" (with a reason) otherwise.
@@ -1946,6 +2338,48 @@ def recompute_overall_safe():
                 pending_logs.append(("Safety", ai_msg,
                                       "info" if ai_state_key in ("active", "disabled") else "warn", "never"))
 
+        # Cloud-trained image model (Phase 5) - an optional sixth gate, same
+        # fail-open shape as the AI Model gate just above, except the
+        # prediction itself comes from poll_cloud_model() (a separate,
+        # throttled poller - see its docstring) rather than being computed
+        # inline here, since it involves a network fetch + tflite inference
+        # too heavy to do every recompute_overall_safe() cycle. This block
+        # just reads whatever poll_cloud_model() last wrote.
+        cloud_model_wanted = checks.get("cloud_model_enabled", False)
+        cloud_model_status = sensor_state["cloud_model_status"]
+        cloud_predicted = sensor_state["cloud_model_predicted"]
+        if cloud_model_wanted and cloud_model_status == "active":
+            safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
+            gate_cloud_model = cloud_predicted.strip().lower() in safe_labels
+        else:
+            gate_cloud_model = True  # fail open: toggle off, no model, no image, or a prediction error
+        sensor_state["gate_cloud_model"] = gate_cloud_model
+        cloud_model_pass = gate_cloud_model
+        sensor_state["cloud_model_pass"] = cloud_model_pass
+
+        # Same edge-triggered notification shape as the AI Model gate above.
+        cloud_state_key = cloud_model_status if cloud_model_wanted else "disabled"
+        prev_cloud_state = _log_status_change("log_cloud_model_state", cloud_state_key)
+        if prev_cloud_state is not None:
+            cloud_state_messages = {
+                "disabled": "Cloud Image Model gate turned off - back to the standard safety checks only",
+                "tflite_missing": "Cloud Image Model gate is enabled but tflite-runtime isn't installed on "
+                                   "this Pi - falling back to the standard safety checks (pip3 install "
+                                   "tflite-runtime)",
+                "untrained": "Cloud Image Model gate is enabled but no model has been downloaded yet - "
+                             "falling back to the standard safety checks (train one on the Classify page)",
+                "no_image": "Cloud Image Model gate is enabled but has no current All Sky frame to classify "
+                            "right now - falling back to the standard safety checks",
+                "error": "Cloud Image Model gate is enabled but the last prediction failed - falling back to "
+                         "the standard safety checks",
+                "active": f"Cloud Image Model gate now has a usable trained model and is contributing to the "
+                          f"SAFE/UNSAFE decision (currently predicting {cloud_predicted})",
+            }
+            cloud_msg = cloud_state_messages.get(cloud_state_key)
+            if cloud_msg:
+                pending_logs.append(("Safety", cloud_msg,
+                                      "info" if cloud_state_key in ("active", "disabled") else "warn", "never"))
+
         # Connectivity edges - ALL five polled sensors, regardless of
         # whether their safety CHECK is currently enabled (a loose wire
         # matters even on a sensor whose gate is toggled off right now).
@@ -1964,7 +2398,8 @@ def recompute_overall_safe():
             elif edge == "reconnected":
                 pending_logs.append(("Safety", f"{label} is responding again (reconnected)", "info", "never"))
 
-        auto_safe = daynight_pass and rain_pass and mlx_cloud_pass and ml_cloud_pass and ai_model_pass
+        auto_safe = (daynight_pass and rain_pass and mlx_cloud_pass and ml_cloud_pass
+                     and ai_model_pass and cloud_model_pass)
         sensor_state["raw_safe"] = auto_safe
 
         # Fail-safe immediately on any UNSAFE transition, but require the raw
@@ -2076,6 +2511,7 @@ def _log_startup_connectivity():
 def sensor_poll_loop():
     global _startup_connectivity_logged
     last_cloud_poll = 0.0
+    last_cloud_model_predict = 0.0
     last_log_cleanup = 0.0
     last_ai_capture = 0.0
     while True:
@@ -2090,6 +2526,10 @@ def sensor_poll_loop():
         if now - last_cloud_poll >= CLOUDDETECT_POLL_INTERVAL_SEC:
             poll_clouddetect()
             last_cloud_poll = now
+
+        if now - last_cloud_model_predict >= CLOUD_MODEL_PREDICT_INTERVAL_SEC:
+            poll_cloud_model()
+            last_cloud_model_predict = now
 
         recompute_overall_safe()
 
@@ -3264,6 +3704,8 @@ def livestatus():
             "ml_cloud": {"enabled": checks["ml_cloud_enabled"], "pass": s["gate_ml_cloud"]},
             "ai_model": {"enabled": checks.get("ai_model_enabled", False), "pass": s["gate_ai_model"],
                          "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted")},
+            "cloud_model": {"enabled": checks.get("cloud_model_enabled", False), "pass": s["gate_cloud_model"],
+                            "status": s.get("cloud_model_status"), "predicted": s.get("cloud_model_predicted")},
         },
         "solar_elevation_deg": s["solar_elevation_deg"],
         "daytime_now": s["daytime_now"],
@@ -3481,6 +3923,7 @@ def save_checks():
         # and are saved here instead.
         s["safety_checks"]["mlx_gate_enabled"] = "mlxGateEnable" in request.args
         s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
+        s["safety_checks"]["cloud_model_enabled"] = "cloudModelEnable" in request.args
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
         if "mlcloudignore" in request.args:
             s["safety_checks"]["ml_cloud_ignore_classes"] = request.args["mlcloudignore"].strip()
@@ -3636,6 +4079,10 @@ def save_ai_learning():
         # that checkbox.
         if "aiSafeLabels" in request.args:
             s["ai_learning"]["safe_labels"] = request.args["aiSafeLabels"].strip()
+        if "cloudServerUrl" in request.args:
+            s["ai_learning"]["cloud_server_url"] = request.args["cloudServerUrl"].strip()
+        if "cloudApiKey" in request.args:
+            s["ai_learning"]["cloud_api_key"] = request.args["cloudApiKey"].strip()
     update_settings(patch)
     _log_event("Settings", "AI Learning settings saved")
     return "", 302, {"Location": "/#ai-learning-settings"}
@@ -3955,6 +4402,41 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
             "AI Model gate is enabled but has no fresh sensor data to predict from right now — falling "
             "back to the standard safety checks.", "warn-text")
 
+    # Cloud-trained image model (Phase 5) - same shape as the AI Model row
+    # above, reading whatever poll_cloud_model() last wrote this cycle.
+    cloud_model_wanted = checks.get("cloud_model_enabled", False)
+    cloud_status = s.get("cloud_model_status")
+    cloud_predicted = s.get("cloud_model_predicted")
+    cloud_model_row = ""
+    if cloud_status == "active":
+        cloud_dot = _status_dot(
+            s.get("cloud_model_pass", True), cloud_model_wanted,
+            f"Cloud Image Model check: not currently used in the SAFE/UNSAFE decision (model currently "
+            f"predicts {cloud_predicted}).",
+            f"Cloud Image Model check: passing — model predicts {cloud_predicted}.",
+            f"Cloud Image Model check: FAILING — model predicts {cloud_predicted}.",
+            neutral_when_disabled=True,
+        )
+        cloud_using_note = ("actively contributing to the SAFE/UNSAFE decision" if cloud_model_wanted
+                             else "informational only, not used in the SAFE/UNSAFE decision")
+        cloud_confidence = s.get("cloud_model_confidence")
+        confidence_str = f" ({cloud_confidence * 100:.0f}%)" if cloud_confidence is not None else ""
+        cloud_model_row = _field_row(cloud_dot, "📷", f"""Cloud model prediction: <b>{cloud_predicted}</b>{confidence_str}
+  <span class="muted">(trained on {s.get('cloud_model_sample_count')} classified samples on the
+  <a href="/ai-classify">Classify page</a> - {cloud_using_note})</span>""")
+    elif cloud_model_wanted and cloud_status == "tflite_missing":
+        cloud_model_row = _field_row("", "⚠️",
+            "Cloud Image Model gate is enabled but tflite-runtime isn't installed on this Pi — falling "
+            "back to the standard safety checks.", "warn-text")
+    elif cloud_model_wanted and cloud_status == "untrained":
+        cloud_model_row = _field_row("", "⚠️",
+            "Cloud Image Model gate is enabled but no model has been downloaded yet — falling back to "
+            "the standard safety checks. <a href=\"/ai-classify\">Train one on the Classify page</a>.", "warn-text")
+    elif cloud_model_wanted and cloud_status in ("no_image", "error"):
+        cloud_model_row = _field_row("", "⚠️",
+            "Cloud Image Model gate is enabled but has no usable prediction right now — falling back to "
+            "the standard safety checks.", "warn-text")
+
     rain_row = _field_row(rain_dot, "☔", f"""Rain: <b>{'WET' if s['rain_detected'] else 'DRY'}</b> <span class="tag">{sensor_names['rain']}</span>{' <span class="muted">(disabled)</span>' if not checks['rain_enabled'] else ''}""")
     rain_prev = _prev_status_text(s["rain_prev_state"], s["rain_prev_since"], tz_name,
                                    {True: "WET", False: "DRY"})
@@ -3969,7 +4451,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if mlcloud_prev:
         ml_row += _field_row("", "", mlcloud_prev, "prev-status")
 
-    return sky_row + ai_model_row + rain_row + ml_row + outside_row + box_row
+    return sky_row + ai_model_row + cloud_model_row + rain_row + ml_row + outside_row + box_row
 
 
 def render_heater_info_html(h, heater_enabled=True, mosfet_name="Heater MOSFET"):
@@ -4018,6 +4500,28 @@ def _ai_model_banner_html(s, checks):
     return ""
 
 
+def _cloud_model_banner_html(s, checks):
+    """Same purpose as _ai_model_banner_html() above, for the cloud-trained
+    image model gate: not trained yet, tflite-runtime missing, or no usable
+    prediction right now, all fail open and all get their own visible
+    banner rather than a silent fallback."""
+    if not checks.get("cloud_model_enabled"):
+        return ""
+    status = s.get("cloud_model_status")
+    if status == "tflite_missing":
+        return ("<div class='banner banner-warn'>📷 <b>Cloud Image Model gate is enabled but "
+                "tflite-runtime isn't installed on this Pi</b> &mdash; falling back to the standard "
+                "safety checks.</div>")
+    if status == "untrained":
+        return ("<div class='banner banner-warn'>📷 <b>Cloud Image Model gate is enabled but not "
+                "trained yet</b> &mdash; falling back to the standard safety checks. "
+                "<a href='/ai-classify'>Train a model on the Classify page</a>.</div>")
+    if status in ("no_image", "error"):
+        return ("<div class='banner banner-warn'>📷 <b>Cloud Image Model gate has no usable prediction "
+                "right now</b> &mdash; falling back to the standard safety checks.</div>")
+    return ""
+
+
 @app.route("/fragments", methods=["GET"])
 def web_fragments():
     """Small pre-rendered HTML snippets + a few raw values, polled by the
@@ -4049,6 +4553,7 @@ def web_fragments():
         warning_html = (f"<div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> "
                          f"{', '.join(disabled)} disabled &mdash; see <a href='/config'>Settings</a></div>")
     warning_html += _ai_model_banner_html(s, checks)
+    warning_html += _cloud_model_banner_html(s, checks)
 
     override_label = {"AUTO": "Auto (sensor-based)", "FORCE_SAFE": "Forced SAFE — sensors ignored",
                        "FORCE_UNSAFE": "Forced UNSAFE — sensors ignored"}[override_mode]
@@ -4121,6 +4626,8 @@ def web_index():
     ai_unlabeled_retention_days = ai_learning.get("unlabeled_retention_days", 0)
     ai_label_classes = ai_learning.get("label_classes", "")
     ai_safe_labels = ai_learning.get("safe_labels", "Clear")
+    cloud_server_url = ai_learning.get("cloud_server_url", "")
+    cloud_api_key = ai_learning.get("cloud_api_key", "")
     # Cheap-enough stat for the Settings page: how many samples are sitting
     # there right now, and how many still need a human to look at them -
     # they're reviewed and classified on the /ai-classify page.
@@ -4155,6 +4662,27 @@ def web_index():
                                  "only and never affects the SAFE/UNSAFE decision. Enable it under "
                                  "<a href=\"#safety-checks\">Settings → Safety Checks</a>.")
 
+    # Phase 5 - same plain-language status line as ai_model_status_hint
+    # above, but for the cloud-trained image model gate.
+    if checks.get("cloud_model_enabled"):
+        _cloud_status_hints = {
+            "tflite_missing": "Enabled, but tflite-runtime isn't installed on this Pi — falling back to the "
+                               "standard safety checks. Run <code>pip3 install tflite-runtime</code>.",
+            "untrained": "Enabled, but no model has been downloaded yet — falling back to the standard "
+                         "safety checks. Train one on the <a href=\"/ai-classify\">Classify page</a> first.",
+            "no_image": "Enabled, but there's no current All Sky frame to classify right now — falling "
+                        "back to the standard safety checks.",
+            "error": "Enabled, but the last prediction failed — falling back to the standard safety checks. "
+                     "Check the service log for details.",
+            "active": f"Active — currently predicting <b>{s['cloud_model_predicted']}</b>, trained on "
+                      f"{s.get('cloud_model_sample_count')} classified samples.",
+        }
+        cloud_model_status_hint = _cloud_status_hints.get(s.get("cloud_model_status"), "")
+    else:
+        cloud_model_status_hint = ("Off — a downloaded model (if any) still shows on the Classify page for "
+                                    "comparison only and never affects the SAFE/UNSAFE decision. Enable it "
+                                    "under <a href=\"#safety-checks\">Settings → Safety Checks</a>.")
+
     # Link to simpleCloudDetect's own web UI - built from whatever host/IP the
     # browser used to reach THIS page (so it works from any device on the LAN,
     # not just the Pi itself), just swapped to simpleCloudDetect's port. Its
@@ -4186,6 +4714,7 @@ def web_index():
         warning_html = (f"<div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> "
                          f"{', '.join(disabled)} disabled &mdash; see <a href='/config'>Settings</a></div>")
     warning_html += _ai_model_banner_html(s, checks)
+    warning_html += _cloud_model_banner_html(s, checks)
 
     override_label = {"AUTO": "Auto (sensor-based)", "FORCE_SAFE": "Forced SAFE — sensors ignored",
                        "FORCE_UNSAFE": "Forced UNSAFE — sensors ignored"}[override_mode]
@@ -4554,6 +5083,12 @@ a{{color:var(--accent-safety);}}
       the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
       predict from. Train the model and set which predicted labels count as SAFE on the
       <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
+      <label><input type="checkbox" name="cloudModelEnable" {"checked" if checks.get('cloud_model_enabled') else ""}> Cloud Image Model check</label>
+      <p class="hint">Include the cloud-trained image model's prediction in the SAFE/UNSAFE decision. Falls
+      back to the other enabled checks above whenever no model has been downloaded yet, tflite-runtime isn't
+      installed on this Pi, or there's no current All Sky frame to classify. Train it via the cloud training
+      server and set which predicted labels count as SAFE on the <a href="#ai-learning-settings">AI
+      Learning</a> settings below (shares the same SAFE-labels list as the AI Model check above).</p>
       <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
@@ -4810,6 +5345,16 @@ a{{color:var(--accent-safety);}}
       <label>Predicted labels that count as SAFE (comma-separated, case-insensitive)</label>
       <input type="text" name="aiSafeLabels" value="{ai_safe_labels}" placeholder="e.g. Clear">
       <p class="hint">{ai_model_status_hint}</p>
+      <hr>
+      <p class="hint">Cloud-trained image model — a separate, standalone server (see
+      <code>cloud-training-server/</code> in this repo) that trains a real image classifier from these same
+      labeled samples. Kick off training and see its status on the <a href="/ai-classify">Classify page</a>
+      once these are set. The SAFE-labels list above is shared with this model too.</p>
+      <label>Cloud training server URL</label>
+      <input type="text" name="cloudServerUrl" value="{cloud_server_url}" placeholder="http://192.168.1.50:8787/">
+      <label>Cloud training server API key</label>
+      <input type="text" name="cloudApiKey" value="{cloud_api_key}" placeholder="(from that machine's install.ps1 summary)">
+      <p class="hint">{cloud_model_status_hint}</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
     <p class="hint">Samples collected so far: <b id="aiSampleCount">{ai_sample_count}</b>
@@ -5317,6 +5862,28 @@ def ai_classify_export():
                       download_name=f"ai_training_export_{stamp}.zip")
 
 
+@app.route("/ai-classify-cloud-train", methods=["GET"])
+def ai_classify_cloud_train():
+    """Kicks off a cloud training job - the Classify page's "Train via
+    cloud server" button. JSON, not a redirect: the page calls this via
+    fetch() and immediately starts polling /ai-classify-cloud-status
+    rather than waiting for the whole job (which can take several
+    minutes) to finish before responding."""
+    ok, error = _start_cloud_training()
+    if not ok:
+        return jsonify({"ok": False, "error": error})
+    return jsonify({"ok": True})
+
+
+@app.route("/ai-classify-cloud-status", methods=["GET"])
+def ai_classify_cloud_status():
+    """Plain read of the current/last training job's state, for the
+    Classify page's status poll - never touches the network itself, the
+    background thread started by _start_cloud_training() already did
+    that."""
+    return jsonify({"ok": True, **_load_cloud_job_state()})
+
+
 def _delete_ai_training_samples(ids):
     """Removes the given sample ids from the index and deletes their image
     files from disk - used by both "Delete selected" (any mix of labeled
@@ -5647,6 +6214,46 @@ def ai_classify_page():
     else:
         model_status_html = "No model has been trained yet."
 
+    # Cloud-trained image model (Phase 5) - status card mirroring the local
+    # model's above, but sourced from the downloaded model's meta.json plus
+    # the current/last training job's state rather than a file this page
+    # trains synchronously.
+    ai_learning_cfg = get_setting("ai_learning")
+    cloud_server_configured = bool((ai_learning_cfg.get("cloud_server_url") or "").strip()
+                                    and (ai_learning_cfg.get("cloud_api_key") or "").strip())
+    cloud_model_wanted = checks.get("cloud_model_enabled", False)
+    cloud_meta = _load_cloud_model_meta()
+    cloud_job = _load_cloud_job_state()
+    cloud_usage_note = (
+        "Its live prediction is <b>actively used in the SAFE/UNSAFE decision</b> "
+        "(see <a href='/#ai-learning-settings'>Settings</a> to change the SAFE labels or turn this off)."
+        if cloud_model_wanted else
+        "Its live prediction shows on the <a href='/'>dashboard</a>'s Safety Monitor card for comparison "
+        "only — it does not yet affect the SAFE/UNSAFE decision "
+        "(<a href='/#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
+    )
+    if cloud_meta:
+        try:
+            cloud_trained_tz_str = _format_ampm(datetime.fromtimestamp(cloud_meta["trained_at"], tz).strftime(
+                "%Y-%m-%d %I:%M:%S %p"))
+        except Exception:
+            cloud_trained_tz_str = "unknown time"
+        cloud_classes_str = ", ".join(cloud_meta.get("classes") or [])
+        cloud_model_status_html = (f"Model trained <b>{cloud_trained_tz_str}</b> on "
+                                    f"<b>{cloud_meta.get('sample_count')}</b> classified samples "
+                                    f"(classes: {cloud_classes_str}). {cloud_usage_note}")
+    elif cloud_model_wanted:
+        cloud_model_status_html = ("<b>⚠️ No model has been downloaded yet</b>, but the Cloud Image Model "
+                                    "gate is turned on under Settings — it's currently falling back to the "
+                                    "standard safety checks until you train one here.")
+    else:
+        cloud_model_status_html = "No model has been trained via the cloud server yet."
+    if not cloud_server_configured:
+        cloud_train_button_html = ('<span class="btn ai-nav-btn-disabled" title="Set a server URL and API key '
+                                    'under Settings first">Train via cloud server</span>')
+    else:
+        cloud_train_button_html = '<button type="button" class="btn" onclick="trainCloudModel()">Train via cloud server</button>'
+
     html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -5703,6 +6310,16 @@ a{{color:var(--accent);}}
   <button type="button" class="btn" onclick="trainModel()">Train model now</button>
   {reset_model_html}
   <p id="trainStatus"></p>
+</div>
+
+<div class="card">
+  <p class="hint" id="cloudModelStatus">{cloud_model_status_html}</p>
+  {"" if cloud_server_configured else
+   '<p class="hint">Set a cloud training server URL and API key under '
+   '<a href="/#ai-learning-settings">Settings → AI Learning</a> first '
+   '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
+  {cloud_train_button_html}
+  <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
 </div>
 
 <div class="card">
@@ -5940,6 +6557,48 @@ function resetModel() {{
     }})
     .catch(err => {{ status.textContent = 'Failed to reset: ' + err; }});
 }}
+function trainCloudModel() {{
+  const status = document.getElementById('cloudTrainStatus');
+  status.textContent = 'Starting...';
+  fetch('/ai-classify-cloud-train')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to start: unknown error';
+        return;
+      }}
+      status.textContent = 'Uploading labeled images to the cloud training server\\u2026';
+      startCloudStatusPolling();
+    }})
+    .catch(err => {{ status.textContent = 'Failed to start: ' + err; }});
+}}
+var cloudStatusPollTimer = null;
+function startCloudStatusPolling() {{
+  if (cloudStatusPollTimer) return;
+  cloudStatusPollTimer = setInterval(pollCloudStatus, 5000);
+}}
+function pollCloudStatus() {{
+  fetch('/ai-classify-cloud-status')
+    .then(r => r.json())
+    .then(data => {{
+      const status = document.getElementById('cloudTrainStatus');
+      if (data.status === 'uploading') {{
+        status.textContent = 'Uploading labeled images to the cloud training server\\u2026';
+      }} else if (data.status === 'training') {{
+        status.textContent = 'Training on the cloud server (job ' + data.job_id + ')\\u2026 this can take several minutes.';
+      }} else if (data.status === 'done') {{
+        status.textContent = 'Training finished - model downloaded and ready. Reload this page to see the updated details.';
+        clearInterval(cloudStatusPollTimer);
+        cloudStatusPollTimer = null;
+      }} else if (data.status === 'failed') {{
+        status.textContent = 'Training failed: ' + (data.error || 'unknown error');
+        clearInterval(cloudStatusPollTimer);
+        cloudStatusPollTimer = null;
+      }}
+    }})
+    .catch(() => {{}});
+}}
+{"startCloudStatusPolling();" if cloud_job.get("status") in ("uploading", "training") else ""}
 </script>
 </body></html>"""
     return html
