@@ -1540,10 +1540,27 @@ def _predict_cloud_image(image_bytes):
     straight off the All Sky camera, before any overlay is drawn). Returns
     (label, confidence) on success, or (None, reason) - reason is a short
     human-readable string so the caller can show WHY there's no prediction
-    rather than just nothing. Never raises. Preprocessing (resize to
-    CLOUD_MODEL_IMG_SIZE, scale to [-1, 1]) matches
-    tf.keras.applications.mobilenet_v2.preprocess_input, exactly what
-    cloud-training-server/train_server.py trains with."""
+    rather than just nothing. Never raises.
+
+    Feeds RAW pixel values (0-255, resized to CLOUD_MODEL_IMG_SIZE) -
+    deliberately UNNORMALIZED. This looks wrong at a glance (most tflite
+    deployment examples DO normalize by hand before inference) but here
+    it would be a bug: cloud-training-server/train_server.py's model
+    embeds tf.keras.applications.mobilenet_v2.preprocess_input AS THE
+    MODEL'S OWN FIRST LAYER (see _train_job's "x =
+    mobilenet_v2.preprocess_input(inputs)" before the backbone), and
+    Keras's image_dataset_from_directory - what actually feeds training -
+    never rescales images itself. So the .tflite export already expects
+    raw 0-255 input and normalizes internally; pre-normalizing here on
+    top of that would double-apply the same /127.5-1.0 formula, which
+    collapses EVERY possible image into a ~0.016-wide sliver of the
+    model's input range (measured: correct feeding spans the full 2.0
+    range; double-normalized input compresses that to ~0.0157, a 128x
+    reduction) - in effect making every real photo look nearly identical
+    to the model regardless of its content. This was a live, confirmed
+    bug (predictions matching neither the actual sky nor the separate,
+    correctly-normalized local AI Model) - see run_test_cloudpredict_
+    normalization.py for the empirical before/after proof."""
     if not TFLITE_AVAILABLE:
         return None, "no tflite runtime installed"
     cached = _get_cloud_interpreter()
@@ -1552,7 +1569,7 @@ def _predict_cloud_image(image_bytes):
                        else "model file unreadable")
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize(CLOUD_MODEL_IMG_SIZE)
-        arr = (np.asarray(img, dtype=np.float32) / 127.5) - 1.0
+        arr = np.asarray(img, dtype=np.float32)  # raw 0-255 - see docstring above
         arr = np.expand_dims(arr, axis=0)
         interpreter = cached["interpreter"]
         interpreter.set_tensor(cached["input_index"], arr)
