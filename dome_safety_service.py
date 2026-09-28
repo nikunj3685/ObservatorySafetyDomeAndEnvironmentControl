@@ -52,6 +52,7 @@ import io
 import json
 import math
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -375,6 +376,16 @@ DEFAULT_SETTINGS = {
         # no separate list needed.
         "cloud_server_url": "",
         "cloud_api_key": "",
+        # Auto-train (Phase 6) - periodically starts a cloud training job
+        # (and refits the local numeric AI Model above) on its own, once
+        # enough newly labeled samples have piled up since the last run.
+        # Purely a convenience on top of the manual "Train via cloud
+        # server"/"Train model now" buttons - off by default since it
+        # means unattended network uploads to whatever cloud_server_url
+        # is configured. See maybe_auto_train().
+        "auto_train_enabled": False,
+        "auto_train_min_new_samples": 20,
+        "auto_train_min_interval_hours": 24,
     },
     # User-editable display names for each sensor/actuator, shown on the
     # Hardware Pins form and everywhere that sensor's reading is tagged
@@ -559,6 +570,15 @@ CLOUD_MODEL_PREDICT_INTERVAL_SEC = 60  # how often the live gate re-classifies t
 CLOUD_TRAIN_POLL_INTERVAL_SEC = 15     # how often the background upload/poll thread checks job status
 CLOUD_TRAIN_TIMEOUT_SEC = 30 * 60      # give up and mark the job failed after this long either way
 CLOUD_HTTP_TIMEOUT_SEC = 20            # separate from HTTP_TIMEOUT_SEC (fast sensor polls) - uploads/downloads are bigger
+
+# Auto-train (Phase 6) - tracks only WHEN the last automatic attempt
+# happened, separate from CLOUD_JOB_STATE_PATH (which is overwritten
+# wholesale on every job event and would lose this otherwise). Whether
+# there are enough NEW samples to justify the next attempt is computed
+# fresh each check from index.json's own "cloud_trained_at" markers
+# (see _absorb_cloud_training_success()), not stored here.
+AI_AUTOTRAIN_STATE_PATH = os.path.join(AI_TRAINING_DIR, "autotrain_state.json")
+AUTO_TRAIN_CHECK_INTERVAL_SEC = 300     # how often sensor_poll_loop() re-checks whether it's time to auto-train
 
 _log_write_lock = threading.Lock()
 _log_status_seen = {}      # key -> last-logged display value, for change detection
@@ -1212,6 +1232,15 @@ def _predict_ai_sky_class(model, features):
 #      itself is optional (see TFLITE_AVAILABLE at the top of this file) -
 #      without it, or without a downloaded model yet, this fails open
 #      exactly like the AI Model gate above.
+#   4. Auto-train (maybe_auto_train, called on its own timer from
+#      sensor_poll_loop) - starts a job automatically once enough newly
+#      labeled samples have piled up, same entry point as the manual
+#      "Train via cloud server" button, and separately refits the local
+#      numeric AI Model (_train_ai_sky_model) on the same trigger.
+#   5. Resetting (_reset_cloud_model) - clears the downloaded model,
+#      forgets any in-flight/last job, and tells the training server to
+#      drop its own persisted warm-start base (DELETE /model), so the
+#      NEXT training run on either side starts completely fresh.
 # ==========================================================================
 def _load_cloud_job_state():
     """Best-effort load of the current/last training job's state. Returns
@@ -1225,7 +1254,8 @@ def _load_cloud_job_state():
     except Exception:
         pass
     return {"status": "idle", "job_id": None, "error": None,
-             "started_at": None, "finished_at": None, "sample_count": None}
+             "started_at": None, "finished_at": None, "sample_count": None,
+             "sample_ids": [], "triggered_by": None}
 
 
 def _save_cloud_job_state(state):
@@ -1241,6 +1271,69 @@ def _save_cloud_job_state(state):
         os.replace(tmp, CLOUD_JOB_STATE_PATH)
     except Exception as e:
         print(f"[cloud-model] Failed to save training job state: {e}")
+
+
+def _load_autotrain_state():
+    """Best-effort load of the auto-train cursor (just WHEN the last
+    automatic attempt happened) - returns a fresh "never attempted" state
+    on a missing file or any read/parse error, same fallback philosophy as
+    every other small state file in this module."""
+    try:
+        if os.path.exists(AI_AUTOTRAIN_STATE_PATH):
+            with open(AI_AUTOTRAIN_STATE_PATH, "r") as f:
+                state = json.load(f)
+            if isinstance(state, dict):
+                return state
+    except Exception:
+        pass
+    return {"last_attempt_ts": 0}
+
+
+def _save_autotrain_state(state):
+    """Atomic (tmp + os.replace) persist - same reasoning as every other
+    small state file here. Never raises."""
+    try:
+        os.makedirs(AI_TRAINING_DIR, exist_ok=True)
+        tmp = AI_AUTOTRAIN_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, AI_AUTOTRAIN_STATE_PATH)
+    except Exception as e:
+        print(f"[ai-learning] Failed to save auto-train state: {e}")
+
+
+def _absorb_cloud_training_success(sample_ids):
+    """Called once a cloud training job that uploaded `sample_ids` finishes
+    successfully: marks each of those samples as already absorbed
+    (sample["cloud_trained_at"] = now) and deletes ONLY its heavy JPEG
+    file - the index record itself (label + sensor snapshot) is kept
+    forever, so the local numeric AI Model never loses history even as
+    images get purged, and so a sample already counted here is never
+    re-uploaded by a later incremental training run. Missing files/ids
+    (index and disk can always drift apart) are skipped, never fatal -
+    matches _delete_ai_training_samples()'s own best-effort philosophy."""
+    if not sample_ids:
+        return
+    id_set = set(sample_ids)
+    idx = _load_ai_training_index()
+    now = time.time()
+    changed = False
+    for sample in idx["samples"]:
+        if sample["id"] not in id_set or sample.get("cloud_trained_at"):
+            continue
+        changed = True
+        sample["cloud_trained_at"] = now
+        image_name = sample.get("image")
+        if image_name:
+            try:
+                img_path = os.path.join(AI_TRAINING_IMAGES_DIR, image_name)
+                if os.path.isfile(img_path):
+                    os.remove(img_path)
+            except Exception as e:
+                print(f"[ai-learning] absorb: failed to remove image {image_name}: {e}")
+            sample["image"] = None  # already gone (or never existed) - stop pointing at it
+    if changed:
+        _save_ai_training_index(idx)
 
 
 def _load_cloud_model_meta():
@@ -1409,15 +1502,21 @@ def poll_cloud_model():
         sensor_state["cloud_model_last_predict"] = time.time()
 
 
-def _start_cloud_training():
+def _start_cloud_training(triggered_by="manual"):
     """Kicks off a training job on the configured cloud-training-server:
-    uploads the SAME zip _ai_training_export_zip() builds for the manual
-    Teachable Machine export (one folder per label), then hands off to a
-    background thread to poll it to completion. Returns (True, None) once
-    the job is successfully queued, or (False, error_message) for anything
-    that fails before that point - never raises. Refuses to start a second
-    job while one is already in flight, since the training server is a
-    single machine and this app only persists one job's state at a time."""
+    uploads a zip of every labeled sample NOT already absorbed into a
+    previous successful cloud training run (see _ai_training_export_zip's
+    only_untrained - the server's own incremental training then warm-
+    starts from what it already learned, so this Pi-side upload never has
+    to include - or even still have on disk - images from an earlier run),
+    then hands off to a background thread to poll it to completion.
+    Returns (True, None) once the job is successfully queued, or (False,
+    error_message) for anything that fails before that point - never
+    raises. Refuses to start a second job while one is already in flight,
+    since the training server is a single machine and this app only
+    persists one job's state at a time. `triggered_by` ("manual" or
+    "auto") is recorded purely for the status line/log message - it
+    changes nothing about how the job itself runs."""
     current = _load_cloud_job_state()
     if current.get("status") in ("uploading", "training"):
         return False, "A training job is already in progress."
@@ -1430,20 +1529,22 @@ def _start_cloud_training():
     if not api_key:
         return False, "No cloud training server API key configured - set one under Settings → AI Learning."
 
-    zip_buf, labeled_count = _ai_training_export_zip()
+    zip_buf, labeled_count, sample_ids = _ai_training_export_zip(only_untrained=True)
     if labeled_count == 0:
-        return False, "No labeled samples yet - classify at least one image on this page first."
+        return False, ("No newly labeled samples to train on - either classify more on the Classify page, "
+                        "or every classified sample has already been absorbed into a previous cloud training run.")
 
     _save_cloud_job_state({"status": "uploading", "job_id": None, "error": None,
-                            "started_at": time.time(), "finished_at": None, "sample_count": labeled_count})
+                            "started_at": time.time(), "finished_at": None, "sample_count": labeled_count,
+                            "sample_ids": sample_ids, "triggered_by": triggered_by})
 
     threading.Thread(target=_cloud_training_worker,
-                      args=(server_url, api_key, zip_buf.getvalue(), labeled_count),
+                      args=(server_url, api_key, zip_buf.getvalue(), labeled_count, sample_ids, triggered_by),
                       daemon=True).start()
     return True, None
 
 
-def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count):
+def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_ids, triggered_by="manual"):
     """Background thread body for one training job: uploads the zip, polls
     /train/status until it's done (or fails, or times out), then downloads
     and unpacks the finished model. Every step persists its outcome to
@@ -1458,7 +1559,8 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count):
     def _fail(error, job_id=None):
         _save_cloud_job_state({"status": "failed", "job_id": job_id, "error": error,
                                 "started_at": started_at, "finished_at": time.time(),
-                                "sample_count": sample_count})
+                                "sample_count": sample_count, "sample_ids": sample_ids,
+                                "triggered_by": triggered_by})
         _log_event("Settings", f"Cloud training server: {error}", severity="warn")
         print(f"[cloud-model] {error}")
 
@@ -1476,8 +1578,11 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count):
         return _fail(f"Upload failed: {e}")
 
     _save_cloud_job_state({"status": "training", "job_id": job_id, "error": None,
-                            "started_at": started_at, "finished_at": None, "sample_count": sample_count})
-    _log_event("Settings", f"Cloud training server: job {job_id} queued ({sample_count} labeled samples)")
+                            "started_at": started_at, "finished_at": None, "sample_count": sample_count,
+                            "sample_ids": sample_ids, "triggered_by": triggered_by})
+    trigger_note = "auto-train" if triggered_by == "auto" else "manual"
+    _log_event("Settings", f"Cloud training server: job {job_id} queued ({sample_count} labeled samples, "
+                            f"{trigger_note})")
 
     deadline = started_at + CLOUD_TRAIN_TIMEOUT_SEC
     while time.time() < deadline:
@@ -1511,9 +1616,18 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count):
             except Exception as e:
                 return _fail(f"Training finished but the model download failed: {e}", job_id)
 
+            # Only NOW that the model has actually been trained AND
+            # successfully downloaded - never on a failure or a timeout -
+            # mark these samples as absorbed and drop their heavy JPEG
+            # files. A sample that made the upload but whose job then
+            # failed stays untouched, so the next attempt (manual or
+            # auto) naturally retries with it still included.
+            _absorb_cloud_training_success(sample_ids)
+
             _save_cloud_job_state({"status": "done", "job_id": job_id, "error": None,
                                     "started_at": started_at, "finished_at": time.time(),
-                                    "sample_count": sample_count})
+                                    "sample_count": sample_count, "sample_ids": sample_ids,
+                                    "triggered_by": triggered_by})
             _log_event("Settings", f"Cloud training server: job {job_id} finished - trained model downloaded "
                                     f"({sample_count} labeled samples, classes: {', '.join(classes)})")
             return
@@ -1521,6 +1635,123 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count):
 
     _fail(f"Timed out after {CLOUD_TRAIN_TIMEOUT_SEC // 60} minutes waiting for training to finish on the "
           f"server.", job_id)
+
+
+def maybe_auto_train():
+    """Periodic check - called on its own timer from sensor_poll_loop(),
+    same pattern as poll_cloud_model()/poll_clouddetect() - that starts a
+    cloud training job automatically once enough newly labeled samples
+    have piled up since the last attempt, AND separately refits the local
+    numeric AI Model on the same trigger (both models get a fresh look at
+    whatever's new, cloud image model and local sensor model alike - the
+    Pi-side half of what was asked for alongside incremental training).
+
+    Fails open/silent on anything not ready: auto-train turned off, no
+    server URL/API key configured, a training job (manual or auto)
+    already in flight, too soon since the last attempt, or not enough new
+    samples yet. This is purely a convenience layered on top of the
+    manual "Train via cloud server" button - nothing here is required for
+    either model to keep working."""
+    ai_cfg = get_setting("ai_learning")
+    if not ai_cfg.get("auto_train_enabled"):
+        return
+    server_url = (ai_cfg.get("cloud_server_url") or "").strip()
+    api_key = (ai_cfg.get("cloud_api_key") or "").strip()
+    if not server_url or not api_key:
+        return
+
+    min_interval_sec = max(1, int(ai_cfg.get("auto_train_min_interval_hours", 24))) * 3600
+    state = _load_autotrain_state()
+    if time.time() - state.get("last_attempt_ts", 0) < min_interval_sec:
+        return
+
+    current = _load_cloud_job_state()
+    if current.get("status") in ("uploading", "training"):
+        return  # a job (manual or auto) is already running - don't pile another on top
+
+    idx = _load_ai_training_index()
+    new_count = sum(1 for s in idx["samples"] if s.get("label") and not s.get("cloud_trained_at"))
+    min_new = max(1, int(ai_cfg.get("auto_train_min_new_samples", 20)))
+    if new_count < min_new:
+        return
+
+    # Record the attempt BEFORE starting the job, not after - so a job
+    # that's still slowly training (or that crashes this thread somehow)
+    # can't make every subsequent poll cycle re-fire this same check
+    # every AUTO_TRAIN_CHECK_INTERVAL_SEC until it finishes.
+    state["last_attempt_ts"] = time.time()
+    _save_autotrain_state(state)
+
+    ok, error = _start_cloud_training(triggered_by="auto")
+    if ok:
+        _log_event("Settings", f"AI Learning: auto-train started a cloud training job "
+                                f"({new_count} new labeled sample(s) since the last run)")
+    else:
+        print(f"[ai-learning] auto-train: could not start a cloud training job - {error}")
+
+    # Independent of the cloud image model above - entirely local,
+    # instant, no network/upload involved - but refit on the same "enough
+    # new data" trigger since both models learn from the same growing set
+    # of classified samples. A quiet no-op (returns an error string, never
+    # raises) if there still aren't 2+ labels with enough samples each.
+    _, train_error = _train_ai_sky_model()
+    if train_error:
+        print(f"[ai-learning] auto-train: local AI Model not retrained - {train_error}")
+    else:
+        _log_event("Settings", "AI Learning: auto-train also refit the local AI Model on the same trigger")
+
+
+def _reset_cloud_model():
+    """Clears everything about the DOWNLOADED cloud model on this Pi
+    (model.tflite/classes.json/meta.json) and forgets the last training
+    job's state, then best-effort tells the training server itself to
+    drop its persisted warm-start base (DELETE /model) so the NEXT
+    training run - on either side - starts completely fresh instead of
+    warm-starting from a model that's no longer wanted. Classified
+    samples are never touched. Mirrors _ai_reset_model()'s philosophy
+    (start the model over without losing curated training data), for
+    when the observatory has moved or the sky's baseline has otherwise
+    changed enough that the old model's learning is actively wrong.
+
+    The Pi-side reset always happens; the server-side call is best-effort
+    (network/auth problems there are reported back but don't block
+    clearing the local half) - a partial reset (Pi cleared, server call
+    failed) is still strictly safer than leaving a stale local model in
+    place, and simply retrying later (once the server's reachable) is all
+    that's needed to finish the job. Returns (ok, server_error) where
+    server_error is None on success or when no server is configured."""
+    existed = _cloud_model_files_present() or os.path.isdir(CLOUD_MODEL_DIR)
+    try:
+        if os.path.isdir(CLOUD_MODEL_DIR):
+            shutil.rmtree(CLOUD_MODEL_DIR)
+    except Exception as e:
+        return False, f"Failed to remove local model files: {e}"
+    _cloud_interpreter_cache.update({"mtime": None, "interpreter": None, "input_index": None,
+                                      "output_index": None, "classes": None})
+    _save_cloud_job_state({"status": "idle", "job_id": None, "error": None,
+                            "started_at": None, "finished_at": None, "sample_count": None,
+                            "sample_ids": [], "triggered_by": None})
+
+    ai_cfg = get_setting("ai_learning")
+    server_url = (ai_cfg.get("cloud_server_url") or "").strip()
+    api_key = (ai_cfg.get("cloud_api_key") or "").strip()
+    server_error = None
+    if server_url and api_key:
+        try:
+            r = requests.delete(f"{server_url.rstrip('/')}/model", headers={"X-API-Key": api_key},
+                                 timeout=CLOUD_HTTP_TIMEOUT_SEC)
+            if r.status_code == 401:
+                server_error = "Server rejected the API key - the LOCAL model was still reset."
+            else:
+                r.raise_for_status()
+        except Exception as e:
+            server_error = (f"Could not reach the cloud training server to reset its model too "
+                             f"(the LOCAL model was still reset): {e}")
+    _log_event("Settings", "AI Learning: cloud model reset" +
+               (" (classified samples were kept)" if existed else "") +
+               (f" - {server_error}" if server_error else ""),
+               severity="warn" if server_error else "info")
+    return True, server_error
 
 
 def _log_heater_mode_change():
@@ -2514,6 +2745,7 @@ def sensor_poll_loop():
     last_cloud_model_predict = 0.0
     last_log_cleanup = 0.0
     last_ai_capture = 0.0
+    last_autotrain_check = 0.0
     while True:
         poll_bme280()
         poll_mlx90614()
@@ -2548,6 +2780,10 @@ def sensor_poll_loop():
             if now - last_ai_capture >= capture_interval_sec:
                 _capture_ai_training_sample()
                 last_ai_capture = now
+
+        if now - last_autotrain_check >= AUTO_TRAIN_CHECK_INTERVAL_SEC:
+            maybe_auto_train()
+            last_autotrain_check = now
 
         time.sleep(SENSOR_POLL_INTERVAL_SEC)
 
@@ -4083,6 +4319,17 @@ def save_ai_learning():
             s["ai_learning"]["cloud_server_url"] = request.args["cloudServerUrl"].strip()
         if "cloudApiKey" in request.args:
             s["ai_learning"]["cloud_api_key"] = request.args["cloudApiKey"].strip()
+        s["ai_learning"]["auto_train_enabled"] = "autoTrainEnable" in request.args
+        if "autoTrainMinNewSamples" in request.args:
+            try:
+                s["ai_learning"]["auto_train_min_new_samples"] = max(1, int(request.args["autoTrainMinNewSamples"]))
+            except ValueError:
+                pass
+        if "autoTrainMinIntervalHours" in request.args:
+            try:
+                s["ai_learning"]["auto_train_min_interval_hours"] = max(1, int(request.args["autoTrainMinIntervalHours"]))
+            except ValueError:
+                pass
     update_settings(patch)
     _log_event("Settings", "AI Learning settings saved")
     return "", 302, {"Location": "/#ai-learning-settings"}
@@ -4628,12 +4875,17 @@ def web_index():
     ai_safe_labels = ai_learning.get("safe_labels", "Clear")
     cloud_server_url = ai_learning.get("cloud_server_url", "")
     cloud_api_key = ai_learning.get("cloud_api_key", "")
+    auto_train_enabled = ai_learning.get("auto_train_enabled", False)
+    auto_train_min_new_samples = ai_learning.get("auto_train_min_new_samples", 20)
+    auto_train_min_interval_hours = ai_learning.get("auto_train_min_interval_hours", 24)
     # Cheap-enough stat for the Settings page: how many samples are sitting
     # there right now, and how many still need a human to look at them -
     # they're reviewed and classified on the /ai-classify page.
     _ai_idx_for_stats = _load_ai_training_index()
     ai_sample_count = len(_ai_idx_for_stats["samples"])
     ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
+    ai_new_since_cloud_train = sum(1 for smp in _ai_idx_for_stats["samples"]
+                                    if smp.get("label") and not smp.get("cloud_trained_at"))
     dome_snap = dome.snapshot()
     with sensor_lock:
         s = dict(sensor_state)
@@ -5355,6 +5607,20 @@ a{{color:var(--accent-safety);}}
       <label>Cloud training server API key</label>
       <input type="text" name="cloudApiKey" value="{cloud_api_key}" placeholder="(from that machine's install.ps1 summary)">
       <p class="hint">{cloud_model_status_hint}</p>
+      <label><input type="checkbox" name="autoTrainEnable" {"checked" if auto_train_enabled else ""}>
+      Auto-train automatically (cloud image model + local AI Model together)</label>
+      <p class="hint">When on, this checks every few minutes and starts a new cloud training job (uploading
+      only the newly labeled samples since the last run - see the incremental training note in
+      <code>cloud-training-server/README.md</code>) once enough have piled up, and refits the local AI Model
+      at the same time. Off by default since it means unattended network uploads to the server URL above -
+      the manual "Train via cloud server"/"Train model now" buttons on the
+      <a href="/ai-classify">Classify page</a> always work regardless of this setting.</p>
+      <label>Minimum newly labeled samples before auto-training</label>
+      <input type="number" name="autoTrainMinNewSamples" min="1" value="{auto_train_min_new_samples}" class="narrow-number">
+      <label>Minimum hours between auto-train attempts</label>
+      <input type="number" name="autoTrainMinIntervalHours" min="1" value="{auto_train_min_interval_hours}" class="narrow-number">
+      <p class="hint">Currently <b>{ai_new_since_cloud_train}</b> labeled sample(s) not yet absorbed into a
+      successful cloud training run.</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
     <p class="hint">Samples collected so far: <b id="aiSampleCount">{ai_sample_count}</b>
@@ -5813,6 +6079,20 @@ def ai_reset_model():
     return jsonify({"ok": True, "existed": existed})
 
 
+@app.route("/ai-reset-cloud-model", methods=["GET"])
+def ai_reset_cloud_model():
+    """Deletes the downloaded cloud-trained image model and forgets the
+    last training job, then best-effort resets the training server's own
+    persisted warm-start base too (see _reset_cloud_model()'s docstring
+    for why the server call is best-effort and the Pi-side reset always
+    happens regardless). JSON, not a redirect, matching /ai-reset-model
+    and the Classify page's fetch()-based buttons generally."""
+    ok, server_error = _reset_cloud_model()
+    if not ok:
+        return jsonify({"ok": False, "error": server_error})
+    return jsonify({"ok": True, "server_error": server_error})
+
+
 def _safe_export_folder_name(label):
     """Label text is free-form (Settings -> AI Learning -> label list), so
     turn it into something safe to use as a zip folder name rather than
@@ -5822,26 +6102,45 @@ def _safe_export_folder_name(label):
     return cleaned or "Unlabeled"
 
 
-def _ai_training_export_zip():
-    """Builds an in-memory .zip of every labeled AI Learning sample, one
-    folder per label (Clear/, Cloudy/, ...) - the same folder-per-class
-    layout Teachable Machine's own image uploader expects, so the export
-    can be dragged straight into (or added onto) that project to retrain
+def _ai_training_export_zip(only_untrained=False):
+    """Builds an in-memory .zip of labeled AI Learning samples, one folder
+    per label (Clear/, Cloudy/, ...) - the same folder-per-class layout
+    Teachable Machine's own image uploader expects, so the export can be
+    dragged straight into (or added onto) that project to retrain
     simpleCloudDetect on more of your own sky, class by class. Unlabeled
-    samples are skipped - there's nothing usable in them yet. Returns
-    (zip_bytes_io, labeled_count)."""
+    samples are always skipped - there's nothing usable in them yet.
+
+    With only_untrained=True (used for the cloud-training-server upload,
+    NOT the manual Teachable Machine download below), also skips any
+    sample already absorbed into a previous successful cloud training run
+    (see _absorb_cloud_training_success()) - the whole point of
+    incremental training is that the Pi never has to re-upload those. A
+    sample whose image has already been deleted ("image": None, once
+    absorbed) is skipped either way, since there's nothing left to zip.
+
+    Returns (zip_bytes_io, sample_count, sample_ids) - sample_ids lists
+    exactly which samples actually made it into the zip (skipping any
+    with a missing/already-deleted image file), for the caller to record
+    against whichever job uploads it."""
     idx = _load_ai_training_index()
     labeled = [s for s in idx["samples"] if s.get("label")]
+    if only_untrained:
+        labeled = [s for s in labeled if not s.get("cloud_trained_at")]
     buf = io.BytesIO()
+    sample_ids = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for sample in labeled:
-            src = os.path.join(AI_TRAINING_IMAGES_DIR, sample.get("image", ""))
+            image_name = sample.get("image")
+            if not image_name:
+                continue  # already absorbed/deleted - nothing left to zip
+            src = os.path.join(AI_TRAINING_IMAGES_DIR, image_name)
             if not os.path.isfile(src):
                 continue  # index and disk can drift apart (e.g. manual cleanup) - skip, don't fail the whole export
             folder = _safe_export_folder_name(sample["label"])
             zf.write(src, arcname=f"{folder}/{sample['id']}.jpg")
+            sample_ids.append(sample["id"])
     buf.seek(0)
-    return buf, len(labeled)
+    return buf, len(sample_ids), sample_ids
 
 
 @app.route("/ai-classify-export", methods=["GET"])
@@ -5853,7 +6152,7 @@ def ai_classify_export():
     Machine project can be reopened and fed more images per class, then
     re-exported. This is a plain page navigation (not fetch), same as
     /logs/image/<name> above, since the point is a file download."""
-    buf, count = _ai_training_export_zip()
+    buf, count, _sample_ids = _ai_training_export_zip()
     if count == 0:
         return ("No labeled samples yet — classify at least one image on this page first.", 400)
     _log_event("Settings", f"AI Learning: exported {count} labeled sample(s) as a zip for retraining")
@@ -6221,6 +6520,7 @@ def ai_classify_page():
     ai_learning_cfg = get_setting("ai_learning")
     cloud_server_configured = bool((ai_learning_cfg.get("cloud_server_url") or "").strip()
                                     and (ai_learning_cfg.get("cloud_api_key") or "").strip())
+    auto_train_enabled = ai_learning_cfg.get("auto_train_enabled", False)
     cloud_model_wanted = checks.get("cloud_model_enabled", False)
     cloud_meta = _load_cloud_model_meta()
     cloud_job = _load_cloud_job_state()
@@ -6248,11 +6548,23 @@ def ai_classify_page():
                                     "standard safety checks until you train one here.")
     else:
         cloud_model_status_html = "No model has been trained via the cloud server yet."
+    cloud_new_count = sum(1 for s in all_samples if s.get("label") and not s.get("cloud_trained_at"))
     if not cloud_server_configured:
         cloud_train_button_html = ('<span class="btn ai-nav-btn-disabled" title="Set a server URL and API key '
                                     'under Settings first">Train via cloud server</span>')
+    elif cloud_new_count == 0:
+        cloud_train_button_html = ('<span class="btn ai-nav-btn-disabled" title="No newly labeled samples since '
+                                    'the last cloud training run">Train via cloud server</span>')
     else:
         cloud_train_button_html = '<button type="button" class="btn" onclick="trainCloudModel()">Train via cloud server</button>'
+    cloud_reset_button_html = (
+        f'<button type="button" class="btn ai-delete-btn" '
+        f'onclick="if(confirm(\'Reset the cloud-trained model? Classified samples are kept - you can '
+        f'train a new one from them any time. This also clears the training server own warm-start '
+        f'base, so its next run trains fully from scratch.\')) resetCloudModel()">Reset cloud model</button>'
+        if (cloud_meta or cloud_job.get("status") == "done") else
+        '<span class="btn ai-nav-btn-disabled">Reset cloud model</span>'
+    )
 
     html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6319,7 +6631,11 @@ a{{color:var(--accent);}}
    '<a href="/#ai-learning-settings">Settings → AI Learning</a> first '
    '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
   {cloud_train_button_html}
+  {cloud_reset_button_html}
   <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
+  <p class="hint">{cloud_new_count} labeled sample(s) not yet absorbed into a successful cloud training run.
+  {"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
+  <a href="/#ai-learning-settings">Settings → AI Learning</a> to change it.</p>
 </div>
 
 <div class="card">
@@ -6597,6 +6913,21 @@ function pollCloudStatus() {{
       }}
     }})
     .catch(() => {{}});
+}}
+function resetCloudModel() {{
+  const status = document.getElementById('cloudTrainStatus');
+  status.textContent = 'Resetting...';
+  fetch('/ai-reset-cloud-model')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to reset: unknown error';
+        return;
+      }}
+      status.textContent = 'Cloud model reset - classified samples were kept.' +
+        (data.server_error ? (' Note: ' + data.server_error) : ' Reload this page, or train a new one whenever you\\'re ready.');
+    }})
+    .catch(err => {{ status.textContent = 'Failed to reset: ' + err; }});
 }}
 {"startCloudStatusPolling();" if cloud_job.get("status") in ("uploading", "training") else ""}
 </script>
