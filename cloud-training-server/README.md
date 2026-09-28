@@ -23,12 +23,27 @@ in the parent folder of this repo, and hasn't been built yet.
 
 ## Installing
 
+**Only ever have ONE copy of this folder set up to autostart on a given
+Windows machine.** If you download it again into a different folder
+(Downloads, a different drive, a re-clone, etc.) and run `install.ps1`
+there too, you end up with two independent copies - each with its own
+`server_config.json` and its own API key - silently fighting over the
+same port, and whichever one happens to grab it first is the one that
+actually answers the Pi, while the other one's key is what you keep
+pasting into Settings by mistake. If you're not sure whether an old copy
+is still lying around, see "Which copy is actually running?" below
+before installing again.
+
 1. On the Windows machine that will run this, either clone this whole
-   repository or just download this `cloud-training-server` folder.
+   repository or just download this `cloud-training-server` folder -
+   pick one permanent location for it (not Downloads) and always
+   re-install into that same folder from then on.
 2. Right-click `install.ps1` -> **Run with PowerShell** (or run
    `powershell -ExecutionPolicy Bypass -File install.ps1` from an existing
    PowerShell window). It will prompt for administrator approval - that's
-   expected, it needs it for the firewall rule and scheduled task below.
+   expected, it needs it for the firewall rule and autostart mechanism
+   below. Add `-Service` (`... -File install.ps1 -Service`) to install it
+   as a true Windows Service instead of a scheduled task - see step 5.
 
 If Windows blocks the script with *"is not digitally signed"* (normal for
 any script downloaded from the internet), run this first from an
@@ -56,13 +71,19 @@ What the installer does, in order:
    only**. Nothing here forwards the port to the public internet, and you
    shouldn't either; see the Tailscale note below if you need to reach it
    from outside your home network.
-5. Registers a scheduled task (`CloudTrainingServer`) that starts the
-   server when you log in to Windows and restarts it automatically if it
-   ever crashes. (This starts at logon, not before anyone's signed in -
-   the simplest option that doesn't require storing an account password.
-   If you need it running with nobody logged in at all, look at wrapping
-   the same command with [NSSM](https://nssm.cc/) as a true Windows
-   Service instead.)
+5. Registers something to start the server automatically and restart it
+   if it ever crashes - by default, a scheduled task (`CloudTrainingServer`)
+   that starts at logon. This is the simplest option (no account password
+   to store), but it's tied to your logon session: a lock, logoff, or
+   remote-desktop disconnect can end that session and take the server
+   down with it (Windows reports this as result code `3221225786` in
+   `Get-ScheduledTaskInfo` - a normal session-ended kill, not a crash).
+   Pass `-Service` to install it as a true Windows Service instead
+   (via the free [NSSM](https://nssm.cc/) tool, downloaded automatically
+   the first time): it starts at boot before anyone signs in, keeps
+   running through logoff/lock/disconnect, and still restarts itself if
+   it ever exits. Re-running the installer in either mode automatically
+   removes the other one first, so only one is ever active.
 6. Turns off sleep while the machine is plugged in (leaves battery
    behavior alone, in case this happens to be a laptop), since a sleeping
    machine won't answer when something tries to reach it.
@@ -91,14 +112,49 @@ error live:
 .\venv\Scripts\python.exe .\train_server.py
 ```
 
+## Which copy is actually running?
+
+Only one process can ever actually be bound to a given port, so if you
+suspect multiple installs (different folders, or a manual `python
+train_server.py` run by hand alongside the scheduled task/service), this
+tells you definitively which one is live:
+
+```powershell
+netstat -ano | findstr :8787
+```
+
+The `LISTENING` line's last column is the PID. Then:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "ProcessId = <PID>" | Select-Object ExecutablePath, CommandLine
+```
+
+`CommandLine` shows the exact folder this instance is running from - that
+folder's `server_config.json` holds the API key that actually matters;
+any other copy's key is stale. Compare against what the installer
+actually registered:
+
+```powershell
+Get-ScheduledTask -TaskName CloudTrainingServer -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty Actions
+Get-Service -Name CloudTrainingServer -ErrorAction SilentlyContinue
+```
+
+If the folder in `CommandLine` doesn't match either of those, something
+was started by hand from a different folder and is squatting on the
+port - stop it (`Stop-Process -Id <PID> -Force`) and settle on one
+folder as the only one you ever install into.
+
 ## Uninstalling
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File uninstall.ps1
 ```
 
-Removes the scheduled task and firewall rule. Add `-RemoveData` to also
-delete the virtual environment, any trained models sitting in `jobs/`, and
+Removes whichever autostart mechanism is present - the scheduled task,
+the Windows Service, or both, if you've switched modes over time - plus
+the firewall rule. Add `-RemoveData` to also delete the virtual
+environment, any trained models sitting in `jobs/`, and
 `server_config.json` (which means a future re-install generates a brand
 new API key).
 
