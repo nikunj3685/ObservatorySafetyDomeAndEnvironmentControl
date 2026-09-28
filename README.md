@@ -32,6 +32,7 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
 | `dome-safety.service` | Ready-to-copy systemd unit file - see "Running as a systemd service" below. |
 | `install.sh` | One-shot installer - system packages, I2C enable, pip install, and a `dome-safety.service` generated for wherever you actually cloned this and whichever user runs it. `sudo bash install.sh`. |
 | `test_bme_mlx.py`, `test_dht_reed.py`, `test_mlx_oled.py`, `test_mosfet.py`, `test_relay.py` | One-off hardware bring-up scripts used while wiring each sensor/actuator - not part of the running service. |
+| `cloud-training-server/` | Standalone Windows-side server for training a real image-classification sky model - see "Cloud training server" below and `cloud-training-server/README.md`. |
 
 ## Setup
 
@@ -61,6 +62,10 @@ When **All Sky Camera** is enabled in Settings, this service can burn the curren
 The `/ai-classify` page captures a raw All Sky frame plus a full sensor snapshot on a timer (Settings → AI Learning), lets you manually label each capture (Clear, Partly Cloudy, Rain, etc. - the label list is your own, configurable per your sky), and trains a from-scratch model from whatever you've labeled so far - no cloud service, no external dataset. Classify at least a handful of samples per label (5+ recommended, across at least 2 labels) before the first "Train model now" click; retraining later on more samples just overwrites the previous model with a better one, and the label list can keep growing as you add more classified frames over time.
 
 Once trained, the model's prediction shows up on the dashboard as informational-only until you explicitly opt in - checking "Use the trained model in the SAFE/UNSAFE decision" under Settings → AI Learning turns it into the SafetyMonitor's optional fifth gate described above. Turning that on can never itself make the roof less safe than before it existed: if the model isn't trained yet, or has no fresh sensor reading to predict from right now, the gate fails open (behaves exactly as if it were off) instead of blocking SAFE or crashing - and neither case is silent, showing a dashboard banner, an inline warning row on the Safety Monitor card, a matching note on the Classify page, and a one-time Event Log entry the moment either state begins. See Section 5.9 ("AI Learning" settings) and Section 10 ("AI Learning: Training and Using Your Own Sky Model") of `Observatory_Setup_Guide.docx` for the full step-by-step walkthrough and troubleshooting.
+
+### Cloud training server (optional, experimental)
+
+The `cloud-training-server/` folder is a separate, standalone component - a Windows-machine-side server that trains a real image-classification model (not the numeric-sensor model above) from your Classify page's labeled sky photos, using transfer learning on MobileNetV2. It's meant to run on a spare Windows machine on your LAN so the Pi itself never has to run TensorFlow. See `cloud-training-server/README.md` for installation. **This currently only sets up the server side** - the Pi-side integration (a Classify page button to upload/train/download, and using the resulting model for cloud detection) hasn't been built yet.
 
 ### Running as a systemd service
 

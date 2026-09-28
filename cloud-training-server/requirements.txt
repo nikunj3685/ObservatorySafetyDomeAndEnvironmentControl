@@ -1,0 +1,6 @@
+# Cloud Training Server dependencies.
+# numpy comes in transitively via tensorflow.
+flask
+tensorflow
+pillow
+waitress
