@@ -569,7 +569,15 @@ CLOUD_MODEL_IMG_SIZE = (224, 224)      # must match cloud-training-server/train_
 CLOUD_MODEL_PREDICT_INTERVAL_SEC = 60  # how often the live gate re-classifies the current All Sky frame
 CLOUD_TRAIN_POLL_INTERVAL_SEC = 15     # how often the background upload/poll thread checks job status
 CLOUD_TRAIN_TIMEOUT_SEC = 30 * 60      # give up and mark the job failed after this long either way
-CLOUD_HTTP_TIMEOUT_SEC = 20            # separate from HTTP_TIMEOUT_SEC (fast sensor polls) - uploads/downloads are bigger
+CLOUD_HTTP_TIMEOUT_SEC = 20            # for quick round trips (status polls, health, model download) - NOT the upload itself
+CLOUD_UPLOAD_TIMEOUT_SEC = 20 * 60     # the upload can be large (hundreds of labeled images) - a short timeout
+                                        # would fail a real, still-in-progress upload, not just a dead one
+CLOUD_JOB_HEALTH_CHECK_INTERVAL_SEC = 30   # how often sensor_poll_loop() checks for an orphaned job (see
+                                            # _check_cloud_job_health()) - independent of, and a safety net for,
+                                            # the worker thread's own tighter CLOUD_TRAIN_POLL_INTERVAL_SEC above
+CLOUD_JOB_STALE_AFTER_SEC = 90          # no heartbeat this long -> presume the thread/process tracking the job
+                                        # is gone (a crash, or the whole service restarting) - NOT a ceiling on
+                                        # total job time, so a large, genuinely slow upload is never penalized
 
 # Auto-train (Phase 6) - tracks only WHEN the last automatic attempt
 # happened, separate from CLOUD_JOB_STATE_PATH (which is overwritten
@@ -1294,7 +1302,8 @@ def _load_cloud_job_state():
         pass
     return {"status": "idle", "job_id": None, "error": None,
              "started_at": None, "finished_at": None, "sample_count": None,
-             "sample_ids": [], "triggered_by": None}
+             "sample_ids": [], "triggered_by": None,
+             "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None}
 
 
 def _save_cloud_job_state(state):
@@ -1389,20 +1398,45 @@ def _load_cloud_model_meta():
     return None
 
 
+def _format_bytes(n):
+    """Plain human-readable size for the upload-progress line below - just
+    enough precision to be useful (KB/MB), nothing fancier. Returns ""
+    for None rather than raising, matching this file's usual style for
+    optional/not-yet-known values."""
+    if n is None:
+        return ""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
 def _cloud_job_status_line(job):
     """Plain-language one-liner for a training job state dict (from
     _load_cloud_job_state()), for the Classify page's status area - both
     the initial page render and the JS poll that keeps it live use this
-    same phrasing, via /ai-classify-cloud-status."""
+    same phrasing, via /ai-classify-cloud-status. Shows the job ID
+    whenever one exists (assigned once the upload finishes - there's
+    nothing to show yet while still uploading) and, while uploading,
+    real byte-level progress once at least one progress update has come
+    in - see _touch_cloud_job_progress()."""
     status = job.get("status")
+    job_id = job.get("job_id")
+    job_suffix = f" (job {job_id})" if job_id else ""
     if status == "uploading":
+        uploaded, total = job.get("uploaded_bytes"), job.get("total_bytes")
+        if uploaded is not None and total:
+            pct = min(100, int(uploaded * 100 / total))
+            return (f"Uploading labeled images to the cloud training server… "
+                    f"{pct}% ({_format_bytes(uploaded)} / {_format_bytes(total)})")
         return "Uploading labeled images to the cloud training server…"
     if status == "training":
-        return f"Training on the cloud server (job {job.get('job_id')})… this can take several minutes."
+        return f"Training on the cloud server (job {job_id})… this can take several minutes."
     if status == "done":
-        return "Last training job finished successfully - model downloaded and ready."
+        return f"Last training job finished successfully - model downloaded and ready.{job_suffix}"
     if status == "failed":
-        return f"Last training job failed: {job.get('error') or 'unknown error'}"
+        return f"Last training job failed: {job.get('error') or 'unknown error'}{job_suffix}"
     return ""  # "idle" - never trained via the cloud server yet, nothing to report
 
 
@@ -1573,40 +1607,100 @@ def _start_cloud_training(triggered_by="manual"):
         return False, ("No newly labeled samples to train on - either classify more on the Classify page, "
                         "or every classified sample has already been absorbed into a previous cloud training run.")
 
+    zip_bytes = zip_buf.getvalue()
+    now = time.time()
     _save_cloud_job_state({"status": "uploading", "job_id": None, "error": None,
-                            "started_at": time.time(), "finished_at": None, "sample_count": labeled_count,
-                            "sample_ids": sample_ids, "triggered_by": triggered_by})
+                            "started_at": now, "finished_at": None, "sample_count": labeled_count,
+                            "sample_ids": sample_ids, "triggered_by": triggered_by,
+                            "uploaded_bytes": 0, "total_bytes": len(zip_bytes), "last_progress_at": now})
 
     threading.Thread(target=_cloud_training_worker,
-                      args=(server_url, api_key, zip_buf.getvalue(), labeled_count, sample_ids, triggered_by),
+                      args=(server_url, api_key, zip_bytes, labeled_count, sample_ids, triggered_by),
                       daemon=True).start()
     return True, None
 
 
+def _touch_cloud_job_progress(uploaded_bytes=None, total_bytes=None):
+    """Best-effort partial update of the in-flight job's heartbeat
+    timestamp (and, during upload, its live byte progress) - called
+    frequently (once per upload progress callback, and once per training-
+    phase status poll), so callers throttle how often they call this
+    where it matters (see the upload progress callback in
+    _cloud_training_worker() below). A no-op once the job has moved past
+    "uploading"/"training" (finished, failed, or cancelled), so a
+    straggling late callback can never resurrect a job the rest of the
+    system has already moved on from.
+
+    _check_cloud_job_health() uses how STALE this timestamp is - not how
+    long the job has been running in total - to tell a genuinely large,
+    slow-but-alive job apart from one whose owning thread has died (a
+    crash, or the whole service having restarted): a legitimately slow
+    upload keeps refreshing this and is never touched by that check, no
+    matter how long it runs. Never raises."""
+    try:
+        state = _load_cloud_job_state()
+        if state.get("status") not in ("uploading", "training"):
+            return
+        state["last_progress_at"] = time.time()
+        if uploaded_bytes is not None:
+            state["uploaded_bytes"] = uploaded_bytes
+        if total_bytes is not None:
+            state["total_bytes"] = total_bytes
+        _save_cloud_job_state(state)
+    except Exception as e:
+        print(f"[cloud-model] Failed to record job progress: {e}")
+
+
 def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_ids, triggered_by="manual"):
-    """Background thread body for one training job: uploads the zip, polls
-    /train/status until it's done (or fails, or times out), then downloads
-    and unpacks the finished model. Every step persists its outcome to
-    CLOUD_JOB_STATE_PATH so the Classify page's status poll sees the
-    latest known state. Never raises - any exception here is caught and
-    recorded as a failed job instead of silently killing this daemon
-    thread."""
+    """Background thread body for one training job: uploads the zip, then
+    hands off to _poll_cloud_job_to_completion() for the rest. Never
+    raises - any exception here is caught and recorded as a failed job
+    instead of silently killing this daemon thread.
+
+    The upload itself is STREAMED (via requests_toolbelt's
+    MultipartEncoderMonitor) rather than handed to requests as one opaque
+    blob, so real byte-level progress can be recorded as it goes - see
+    _touch_cloud_job_progress() - instead of the Classify page showing an
+    unchanging "Uploading..." message for however long a few hundred
+    images take to actually transfer. Falls back to a plain, non-streamed
+    upload (no live progress, otherwise identical) if requests_toolbelt
+    isn't installed - this feature is additive, never required, matching
+    this project's usual approach to optional dependencies (see
+    requirements.txt's note on tflite-runtime/numpy)."""
     started_at = time.time()
     base = server_url.rstrip("/")
     headers = {"X-API-Key": api_key}
 
-    def _fail(error, job_id=None):
-        _save_cloud_job_state({"status": "failed", "job_id": job_id, "error": error,
+    def _fail(error):
+        _save_cloud_job_state({"status": "failed", "job_id": None, "error": error,
                                 "started_at": started_at, "finished_at": time.time(),
                                 "sample_count": sample_count, "sample_ids": sample_ids,
-                                "triggered_by": triggered_by})
+                                "triggered_by": triggered_by,
+                                "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None})
         _log_event("Settings", f"Cloud training server: {error}", severity="warn")
         print(f"[cloud-model] {error}")
 
     try:
-        r = requests.post(f"{base}/train", headers=headers,
-                           files={"file": ("training_data.zip", zip_bytes, "application/zip")},
-                           timeout=CLOUD_HTTP_TIMEOUT_SEC)
+        try:
+            from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+            last_write = {"t": 0.0}
+
+            def _on_upload_progress(monitor):
+                now = time.time()
+                finished = monitor.bytes_read >= monitor.len
+                if not finished and now - last_write["t"] < 1.0:
+                    return  # throttle to ~once/sec - a large upload can fire this callback constantly
+                last_write["t"] = now
+                _touch_cloud_job_progress(monitor.bytes_read, monitor.len)
+
+            encoder = MultipartEncoder(fields={"file": ("training_data.zip", zip_bytes, "application/zip")})
+            monitor = MultipartEncoderMonitor(encoder, _on_upload_progress)
+            r = requests.post(f"{base}/train", headers={**headers, "Content-Type": monitor.content_type},
+                               data=monitor, timeout=CLOUD_UPLOAD_TIMEOUT_SEC)
+        except ImportError:
+            r = requests.post(f"{base}/train", headers=headers,
+                               files={"file": ("training_data.zip", zip_bytes, "application/zip")},
+                               timeout=CLOUD_UPLOAD_TIMEOUT_SEC)
         if r.status_code == 401:
             return _fail("Server rejected the API key - check it under Settings → AI Learning.")
         r.raise_for_status()
@@ -1616,16 +1710,52 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_
     except Exception as e:
         return _fail(f"Upload failed: {e}")
 
-    _save_cloud_job_state({"status": "training", "job_id": job_id, "error": None,
-                            "started_at": started_at, "finished_at": None, "sample_count": sample_count,
-                            "sample_ids": sample_ids, "triggered_by": triggered_by})
     trigger_note = "auto-train" if triggered_by == "auto" else "manual"
     _log_event("Settings", f"Cloud training server: job {job_id} queued ({sample_count} labeled samples, "
                             f"{trigger_note})")
+    _poll_cloud_job_to_completion(server_url, api_key, job_id, sample_count, sample_ids, triggered_by, started_at)
+
+
+def _poll_cloud_job_to_completion(server_url, api_key, job_id, sample_count, sample_ids, triggered_by, started_at):
+    """Polls /train/status/<job_id> until it's done, fails, or times out,
+    then downloads and unpacks a finished model - the shared second half
+    of a training job, used both by the normal upload-then-poll flow in
+    _cloud_training_worker() above AND by _check_cloud_job_health()'s
+    recovery path (resuming a job whose original worker thread died -
+    service restart or otherwise - but that turns out to still be
+    genuinely running on the server), so both paths finish a job
+    identically. Checks status immediately on entry (then sleeps between
+    subsequent checks) specifically so a resumed job gets an instant
+    answer rather than waiting a full poll interval first.
+
+    Touches the job's heartbeat on every successful poll (not just real
+    upload progress), so the periodic health check can tell "still alive
+    and waiting on the server" apart from "the thread tracking this is
+    gone" even during the plain wait-for-training part of a job. Never
+    raises."""
+    base = server_url.rstrip("/")
+    headers = {"X-API-Key": api_key}
+
+    def _fail(error):
+        _save_cloud_job_state({"status": "failed", "job_id": job_id, "error": error,
+                                "started_at": started_at, "finished_at": time.time(),
+                                "sample_count": sample_count, "sample_ids": sample_ids,
+                                "triggered_by": triggered_by,
+                                "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None})
+        _log_event("Settings", f"Cloud training server: {error}", severity="warn")
+        print(f"[cloud-model] {error}")
+
+    _save_cloud_job_state({"status": "training", "job_id": job_id, "error": None,
+                            "started_at": started_at, "finished_at": None, "sample_count": sample_count,
+                            "sample_ids": sample_ids, "triggered_by": triggered_by,
+                            "uploaded_bytes": None, "total_bytes": None, "last_progress_at": time.time()})
 
     deadline = started_at + CLOUD_TRAIN_TIMEOUT_SEC
+    first_check = True
     while time.time() < deadline:
-        time.sleep(CLOUD_TRAIN_POLL_INTERVAL_SEC)
+        if not first_check:
+            time.sleep(CLOUD_TRAIN_POLL_INTERVAL_SEC)
+        first_check = False
         try:
             r = requests.get(f"{base}/train/status/{job_id}", headers=headers, timeout=CLOUD_HTTP_TIMEOUT_SEC)
             r.raise_for_status()
@@ -1634,8 +1764,10 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_
             print(f"[cloud-model] Status poll failed (will retry): {e}")
             continue
 
+        _touch_cloud_job_progress()  # proof of life, even while still queued/training
+
         if status.get("status") == "failed":
-            return _fail(status.get("error") or "Training failed on the server (no details given).", job_id)
+            return _fail(status.get("error") or "Training failed on the server (no details given).")
 
         if status.get("status") == "done":
             try:
@@ -1653,7 +1785,7 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_
                     json.dump(meta, f, indent=2)
                 os.replace(tmp, CLOUD_MODEL_META_PATH)
             except Exception as e:
-                return _fail(f"Training finished but the model download failed: {e}", job_id)
+                return _fail(f"Training finished but the model download failed: {e}")
 
             # Only NOW that the model has actually been trained AND
             # successfully downloaded - never on a failure or a timeout -
@@ -1666,14 +1798,115 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_
             _save_cloud_job_state({"status": "done", "job_id": job_id, "error": None,
                                     "started_at": started_at, "finished_at": time.time(),
                                     "sample_count": sample_count, "sample_ids": sample_ids,
-                                    "triggered_by": triggered_by})
+                                    "triggered_by": triggered_by,
+                                    "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None})
             _log_event("Settings", f"Cloud training server: job {job_id} finished - trained model downloaded "
                                     f"({sample_count} labeled samples, classes: {', '.join(classes)})")
             return
         # else: "queued" or "training" - keep waiting.
 
     _fail(f"Timed out after {CLOUD_TRAIN_TIMEOUT_SEC // 60} minutes waiting for training to finish on the "
-          f"server.", job_id)
+          f"server.")
+
+
+def _check_cloud_job_health():
+    """Periodic safety net - called on its own timer from
+    sensor_poll_loop() (see CLOUD_JOB_HEALTH_CHECK_INTERVAL_SEC), same
+    pattern as maybe_auto_train()/poll_cloud_model(): if the persisted
+    job state says "uploading" or "training" but nothing has touched its
+    heartbeat (_touch_cloud_job_progress()) in CLOUD_JOB_STALE_AFTER_SEC,
+    the thread that was supposed to be tracking it is no longer doing so
+    - most commonly the whole service restarted (a fresh process never
+    touches an old job's heartbeat, so it reads as instantly, maximally
+    stale) but could also be a thread that silently died mid-job. Either
+    way, this reconciles the stuck state instead of leaving the Classify
+    page showing "Uploading..."/"Training..." forever - see the earlier
+    conversation that motivated this: a job left stuck after a restart,
+    discovered via the training server's own /health showing no matching
+    job in memory.
+
+    Deliberately keyed off time-SINCE-LAST-PROGRESS, never time-since-
+    started - a legitimately large upload (hundreds of images) keeps
+    refreshing its own heartbeat and is never touched here no matter how
+    long it takes.
+
+    For a "training" job with a job_id, this doesn't just give up - it
+    resumes watching the job (via _poll_cloud_job_to_completion(), the
+    same function the original worker thread would have used) so a job
+    that's genuinely still running on the server is picked back up
+    rather than abandoned. Only when there's nothing left to recover
+    (an "uploading" job never got far enough to have a job_id at all, or
+    the server itself isn't configured/reachable to ask) does this mark
+    the job failed with a clear explanation. Never raises - a failed
+    reconciliation attempt here must never crash the poll loop; worst
+    case it's simply retried next cycle."""
+    job = _load_cloud_job_state()
+    status = job.get("status")
+    if status not in ("uploading", "training"):
+        return
+    last_progress = job.get("last_progress_at")
+    age = time.time() - last_progress if last_progress else float("inf")
+    if age < CLOUD_JOB_STALE_AFTER_SEC:
+        return  # still showing signs of life - leave it alone, however long it's been running in total
+
+    job_id = job.get("job_id")
+    if status == "training" and job_id:
+        ai_cfg = get_setting("ai_learning")
+        server_url = (ai_cfg.get("cloud_server_url") or "").strip()
+        api_key = (ai_cfg.get("cloud_api_key") or "").strip()
+        if server_url and api_key:
+            # Touch the heartbeat FIRST, before spawning - so this same
+            # stale job can never be picked up a second time by the next
+            # health-check cycle running before the resumed thread's own
+            # first status check (immediate, see _poll_cloud_job_to_
+            # completion()'s first_check) has had a chance to land.
+            _touch_cloud_job_progress()
+            _log_event("Settings", f"Cloud training server: resuming job {job_id} after losing track of it "
+                                    f"(likely a service restart) - no progress was lost", severity="info")
+            threading.Thread(target=_poll_cloud_job_to_completion,
+                              args=(server_url, api_key, job_id, job.get("sample_count"),
+                                    job.get("sample_ids") or [], job.get("triggered_by"),
+                                    job.get("started_at") or time.time()),
+                              daemon=True).start()
+            return
+
+    # "uploading" with no job_id ever assigned (the server has no record
+    # of it at all - there's nothing to recover), or a "training" job
+    # whose server isn't even configured any more - nothing left to
+    # check, so stop the page from waiting on it forever.
+    _save_cloud_job_state({**job, "status": "failed",
+                            "error": "Interrupted (the service restarted, or the training server became "
+                                     "unreachable, partway through this job) - start a new training run "
+                                     "when ready.",
+                            "finished_at": time.time(),
+                            "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None})
+    _log_event("Settings", "Cloud training server: previous job was interrupted and has been cleared",
+                severity="warn")
+
+
+def _cancel_cloud_job():
+    """Manually abandons the current in-flight job (the Classify page's
+    "Cancel job" control) - marks it failed on the Pi side immediately,
+    so "Train via cloud server" is usable again right away rather than
+    waiting for _check_cloud_job_health()'s staleness window. A no-op
+    (still returns True) if nothing is actually in flight, matching the
+    other reset/delete routes' harmless-no-op philosophy.
+
+    Only stops the PI from waiting on this job - if it's genuinely still
+    running on the training server (most likely for "training", never
+    for "uploading" since no job exists there yet), this does not, and
+    has no way to, stop that server-side work. The next successful job
+    still works fine either way; this only affects what the Pi is
+    currently tracking."""
+    job = _load_cloud_job_state()
+    if job.get("status") not in ("uploading", "training"):
+        return True
+    _save_cloud_job_state({**job, "status": "failed", "error": "Cancelled manually.",
+                            "finished_at": time.time(),
+                            "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None})
+    _log_event("Settings", f"Cloud training server: job {job.get('job_id') or '(upload)'} cancelled manually",
+                severity="warn")
+    return True
 
 
 def maybe_auto_train():
@@ -1769,7 +2002,8 @@ def _reset_cloud_model():
                                       "output_index": None, "classes": None})
     _save_cloud_job_state({"status": "idle", "job_id": None, "error": None,
                             "started_at": None, "finished_at": None, "sample_count": None,
-                            "sample_ids": [], "triggered_by": None})
+                            "sample_ids": [], "triggered_by": None,
+                            "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None})
 
     ai_cfg = get_setting("ai_learning")
     server_url = (ai_cfg.get("cloud_server_url") or "").strip()
@@ -2800,6 +3034,7 @@ def sensor_poll_loop():
     last_log_cleanup = 0.0
     last_ai_capture = 0.0
     last_autotrain_check = 0.0
+    last_cloud_job_health_check = 0.0
     while True:
         poll_bme280()
         poll_mlx90614()
@@ -2838,6 +3073,10 @@ def sensor_poll_loop():
         if now - last_autotrain_check >= AUTO_TRAIN_CHECK_INTERVAL_SEC:
             maybe_auto_train()
             last_autotrain_check = now
+
+        if now - last_cloud_job_health_check >= CLOUD_JOB_HEALTH_CHECK_INTERVAL_SEC:
+            _check_cloud_job_health()
+            last_cloud_job_health_check = now
 
         time.sleep(SENSOR_POLL_INTERVAL_SEC)
 
@@ -6165,6 +6404,18 @@ def ai_reset_cloud_model():
     return jsonify({"ok": True, "server_error": server_error})
 
 
+@app.route("/ai-cancel-cloud-job", methods=["GET"])
+def ai_cancel_cloud_job():
+    """Manually clears a stuck/unwanted in-flight cloud training job - the
+    Classify page's "Cancel job" control, shown only while a job is
+    "uploading" or "training". See _cancel_cloud_job()'s docstring for
+    what this does and doesn't affect. JSON, matching this page's other
+    fetch()-based buttons; returns the resulting job state so the caller
+    can update its status line without a second round trip."""
+    _cancel_cloud_job()
+    return jsonify({"ok": True, **_load_cloud_job_state()})
+
+
 def _safe_export_folder_name(label):
     """Label text is free-form (Settings -> AI Learning -> label list), so
     turn it into something safe to use as a zip folder name rather than
@@ -6659,6 +6910,19 @@ def ai_classify_page():
         if (cloud_meta or cloud_job.get("status") == "done") else
         '<span class="btn ai-nav-btn-disabled">Reset cloud model</span>'
     )
+    # Shown only while a job is actually in flight - see _cancel_cloud_job()'s
+    # docstring for exactly what this does and doesn't stop. Rendered with an
+    # id + inline display style (rather than only in JS) so it's correct on
+    # first page load too, before the JS poll's first tick; pollCloudStatus()
+    # keeps its visibility in sync with the live status afterward.
+    cloud_job_in_flight = cloud_job.get("status") in ("uploading", "training")
+    cloud_cancel_button_html = (
+        f'<button type="button" id="cloudCancelBtn" class="btn ai-delete-btn" '
+        f'style="{"" if cloud_job_in_flight else "display:none"}" '
+        f'onclick="if(confirm(\'Cancel the in-progress cloud training job? This only stops the Pi from '
+        f'waiting on it - if it is genuinely still running on the server, it keeps running there.\')) '
+        f'cancelCloudJob()">Cancel job</button>'
+    )
 
     html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6730,6 +6994,7 @@ a{{color:var(--accent);}}
    '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
   {cloud_train_button_html}
   {cloud_reset_button_html}
+  {cloud_cancel_button_html}
   <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
   <p class="hint">{cloud_new_count} labeled sample(s) not yet absorbed into a successful cloud training run.
   {"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
@@ -6982,9 +7247,17 @@ function trainCloudModel() {{
         return;
       }}
       status.textContent = 'Uploading labeled images to the cloud training server\\u2026';
+      const cancelBtn = document.getElementById('cloudCancelBtn');
+      if (cancelBtn) cancelBtn.style.display = 'inline-block';
       startCloudStatusPolling();
     }})
     .catch(err => {{ status.textContent = 'Failed to start: ' + err; }});
+}}
+function _formatBytes(n) {{
+  if (n === null || n === undefined) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
 }}
 var cloudStatusPollTimer = null;
 function startCloudStatusPolling() {{
@@ -6996,21 +7269,39 @@ function pollCloudStatus() {{
     .then(r => r.json())
     .then(data => {{
       const status = document.getElementById('cloudTrainStatus');
+      const cancelBtn = document.getElementById('cloudCancelBtn');
+      const inFlight = (data.status === 'uploading' || data.status === 'training');
+      if (cancelBtn) cancelBtn.style.display = inFlight ? 'inline-block' : 'none';
+      const jobSuffix = data.job_id ? (' (job ' + data.job_id + ')') : '';
       if (data.status === 'uploading') {{
-        status.textContent = 'Uploading labeled images to the cloud training server\\u2026';
+        if (data.total_bytes) {{
+          const pct = Math.min(100, Math.round(data.uploaded_bytes * 100 / data.total_bytes));
+          status.textContent = 'Uploading labeled images to the cloud training server\\u2026 ' + pct +
+            '% (' + _formatBytes(data.uploaded_bytes) + ' / ' + _formatBytes(data.total_bytes) + ')';
+        }} else {{
+          status.textContent = 'Uploading labeled images to the cloud training server\\u2026';
+        }}
       }} else if (data.status === 'training') {{
         status.textContent = 'Training on the cloud server (job ' + data.job_id + ')\\u2026 this can take several minutes.';
       }} else if (data.status === 'done') {{
-        status.textContent = 'Training finished - model downloaded and ready. Reload this page to see the updated details.';
+        status.textContent = 'Training finished - model downloaded and ready' + jobSuffix +
+          '. Reload this page to see the updated details.';
         clearInterval(cloudStatusPollTimer);
         cloudStatusPollTimer = null;
       }} else if (data.status === 'failed') {{
-        status.textContent = 'Training failed: ' + (data.error || 'unknown error');
+        status.textContent = 'Training failed' + jobSuffix + ': ' + (data.error || 'unknown error');
         clearInterval(cloudStatusPollTimer);
         cloudStatusPollTimer = null;
       }}
     }})
     .catch(() => {{}});
+}}
+function cancelCloudJob() {{
+  const status = document.getElementById('cloudTrainStatus');
+  status.textContent = 'Cancelling\\u2026';
+  fetch('/ai-cancel-cloud-job')
+    .then(() => {{ startCloudStatusPolling(); pollCloudStatus(); }})
+    .catch(err => {{ status.textContent = 'Failed to cancel: ' + err; }});
 }}
 function resetCloudModel() {{
   const status = document.getElementById('cloudTrainStatus');

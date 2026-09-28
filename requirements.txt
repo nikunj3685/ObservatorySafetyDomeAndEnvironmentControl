@@ -4,6 +4,10 @@
 # libraries stubbed out, as the test suite under obs_test/ does).
 flask
 requests
+requests_toolbelt   # pure-Python, no compiled/hardware deps - safe to list normally (unlike the
+                    # tflite-runtime/numpy note below). Only used for live upload-progress
+                    # reporting during cloud training; the code falls back to a plain non-streamed
+                    # upload if this somehow isn't installed, so it's never load-bearing.
 adafruit-circuitpython-bme280
 adafruit-circuitpython-mlx90614
 adafruit-circuitpython-dht
