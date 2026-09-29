@@ -400,6 +400,20 @@ DEFAULT_SETTINGS = {
         "auto_train_enabled": False,
         "auto_train_min_new_samples": 20,
         "auto_train_min_interval_hours": 24,
+        # "Keep full resolution Images" (Phase 7) - default ON since existing
+        # installs already have full-resolution images on disk that this
+        # toggle should never touch retroactively just by existing. On:
+        # _absorb_cloud_training_success() leaves a sample's full-resolution
+        # image exactly as it is once that sample is absorbed into a
+        # successful cloud training run (the old behavior deleted it
+        # outright). Off: instead of deleting it, the image is replaced IN
+        # PLACE with a smaller compressed copy (see CLOUD_UPLOAD_RESIZE_
+        # MAX_DIM) - still viewable/downloadable on the Classify page,
+        # never silently gone. Flipping this to Off does not, by itself,
+        # touch any existing backlog of already-absorbed full-resolution
+        # images - see the Classify page's manual "Compress already-trained
+        # images" action for that.
+        "keep_full_res_images": True,
     },
     # User-editable display names for each sensor/actuator, shown on the
     # Hardware Pins form and everywhere that sensor's reading is tagged
@@ -1411,38 +1425,158 @@ def _save_autotrain_state(state):
         print(f"[ai-learning] Failed to save auto-train state: {e}")
 
 
+def _compress_training_image_in_place(path, max_dim=CLOUD_UPLOAD_RESIZE_MAX_DIM, quality=85):
+    """Best-effort downsize-in-place for an AI Learning training image -
+    same resize math _ai_training_export_zip() already uses for the cloud
+    upload zip (long edge capped at max_dim, re-saved as JPEG at
+    `quality`), but writing the result back over the ORIGINAL file on disk
+    instead of into an in-memory zip entry, so the sample keeps the same
+    filename and stays viewable/downloadable on the Classify page - just
+    smaller. Written to a temp file and atomically replaced (same pattern
+    as _save_ai_training_index()), so a failure never leaves a half-written
+    file in the original's place. Returns True on success, False on any
+    failure (original file is left completely untouched on failure)."""
+    tmp = path + ".compress.tmp"
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            longest = max(w, h)
+            if longest > max_dim:
+                scale = max_dim / float(longest)
+                img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+            img.save(tmp, format="JPEG", quality=quality)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"[ai-learning] failed to compress image {path} in place: {e}")
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _ai_training_images_folder_stats():
+    """(image_count, total_bytes) for whatever is actually sitting on disk
+    under AI_TRAINING_IMAGES_DIR right now - a plain directory walk,
+    independent of index.json (which can drift from disk, same as
+    everywhere else in this file that touches both). Feeds the folder-size
+    line shown under Settings -> AI Learning and on the Classify page.
+    Never raises; returns (0, 0) if the directory doesn't exist yet."""
+    count = 0
+    total = 0
+    try:
+        if os.path.isdir(AI_TRAINING_IMAGES_DIR):
+            for name in os.listdir(AI_TRAINING_IMAGES_DIR):
+                path = os.path.join(AI_TRAINING_IMAGES_DIR, name)
+                try:
+                    if os.path.isfile(path):
+                        total += os.path.getsize(path)
+                        count += 1
+                except OSError:
+                    continue
+    except Exception as e:
+        print(f"[ai-learning] failed to stat training images folder: {e}")
+    return count, total
+
+
+def _format_size_general(n):
+    """Human-readable size up to GB - used for the training-images folder
+    line (routinely gigabytes over time), unlike _format_bytes() above
+    (KB/MB only, sized for a single cloud-upload's progress, which never
+    reaches a GB)."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.2f} GB"
+
+
 def _absorb_cloud_training_success(sample_ids):
     """Called once a cloud training job that uploaded `sample_ids` finishes
     successfully: marks each of those samples as already absorbed
-    (sample["cloud_trained_at"] = now) and deletes ONLY its heavy JPEG
-    file - the index record itself (label + sensor snapshot) is kept
-    forever, so the local numeric AI Model never loses history even as
-    images get purged, and so a sample already counted here is never
-    re-uploaded by a later incremental training run. Missing files/ids
-    (index and disk can always drift apart) are skipped, never fatal -
-    matches _delete_ai_training_samples()'s own best-effort philosophy."""
+    (sample["cloud_trained_at"] = now). The index record itself (label +
+    sensor snapshot) is kept forever either way, so the local numeric AI
+    Model never loses history even as images shrink/get purged, and so a
+    sample already counted here is never re-uploaded by a later
+    incremental training run.
+
+    What happens to the heavy JPEG depends on ai_learning.keep_full_res_
+    images (see DEFAULT_SETTINGS for the full rationale): ON (default)
+    leaves the full-resolution image exactly as it is - nothing here
+    touches it. OFF replaces it IN PLACE with a smaller compressed copy
+    (_compress_training_image_in_place(), same resize convention as the
+    cloud-upload zip) rather than deleting it outright, and marks
+    sample["image_compressed"] = True so the Classify page and the
+    "Delete resized images"/"Delete classified full-size images" actions
+    can tell full-resolution and already-compressed samples apart. A
+    compression failure leaves the original full-resolution image in
+    place rather than losing it - the point of this setting is never to
+    silently destroy data, so "compress failed" degrades to "kept full
+    res, try again later" rather than "deleted anyway".
+
+    Missing files/ids (index and disk can always drift apart) are
+    skipped, never fatal - matches _delete_ai_training_samples()'s own
+    best-effort philosophy."""
     if not sample_ids:
         return
     id_set = set(sample_ids)
     idx = _load_ai_training_index()
     now = time.time()
+    keep_full_res = get_setting("ai_learning").get("keep_full_res_images", True)
     changed = False
     for sample in idx["samples"]:
         if sample["id"] not in id_set or sample.get("cloud_trained_at"):
             continue
         changed = True
         sample["cloud_trained_at"] = now
+        if keep_full_res:
+            continue  # leave the full-resolution image exactly as it is
         image_name = sample.get("image")
-        if image_name:
-            try:
-                img_path = os.path.join(AI_TRAINING_IMAGES_DIR, image_name)
-                if os.path.isfile(img_path):
-                    os.remove(img_path)
-            except Exception as e:
-                print(f"[ai-learning] absorb: failed to remove image {image_name}: {e}")
-            sample["image"] = None  # already gone (or never existed) - stop pointing at it
+        if not image_name:
+            continue
+        img_path = os.path.join(AI_TRAINING_IMAGES_DIR, image_name)
+        if os.path.isfile(img_path) and _compress_training_image_in_place(img_path):
+            sample["image_compressed"] = True
     if changed:
         _save_ai_training_index(idx)
+
+
+def _compress_trained_backlog_images():
+    """One-shot manual button action ("Compress already-trained images" on
+    the Classify page): compresses in place every already-absorbed
+    sample's full-resolution image that "Keep full resolution Images"
+    left untouched (either because that toggle was ON at the time, or the
+    sample was absorbed by an older version of this service before this
+    whole feature existed). A no-op (with an explanatory error, not
+    silently skipping) while the toggle is currently ON, since compressing
+    the backlog while the setting says "keep full res" would be
+    self-defeating - contradicting the very setting a person can see
+    right above this button - and pointless again the moment the very
+    next absorb runs anyway. Returns (compressed_count, error)."""
+    if get_setting("ai_learning").get("keep_full_res_images", True):
+        return 0, ('"Keep full resolution Images" is currently ON under Settings — turn it off first, '
+                   'then run this again to compress the existing backlog.')
+    idx = _load_ai_training_index()
+    compressed = 0
+    changed = False
+    for sample in idx["samples"]:
+        if not sample.get("cloud_trained_at") or sample.get("image_compressed") or not sample.get("image"):
+            continue
+        img_path = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+        if not os.path.isfile(img_path):
+            continue
+        if _compress_training_image_in_place(img_path):
+            sample["image_compressed"] = True
+            compressed += 1
+            changed = True
+    if changed:
+        _save_ai_training_index(idx)
+    return compressed, None
 
 
 def _load_cloud_model_meta():
@@ -2120,11 +2254,19 @@ def _reset_cloud_model():
     job's state, then best-effort tells the training server itself to
     drop its persisted warm-start base (DELETE /model) so the NEXT
     training run - on either side - starts completely fresh instead of
-    warm-starting from a model that's no longer wanted. Classified
-    samples are never touched. Mirrors _ai_reset_model()'s philosophy
-    (start the model over without losing curated training data), for
-    when the observatory has moved or the sky's baseline has otherwise
-    changed enough that the old model's learning is actively wrong.
+    warm-starting from a model that's no longer wanted. Also clears every
+    sample's "already absorbed into a successful cloud training run"
+    marker (cloud_trained_at - see _absorb_cloud_training_success() and
+    _ai_training_export_zip()'s only_untrained filter), so the next
+    training run genuinely retrains from EVERY classified sample you
+    still have usable image data for (full-resolution or compressed),
+    not just ones classified since this reset. Labels, sensor readings,
+    and whichever image each sample currently has are never touched by
+    this reset - only that one marker. Mirrors _ai_reset_model()'s
+    philosophy (start the model over without losing curated training
+    data), for when the observatory has moved or the sky's baseline has
+    otherwise changed enough that the old model's learning is actively
+    wrong.
 
     The Pi-side reset always happens; the server-side call is best-effort
     (network/auth problems there are reported back but don't block
@@ -2147,6 +2289,15 @@ def _reset_cloud_model():
                             "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None,
                             "attempt_id": uuid.uuid4().hex[:12]})
 
+    idx = _load_ai_training_index()
+    cleared_absorbed = 0
+    for sample in idx["samples"]:
+        if sample.get("cloud_trained_at"):
+            sample["cloud_trained_at"] = None
+            cleared_absorbed += 1
+    if cleared_absorbed:
+        _save_ai_training_index(idx)
+
     ai_cfg = get_setting("ai_learning")
     server_url = (ai_cfg.get("cloud_server_url") or "").strip()
     api_key = (ai_cfg.get("cloud_api_key") or "").strip()
@@ -2164,6 +2315,7 @@ def _reset_cloud_model():
                              f"(the LOCAL model was still reset): {e}")
     _log_event("Settings", "AI Learning: cloud model reset" +
                (" (classified samples were kept)" if existed else "") +
+               (f" - {cleared_absorbed} sample(s) marked eligible for re-upload" if cleared_absorbed else "") +
                (f" - {server_error}" if server_error else ""),
                severity="warn" if server_error else "info")
     return True, server_error
@@ -4757,6 +4909,7 @@ def save_allsky():
 def save_ai_learning():
     def patch(s):
         s["ai_learning"]["enabled"] = "aiLearningEnable" in request.args
+        s["ai_learning"]["keep_full_res_images"] = "keepFullResImages" in request.args
         if "aiCaptureIntervalMin" in request.args:
             try:
                 s["ai_learning"]["capture_interval_min"] = max(1, int(request.args["aiCaptureIntervalMin"]))
@@ -5365,12 +5518,18 @@ def web_index():
     auto_train_enabled = ai_learning.get("auto_train_enabled", False)
     auto_train_min_new_samples = ai_learning.get("auto_train_min_new_samples", 20)
     auto_train_min_interval_hours = ai_learning.get("auto_train_min_interval_hours", 24)
+    keep_full_res_images = ai_learning.get("keep_full_res_images", True)
     # Cheap-enough stat for the Settings page: how many samples are sitting
     # there right now, and how many still need a human to look at them -
     # they're reviewed and classified on the /ai-classify page.
     _ai_idx_for_stats = _load_ai_training_index()
     ai_sample_count = len(_ai_idx_for_stats["samples"])
     ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
+    # Plain directory stat (not index-derived) for the "training images
+    # folder" line - see _ai_training_images_folder_stats()'s docstring for
+    # why this is a disk walk rather than summing index.json's records.
+    ai_images_count, ai_images_bytes = _ai_training_images_folder_stats()
+    ai_images_size_str = _format_size_general(ai_images_bytes)
     ai_new_since_cloud_train = sum(1 for smp in _ai_idx_for_stats["samples"]
                                     if smp.get("label") and not smp.get("cloud_trained_at"))
     dome_snap = dome.snapshot()
@@ -6076,6 +6235,14 @@ a{{color:var(--accent-safety);}}
     <form action="/save-ai-learning" method="get">
       <label><input type="checkbox" name="aiLearningEnable" {"checked" if ai_learning_enabled else ""}>
       Enable AI Learning data capture</label>
+      <label><input type="checkbox" name="keepFullResImages" {"checked" if keep_full_res_images else ""}>
+      Keep full resolution Images</label>
+      <p class="hint">On (default): once a sample is absorbed into a successful AI Cloud Detect training run,
+      its full-resolution image is left exactly as it is. Off: instead of deleting it, the image is replaced
+      in place with a smaller compressed copy — still viewable and downloadable on the
+      <a href="/ai-classify">Classify page</a> — nothing is ever silently deleted outright. Turning this off
+      does not by itself touch any backlog of already-absorbed full-resolution images — use "Compress
+      already-trained images" on the <a href="/ai-classify">Classify page</a> for those.</p>
       <label>Capture interval (minutes)</label>
       <input type="number" name="aiCaptureIntervalMin" min="1" value="{ai_capture_interval_min}" class="narrow-number">
       <label>Keep UNLABELED samples for this many days (0 = never auto-delete)</label>
@@ -6120,7 +6287,8 @@ a{{color:var(--accent-safety);}}
     </form>
     <p class="hint">Samples collected so far: <b id="aiSampleCount">{ai_sample_count}</b>
     (<span id="aiUnlabeledCount">{ai_unlabeled_count}</span> not yet
-    classified) — <a href="/ai-classify">go classify them &rarr;</a></p>
+    classified) — training images folder: <b>{ai_images_size_str}</b> across {ai_images_count} image(s) —
+    <a href="/ai-classify">go classify them &rarr;</a></p>
   </div>
 
   <div class="settings-group" id="service-control">
@@ -6728,10 +6896,16 @@ def ai_classify_cloud_status():
 
 
 def _delete_ai_training_samples(ids):
-    """Removes the given sample ids from the index and deletes their image
-    files from disk - used by both "Delete selected" (any mix of labeled
-    and unlabeled ids) and "Delete ALL classified images" below. This is
-    the manual removal _ai_training_cleanup() above always deferred to a
+    """Removes the given sample ids from the index (record + image
+    together) and deletes their image files from disk - used by "Delete
+    selected" (any mix of labeled and unlabeled ids). Whole-record removal
+    like this is otherwise reserved for samples a person picked
+    explicitly; the three Classify page actions that purge just a
+    sensor/resized-image/full-size-image component of an otherwise-kept
+    classified record (see _ai_classify_delete_sensor_data(),
+    _ai_classify_delete_resized_images(), and _ai_classify_delete_
+    fullsize_images()) do NOT go through this function. This is the
+    manual removal _ai_training_cleanup() above always deferred to a
     person, rather than guessing when a classified sample is no longer
     wanted. Best-effort on the file removal, matching that function's own
     philosophy - a stuck file must never block dropping the record.
@@ -6789,18 +6963,313 @@ def ai_classify_delete():
                      "total_count": len(idx["samples"])})
 
 
+def _ai_classify_sensor_backup_zip():
+    """In-memory .zip containing one JSON file (sensor_records.json) with
+    every classified sample's id/label/timestamps/sensor snapshot - the
+    "Download sensor data / records" backup for the local AI Model card,
+    independent of images entirely (see _ai_training_export_zip() for
+    those). Returns (zip_bytes_io, record_count)."""
+    idx = _load_ai_training_index()
+    records = [{"id": s["id"], "ts": s.get("ts"), "label": s.get("label"),
+                "labeled_at": s.get("labeled_at"), "sensors": s.get("sensors")}
+               for s in idx["samples"] if s.get("label") and s.get("sensors")]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("sensor_records.json", json.dumps(records, indent=2))
+    buf.seek(0)
+    return buf, len(records)
+
+
+def _ai_classify_delete_sensor_data():
+    """Clears just the 'sensors' snapshot from every classified sample that
+    currently has one - the record itself (id/label/image/timestamps) is
+    kept, so the Classify page and every label count are unaffected; only
+    the raw sensor readings the local AI Model trains from are freed.
+    Paired with "Download sensor data / records" above so this is always
+    reversible from a zip you kept. Returns the number of samples
+    cleared."""
+    idx = _load_ai_training_index()
+    cleared = 0
+    for sample in idx["samples"]:
+        if sample.get("label") and sample.get("sensors"):
+            sample["sensors"] = None
+            cleared += 1
+    if cleared:
+        _save_ai_training_index(idx)
+    return cleared
+
+
+def _ai_classify_restore_sensor_data(zip_bytes):
+    """Restores sensor snapshots from a zip previously produced by
+    _ai_classify_sensor_backup_zip(), matching each entry back to its
+    original sample by id. A sample id no longer present in the index
+    (its whole record was removed some other way, not just its sensor
+    data) is skipped - there's nothing left to restore it into. Raises
+    ValueError on a zip that isn't a valid backup of this kind. Returns
+    (restored, skipped)."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            with zf.open("sensor_records.json") as f:
+                records = json.load(f)
+    except Exception as e:
+        raise ValueError(f"Not a valid sensor-data backup zip: {e}")
+    idx = _load_ai_training_index()
+    by_id = {s["id"]: s for s in idx["samples"]}
+    restored = 0
+    skipped = 0
+    for rec in records:
+        sample = by_id.get(rec.get("id"))
+        if sample is None:
+            skipped += 1
+            continue
+        sample["sensors"] = rec.get("sensors")
+        restored += 1
+    if restored:
+        _save_ai_training_index(idx)
+    return restored, skipped
+
+
+def _ai_classify_resized_images_backup_zip():
+    """In-memory .zip of every currently-compressed ('image_compressed')
+    sample's resized image, one folder per label like the main export -
+    the "Download resized images" backup for the Cloud Image Model card.
+    Returns (zip_bytes_io, image_count)."""
+    idx = _load_ai_training_index()
+    buf = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for sample in idx["samples"]:
+            if not sample.get("image_compressed") or not sample.get("image"):
+                continue
+            src = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+            if not os.path.isfile(src):
+                continue
+            folder = _safe_export_folder_name(sample.get("label") or "Unlabeled")
+            zf.write(src, arcname=f"{folder}/{sample['id']}.jpg")
+            count += 1
+    buf.seek(0)
+    return buf, count
+
+
+def _ai_classify_delete_resized_images():
+    """Deletes every currently-compressed sample's image file from disk and
+    clears the record's image/image_compressed fields - keeps the label
+    and sensor reading either way (same "purge the heavy part, keep the
+    curated record" philosophy as _ai_classify_delete_sensor_data()
+    above). Paired with "Download resized images" above so this is always
+    reversible from a zip you kept. Returns the number of images
+    removed."""
+    idx = _load_ai_training_index()
+    removed = 0
+    for sample in idx["samples"]:
+        if not sample.get("image_compressed") or not sample.get("image"):
+            continue
+        try:
+            path = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"[ai-learning] failed to remove resized image {sample.get('image')}: {e}")
+        sample["image"] = None
+        sample["image_compressed"] = False
+        removed += 1
+    if removed:
+        _save_ai_training_index(idx)
+    return removed
+
+
+def _ai_classify_restore_resized_images(zip_bytes):
+    """Restores resized images from a zip previously produced by
+    _ai_classify_resized_images_backup_zip(), matching each image back to
+    its original sample by the id in its filename (<folder>/<id>.jpg). A
+    sample id no longer present in the index, or one that already has an
+    image, is skipped rather than overwritten. Raises ValueError on a zip
+    that can't be read at all. Returns (restored, skipped)."""
+    idx = _load_ai_training_index()
+    by_id = {s["id"]: s for s in idx["samples"]}
+    restored = 0
+    skipped = 0
+    os.makedirs(AI_TRAINING_IMAGES_DIR, exist_ok=True)
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".jpg"):
+                    continue
+                stem = os.path.splitext(os.path.basename(name))[0]
+                sample = by_id.get(stem)
+                if sample is None or sample.get("image"):
+                    skipped += 1
+                    continue
+                fname = f"{stem}.jpg"
+                with zf.open(name) as src, open(os.path.join(AI_TRAINING_IMAGES_DIR, fname), "wb") as dst:
+                    dst.write(src.read())
+                sample["image"] = fname
+                sample["image_compressed"] = True
+                restored += 1
+    except KeyError:
+        pass  # a namelist entry vanished between listing and opening - ignore, not fatal
+    except Exception as e:
+        raise ValueError(f"Not a valid resized-images backup zip: {e}")
+    if restored:
+        _save_ai_training_index(idx)
+    return restored, skipped
+
+
+def _ai_classify_fullsize_backup_zip():
+    """In-memory .zip of every classified sample's FULL-RESOLUTION image
+    (i.e. NOT already compressed), one folder per label - the pre-delete
+    backup for "Delete classified full-size images" below. Returns
+    (zip_bytes_io, image_count)."""
+    idx = _load_ai_training_index()
+    buf = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for sample in idx["samples"]:
+            if not sample.get("label") or not sample.get("image") or sample.get("image_compressed"):
+                continue
+            src = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+            if not os.path.isfile(src):
+                continue
+            folder = _safe_export_folder_name(sample["label"])
+            zf.write(src, arcname=f"{folder}/{sample['id']}.jpg")
+            count += 1
+    buf.seek(0)
+    return buf, count
+
+
+def _ai_classify_delete_fullsize_images():
+    """Deletes the full-resolution image for every classified sample that
+    still has one (skips samples already compressed - see "Delete resized
+    images" above for those instead), keeping the label and sensor
+    reading either way. This is the CHANGED behavior of what used to be
+    "Delete ALL classified images" (which removed the whole record) - it
+    now only ever removes the image file, never the record. No
+    upload/restore counterpart for this one: these full-resolution images
+    only ever feed the AI Cloud Detect (cloud training) upload, and once
+    that's done there's nothing to restore them into - unlike the local
+    AI Model's sensor records and the Cloud Image Model's resized images
+    above, which stay useful (and thus worth restoring) indefinitely.
+    Returns the number of images removed."""
+    idx = _load_ai_training_index()
+    removed = 0
+    for sample in idx["samples"]:
+        if not sample.get("label") or not sample.get("image") or sample.get("image_compressed"):
+            continue
+        try:
+            path = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"[ai-learning] failed to remove full-size image {sample.get('image')}: {e}")
+        sample["image"] = None
+        removed += 1
+    if removed:
+        _save_ai_training_index(idx)
+    return removed
+
+
+@app.route("/ai-classify-backup-sensor-data", methods=["GET"])
+def ai_classify_backup_sensor_data():
+    """Downloads the local AI Model card's "Download sensor data /
+    records" backup zip - always available (not just as a pre-delete
+    step), so it can also just be a routine backup."""
+    buf, count = _ai_classify_sensor_backup_zip()
+    if count == 0:
+        return ("No sensor data to back up yet.", 400)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                      download_name=f"ai_sensor_data_{stamp}.zip")
+
+
+@app.route("/ai-classify-delete-sensor-data", methods=["GET"])
+def ai_classify_delete_sensor_data():
+    """The local AI Model card's "Delete sensor data / records" action."""
+    cleared = _ai_classify_delete_sensor_data()
+    if cleared:
+        _log_event("Settings", f"AI Learning: cleared sensor data from {cleared} classified sample(s)")
+    return jsonify({"ok": True, "cleared": cleared})
+
+
+@app.route("/ai-classify-upload-sensor-data", methods=["POST"])
+def ai_classify_upload_sensor_data():
+    """Restores sensor data from a zip produced by the backup route above -
+    the local AI Model card's "Upload sensor data / records" action."""
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "No file uploaded"})
+    try:
+        restored, skipped = _ai_classify_restore_sensor_data(f.read())
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if restored:
+        _log_event("Settings", f"AI Learning: restored sensor data for {restored} sample(s) from an uploaded zip")
+    return jsonify({"ok": True, "restored": restored, "skipped": skipped})
+
+
+@app.route("/ai-classify-backup-resized-images", methods=["GET"])
+def ai_classify_backup_resized_images():
+    """Downloads the Cloud Image Model card's "Download resized images"
+    backup zip - always available, same reasoning as the sensor-data
+    backup route above."""
+    buf, count = _ai_classify_resized_images_backup_zip()
+    if count == 0:
+        return ("No resized images to back up yet.", 400)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                      download_name=f"ai_resized_images_{stamp}.zip")
+
+
+@app.route("/ai-classify-delete-resized-images", methods=["GET"])
+def ai_classify_delete_resized_images():
+    """The Cloud Image Model card's "Delete resized images" action."""
+    removed = _ai_classify_delete_resized_images()
+    if removed:
+        _log_event("Settings", f"AI Learning: deleted {removed} resized image(s)")
+    return jsonify({"ok": True, "deleted": removed})
+
+
+@app.route("/ai-classify-upload-resized-images", methods=["POST"])
+def ai_classify_upload_resized_images():
+    """Restores resized images from a zip produced by the backup route
+    above - the Cloud Image Model card's "Upload resized images" action."""
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "No file uploaded"})
+    try:
+        restored, skipped = _ai_classify_restore_resized_images(f.read())
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if restored:
+        _log_event("Settings", f"AI Learning: restored {restored} resized image(s) from an uploaded zip")
+    return jsonify({"ok": True, "restored": restored, "skipped": skipped})
+
+
+@app.route("/ai-classify-compress-trained", methods=["GET"])
+def ai_classify_compress_trained():
+    """The Classify page's "Compress already-trained images" backlog
+    button - see _compress_trained_backlog_images()'s docstring."""
+    compressed, error = _compress_trained_backlog_images()
+    if error:
+        return jsonify({"ok": False, "error": error})
+    if compressed:
+        _log_event("Settings", f"AI Learning: compressed {compressed} already-trained image(s) to save space")
+    return jsonify({"ok": True, "compressed": compressed})
+
+
 @app.route("/ai-classify-delete-classified", methods=["GET"])
 def ai_classify_delete_classified():
-    """Permanently deletes every currently-labeled sample (image + record),
-    leaving unlabeled ones untouched - the Classify page's "Delete ALL
-    classified images" action, for starting a training set over (e.g.
-    after a labeling mistake) without also losing whatever's still
-    waiting to be classified."""
-    idx = _load_ai_training_index()
-    ids = [s["id"] for s in idx["samples"] if s.get("label")]
-    removed = _delete_ai_training_samples(ids)
+    """CHANGED: this used to permanently delete every currently-labeled
+    sample (image + record) - the Classify page's "Delete ALL classified
+    images" action. It's now "Delete classified full-size images": it
+    only removes the FULL-RESOLUTION image file for samples that still
+    have one (skipping ones already compressed - see
+    /ai-classify-delete-resized-images for those), keeping every record
+    (label + sensor reading) intact either way. See
+    _ai_classify_delete_fullsize_images()'s docstring for why there's no
+    upload/restore counterpart for this one."""
+    removed = _ai_classify_delete_fullsize_images()
     if removed:
-        _log_event("Settings", f"AI Learning: deleted all {removed} classified sample(s)")
+        _log_event("Settings", f"AI Learning: deleted {removed} classified full-size image(s) (records were kept)")
     idx = _load_ai_training_index()
     return jsonify({"ok": True, "deleted": removed,
                      "unlabeled_count": sum(1 for s in idx["samples"] if s.get("label") is None),
@@ -6927,6 +7396,11 @@ def ai_classify_page():
     all_samples = idx["samples"]
     total_count = len(all_samples)
     unlabeled_count = sum(1 for s in all_samples if s.get("label") is None)
+    # Same plain directory stat shown under Settings -> AI Learning, also
+    # surfaced here since this is where you'd actually act on it
+    # (compress/delete/download) rather than just read about it.
+    ai_images_count, ai_images_bytes = _ai_training_images_folder_stats()
+    ai_images_size_str = _format_size_general(ai_images_bytes)
 
     filtered = list(all_samples) if show == "all" else [s for s in all_samples if s.get("label") is None]
     # Newest first - the most recent capture is what you actually want to
@@ -7034,13 +7508,71 @@ def ai_classify_page():
     export_html = (f'<a class="btn" href="/ai-classify-export">Download labeled images (.zip)</a>'
                    if total_labeled else
                    '<span class="btn ai-nav-btn-disabled">Download labeled images (.zip)</span>')
+    # CHANGED: this used to delete the whole record (image + label + sensor
+    # snapshot) for every classified sample - see _ai_classify_delete_
+    # fullsize_images()'s docstring for why it now only ever removes the
+    # FULL-RESOLUTION image (skipping ones already compressed - those have
+    # their own "Delete resized images" action next to the cloud model
+    # card above), keeping every record intact either way.
+    fullsize_delete_count = sum(1 for s in all_samples
+                                 if s.get("label") and s.get("image") and not s.get("image_compressed"))
     delete_all_html = (f'<button type="button" class="btn ai-delete-btn" '
-                        f'onclick="deleteAllClassified({total_labeled})">Delete ALL classified images</button>'
-                        if total_labeled else
-                        '<span class="btn ai-nav-btn-disabled">Delete ALL classified images</span>')
+                        f'onclick="deleteClassifiedFullSize({fullsize_delete_count})">'
+                        f'Delete classified full-size images</button>'
+                        if fullsize_delete_count else
+                        '<span class="btn ai-nav-btn-disabled">Delete classified full-size images</span>')
+    # Manual backlog action for samples absorbed before this feature existed
+    # (or while "Keep full resolution Images" was on) - see
+    # _compress_trained_backlog_images()'s docstring for why it's a no-op
+    # while that toggle is currently on.
+    compress_trained_count = sum(1 for s in all_samples
+                                  if s.get("cloud_trained_at") and s.get("image")
+                                  and not s.get("image_compressed"))
+    compress_html = (f'<button type="button" class="btn" onclick="compressTrained()">'
+                      f'Compress already-trained images</button>'
+                      if compress_trained_count else
+                      '<span class="btn ai-nav-btn-disabled">Compress already-trained images</span>')
     eligibility_html = "".join(
         f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
+    # Same per-label breakdown as the local model's eligibility_html above,
+    # but without a "/N" minimum - there's no configured per-class training
+    # floor for the cloud-trained model the way AI_MODEL_MIN_SAMPLES_PER_
+    # CLASS is for the local one.
+    cloud_eligibility_html = "".join(
+        f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}</span>'
+        for c in label_classes) or "<span class='hint'>No labels configured.</span>"
+
+    # "Delete sensor data / records" (local AI Model card) - clears just the
+    # sensor snapshot from a classified sample, keeping its label/image
+    # intact, so the local model's raw training rows can be purged
+    # independently of anything image-related. Always reversible from a
+    # zip via "Download sensor data / records" below.
+    sensor_records_count = sum(1 for s in all_samples if s.get("label") and s.get("sensors"))
+    sensor_data_delete_html = (
+        f'<button type="button" class="btn ai-delete-btn" '
+        f'onclick="deleteSensorData({sensor_records_count})">Delete sensor data / records</button>'
+        if sensor_records_count else
+        '<span class="btn ai-nav-btn-disabled">Delete sensor data / records</span>')
+    sensor_data_download_html = (
+        '<a class="btn" href="/ai-classify-backup-sensor-data">Download sensor data / records (.zip)</a>'
+        if sensor_records_count else
+        '<span class="btn ai-nav-btn-disabled">Download sensor data / records (.zip)</span>')
+
+    # "Delete resized images" (Cloud Image Model card) - deletes only the
+    # already-compressed copies (image_compressed=True), keeping label +
+    # sensor reading. Always reversible from a zip via "Download resized
+    # images" below.
+    resized_images_count = sum(1 for s in all_samples if s.get("image_compressed") and s.get("image"))
+    resized_images_delete_html = (
+        f'<button type="button" class="btn ai-delete-btn" '
+        f'onclick="deleteResizedImages({resized_images_count})">Delete resized images</button>'
+        if resized_images_count else
+        '<span class="btn ai-nav-btn-disabled">Delete resized images</span>')
+    resized_images_download_html = (
+        '<a class="btn" href="/ai-classify-backup-resized-images">Download resized images (.zip)</a>'
+        if resized_images_count else
+        '<span class="btn ai-nav-btn-disabled">Download resized images (.zip)</span>')
 
     ai_model = _load_ai_sky_model()
     reset_model_html = (f'<button type="button" class="btn ai-delete-btn" '
@@ -7166,8 +7698,9 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .toolbar{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}}
 .toolbar select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
 .ai-label-btn{{background:var(--info);}}
+.ai-upload-btn{{background:var(--info);}}
 .ai-nav-btn-disabled{{background:#c7cdd2;cursor:default;}}
-#classifyStatus,#trainStatus{{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}}
+#classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}}
 .ai-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}}
 .ai-card{{background:#fafbfc;border-radius:10px;padding:8px;position:relative;}}
 .ai-card-select{{display:block;cursor:pointer;}}
@@ -7199,34 +7732,51 @@ a{{color:var(--accent);}}
 <a href="/logs">🗒 Logs</a></p>
 
 <div class="card">
+  <p class="hint" style="margin:0;">Samples collected so far: <b>{total_count}</b>
+  ({unlabeled_count} not yet classified) — training images folder: <b>{ai_images_size_str}</b>
+  across {ai_images_count} image(s).</p>
+</div>
+
+<div class="card">
   <p class="hint" id="modelStatus">{model_status_html}</p>
   <p class="hint">Classified so far, per label (need at least {AI_MODEL_MIN_SAMPLES_PER_CLASS} of each to
   train): {eligibility_html}</p>
   <button type="button" class="btn" onclick="trainModel()">Train model now</button>
   {reset_model_html}
-  <p id="trainStatus"></p>
+  {sensor_data_delete_html}
+  {sensor_data_download_html}
+  <label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor data / records (.zip)</label>
+  <input type="file" id="sensorDataUploadInput" accept=".zip" style="display:none" onchange="uploadSensorData(this)">
+  <p id="trainStatus" class="hint"></p>
+  <p id="sensorDataStatus" class="hint"></p>
 </div>
 
 <div class="card">
   <p class="hint" id="cloudModelStatus">{cloud_model_status_html}</p>
+  <p class="hint">Classified so far, per label: {cloud_eligibility_html}</p>
   {"" if cloud_server_configured else
    '<p class="hint">Set a cloud training server URL and API key under '
    '<a href="/#ai-learning-settings">Settings → AI Learning</a> first '
    '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
   {cloud_train_button_html}
   {cloud_reset_button_html}
+  {resized_images_delete_html}
+  {resized_images_download_html}
+  <label class="btn ai-upload-btn" for="resizedImagesUploadInput">Upload resized images (.zip)</label>
+  <input type="file" id="resizedImagesUploadInput" accept=".zip" style="display:none" onchange="uploadResizedImages(this)">
   {cloud_cancel_button_html}
   <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
   <p class="hint">{cloud_new_count} labeled sample(s) not yet absorbed into a successful cloud training run.
   {"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
   <a href="/#ai-learning-settings">Settings → AI Learning</a> to change it.</p>
+  <p id="resizedImagesStatus" class="hint"></p>
 </div>
 
 <div class="card">
   <p class="hint">{total_labeled} labeled sample(s) total, across {len(classified_counts)} label(s). Bundles
   as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
   your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
-  <div class="toolbar">{export_html}{delete_all_html}</div>
+  <div class="toolbar">{export_html}{compress_html}{delete_all_html}</div>
 </div>
 
 <div class="card">
@@ -7367,10 +7917,11 @@ function deleteSelected() {{
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
 }}
-function deleteAllClassified(count) {{
+function deleteClassifiedFullSize(count) {{
   if (!count) return;
-  if (!confirm('Delete ALL ' + count + ' classified image(s)? This cannot be undone and does not ' +
-               'affect unclassified samples.')) return;
+  if (!confirm('Delete ' + count + ' classified full-size image(s)? This only removes the image file - ' +
+               'labels and sensor readings are kept, and this cannot be undone unless you have a backup ' +
+               'zip. Tip: use "Download labeled images" above first if you have not already.')) return;
   const status = document.getElementById('classifyStatus');
   status.textContent = 'Deleting...';
   fetch('/ai-classify-delete-classified')
@@ -7380,10 +7931,103 @@ function deleteAllClassified(count) {{
         status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
         return;
       }}
-      status.textContent = 'Deleted ' + data.deleted + ' classified image(s). Reloading...';
+      status.textContent = 'Deleted ' + data.deleted + ' full-size image(s). Reloading...';
       window.location.reload();
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
+}}
+function compressTrained() {{
+  const status = document.getElementById('trainStatus');
+  status.textContent = 'Compressing...';
+  fetch('/ai-classify-compress-trained')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to compress: unknown error';
+        return;
+      }}
+      status.textContent = 'Compressed ' + data.compressed + ' already-trained image(s). Reload this page ' +
+        'to see the updated folder size.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to compress: ' + err; }});
+}}
+function deleteSensorData(count) {{
+  if (!count) return;
+  if (!confirm('Clear sensor data from ' + count + ' classified sample(s)? Labels and images are kept, ' +
+               'and this cannot be undone unless you have a backup zip. Tip: use "Download sensor data / ' +
+               'records" first if you have not already.')) return;
+  const status = document.getElementById('sensorDataStatus');
+  status.textContent = 'Clearing...';
+  fetch('/ai-classify-delete-sensor-data')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to clear: unknown error';
+        return;
+      }}
+      status.textContent = 'Cleared sensor data from ' + data.cleared + ' sample(s). Reload this page to ' +
+        'see the updated counts.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed: ' + err; }});
+}}
+function uploadSensorData(input) {{
+  const file = input.files[0];
+  if (!file) return;
+  const status = document.getElementById('sensorDataStatus');
+  status.textContent = 'Uploading...';
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/ai-classify-upload-sensor-data', {{ method: 'POST', body: fd }})
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to restore: unknown error';
+        return;
+      }}
+      status.textContent = 'Restored sensor data for ' + data.restored + ' sample(s)' +
+        (data.skipped ? (', skipped ' + data.skipped + ' (record no longer exists)') : '') + '.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to restore: ' + err; }})
+    .finally(() => {{ input.value = ''; }});
+}}
+function deleteResizedImages(count) {{
+  if (!count) return;
+  if (!confirm('Delete ' + count + ' resized image(s)? Labels and sensor readings are kept, and this ' +
+               'cannot be undone unless you have a backup zip. Tip: use "Download resized images" first ' +
+               'if you have not already.')) return;
+  const status = document.getElementById('resizedImagesStatus');
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete-resized-images')
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed: unknown error';
+        return;
+      }}
+      status.textContent = 'Deleted ' + data.deleted + ' resized image(s). Reload this page to see the ' +
+        'updated folder size.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed: ' + err; }});
+}}
+function uploadResizedImages(input) {{
+  const file = input.files[0];
+  if (!file) return;
+  const status = document.getElementById('resizedImagesStatus');
+  status.textContent = 'Uploading...';
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/ai-classify-upload-resized-images', {{ method: 'POST', body: fd }})
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = data.error || 'Failed to restore: unknown error';
+        return;
+      }}
+      status.textContent = 'Restored ' + data.restored + ' resized image(s)' +
+        (data.skipped ? (', skipped ' + data.skipped) : '') + '.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to restore: ' + err; }})
+    .finally(() => {{ input.value = ''; }});
 }}
 function applyLabelSingle(label) {{
   const card = document.getElementById('singleCard');
