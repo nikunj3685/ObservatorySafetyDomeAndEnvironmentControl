@@ -57,6 +57,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -5072,10 +5073,20 @@ def _safety_favicon_href(is_safe):
     on disk, since there's nothing to cache/serve - it's regenerated fresh
     from whatever `is_safe` the caller already has on hand (initial page
     render), and updated client-side (see the dashboard's poll() JS, which
-    swaps this same href every /fragments cycle) without a page reload."""
-    color = "%231a7f37" if is_safe else "%23c62828"  # --safe / --unsafe, URL-encoded '#'
-    return (f'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-            f'<circle cx="16" cy="16" r="14" fill="{color}"/></svg>')
+    swaps this same href every /fragments cycle) without a page reload.
+
+    Fully percent-encoded (urllib.parse.quote, safe="") rather than embedding
+    the raw SVG markup - the raw form's own double quotes (xmlns="...",
+    fill="...") would otherwise break out of this same string's HTML
+    attribute context (href="...") in the <head> AND its JS single-quoted
+    string context (var FAVICON_SAFE='...') in poll()'s script, spilling
+    literal markup like an orphaned '">' onto the rendered page. Percent-
+    encoding leaves no literal quote, angle-bracket, or space characters at
+    all, so the exact same string is safe to embed in both places."""
+    color = "#1a7f37" if is_safe else "#c62828"  # --safe / --unsafe
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+           f'<circle cx="16" cy="16" r="14" fill="{color}"/></svg>')
+    return "data:image/svg+xml," + urllib.parse.quote(svg, safe="")
 
 
 def _status_dot(effective_pass, enabled, tooltip_off, tooltip_ok, tooltip_fail, neutral_when_disabled=False):
