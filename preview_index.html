@@ -1,4 +1,5 @@
 <!DOCTYPE html><html><head><title>Observatory Control</title>
+<link rel="icon" id="safetyFavicon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%231a7f37%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%231a7f37%22%2F%3E%3Cpath%20d%3D%22M20%2033%20L27%2041%20L45%2020%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{
@@ -147,11 +148,11 @@ a{color:var(--accent-safety);}
 </style></head><body>
 
 <h1>🔭 Observatory Control</h1>
-<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (<span id="classifyCount">2</span>)</a></p>
-
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (<span id="classifyCount">0</span>)</a></p>
+<div class='banner banner-warn top-banner'>📍 <b>Location not set</b> — latitude/longitude are still at the 0&deg;,0&deg; placeholder, so the Day/Night sun-elevation gate is computing nonsense for your actual site. <a href='#settings'>Set your real coordinates in Settings</a>.</div>
 <div class="grid">
 <div class="card safety full-width">
-  <h2><span class="title">🛡️ Safety Monitor <span id="safeState" class="badge badge-unsafe">UNSAFE</span></span></h2>
+  <h2><span class="title">🛡️ Safety Monitor <span id="safeState" class="badge badge-safe">SAFE</span></span></h2>
   <p class="hold-countdown" id="safeHoldCountdown" hidden>⏳ Conditions clear — reporting SAFE in <b id="safeHoldTime">0:00</b></p>
   <p class="override-label" id="overrideLabel">Mode: Auto (sensor-based)</p>
   <div class="btn-row">
@@ -161,16 +162,18 @@ a{color:var(--accent-safety);}
   </div>
   <div id="warningBanner"><div class='banner banner-warn'>⚠️ <b>REDUCED SAFETY CHECKS:</b> Rain disabled &mdash; see <a href='/config'>Settings</a></div></div>
   <hr class="sep">
-  <div id="daynightBlock"><p class="field field-grid muted"><span class="col-dot"></span><span class="col-icon">🕐</span><span class="col-text">Wednesday, September 23, 2026 12:30:00 P.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-unsafe" title="Day/Night check: FAILING — it's daytime (sun elevation 49.5&deg; &gt; threshold -12.0&deg;)."></span></span><span class="col-icon">☀️</span><span class="col-text"><b>Daytime</b> <span class='muted'>(sun elevation 49.5&deg;, threshold -12.0&deg;)</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Dusk <b>07:50 P.M.</b> &nbsp;&middot;&nbsp; Dawn <b>05:46 A.M.</b></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Daytime</b> at 2026-09-23 07:30 A.M.</span></p></div>
+  <div id="daynightBlock"><p class="field field-grid muted"><span class="col-dot"></span><span class="col-icon">🕐</span><span class="col-text">Tuesday, September 29, 2026 09:55:30 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Day/Night check: passing."></span></span><span class="col-icon">☀️</span><span class="col-text"><b>Daytime</b> <span class='muted'>(sun elevation 58.6&deg;, threshold -12.0&deg;)</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Dusk <b>02:38 P.M.</b> &nbsp;&middot;&nbsp; Dawn <b>01:02 A.M.</b></span></p></div>
   <hr class="sep">
-  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="MLX90614 clear-sky check: passing — ambient-vs-sky delta indicates Clear."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>-14.2&deg;C</b> &nbsp;
+  <div id="envReadings"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="MLX90614 clear-sky check: passing — ambient-vs-sky delta indicates Clear."></span></span><span class="col-icon">🌌</span><span class="col-text">Sky: 🌡️ <b>-10.2&deg;C</b> &nbsp;
   <span class="muted">BME280:</span> <b>18.4&deg;C</b> &nbsp;
-  🌬️ <b>8.5&deg;C</b>
-  (Clear, &Delta; 32.6&deg;C)
-  <span class="tag">MLX90614</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Cloudy</b> at 2026-09-23 10:30 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-neutral" title="AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts Clear)."></span></span><span class="col-icon">🤖</span><span class="col-text">Model prediction: <b>Clear</b>
-  <span class="muted">(trained on 10 classified samples on the
-  <a href="/ai-classify">Classify page</a> - informational only, not used in the SAFE/UNSAFE decision)</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>WET</b> at 2026-09-23 09:30 A.M.</span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Simple Cloud Detect ML check: passing — reports Clear and is reachable."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Clear</b> <span class="muted">(1%)</span>
-  &nbsp; <a href="http://localhost:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><p class="field field-grid prev-status"><span class="col-dot"></span><span class="col-icon"></span><span class="col-text">Previously <b>Overcast</b> at 2026-09-23 11:00 A.M.</span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>18.4&deg;C</b> &nbsp;
+  🌬️ <b>17.9&deg;C</b>
+  (Clear, &Delta; 28.6&deg;C)
+  <span class="tag">MLX90614</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="AI Model check: passing — model predicts Clear."></span></span><span class="col-icon">🤖</span><span class="col-text">AI Sky Prediction(Sensor Based): <b>Clear</b>
+  <span class="muted">(trained on 342 classified samples on the
+  <a href="/ai-classify">Classify page</a> - actively contributing to the SAFE/UNSAFE decision)</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Cloud Image Model check: passing — model predicts Clear."></span></span><span class="col-icon">📷</span><span class="col-text">AI Cloud Detect(All Sky): <b>Clear</b> (93%)
+  <span class="muted">(trained on 18 classified samples on the
+  <a href="/ai-classify">Classify page</a> - actively contributing to the SAFE/UNSAFE decision)</span></span></p><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-safe" title="Simple Cloud Detect ML check: passing — reports Clear and is reachable."></span></span><span class="col-icon">☁️</span><span class="col-text">Simple Cloud Detect: <b>Clear</b> <span class="muted">(88%)</span>
+  &nbsp; <a href="http://localhost:11111/setup/v1/safetymonitor/0/setup" target="_blank" rel="noopener">View cloud detect &rarr;</a></span></p><hr class="sep"><p class="field field-grid"><span class="col-dot"><span class="status-dot dot-neutral" title="Rain check: disabled — not currently used in the SAFE/UNSAFE decision (RG-9 currently reads DRY)."></span></span><span class="col-icon">☔</span><span class="col-text">Rain: <b>DRY</b> <span class="tag">RG-9</span> <span class="muted">(disabled)</span></span></p><hr class="sep"><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">🌤️</span><span class="col-text">Environment: 🌡️ <b>18.4&deg;C</b> &nbsp;
   💧 <b>55.2%</b> &nbsp;
   🎚️ <b>1012 hPa</b>
   <span class="tag">BME280</span></span></p><p class="field field-grid"><span class="col-dot"></span><span class="col-icon">📦</span><span class="col-text">Box: 🌡️ <b>19.8&deg;C</b> &nbsp;
@@ -183,7 +186,7 @@ a{color:var(--accent-safety);}
 
 
 <div class="card dome" id="dome">
-  <h2><span class="title">🚪 Dome <span id="domeState" class="badge badge-open">OPEN</span></span></h2>
+  <h2><span class="title">🚪 Dome <span id="domeState" class="badge badge-fault">UNKNOWN</span></span></h2>
   
   
   
@@ -269,8 +272,8 @@ a{color:var(--accent-safety);}
   <div class="settings-group" id="location-timezone">
     <h3>Location &amp; Timezone</h3>
     <form action="/save-location" method="get">
-      <label>Latitude (deg, north +)</label><input type="text" name="lat" value="40.0">
-      <label>Longitude (deg, east +)</label><input type="text" name="lon" value="-74.0">
+      <label>Latitude (deg, north +)</label><input type="text" name="lat" value="0.0">
+      <label>Longitude (deg, east +)</label><input type="text" name="lon" value="0.0">
       <label>Timezone</label><select name="tz"><option value='UTC'>UTC</option><option value='America/New_York' selected>America/New_York</option><option value='America/Chicago'>America/Chicago</option><option value='America/Denver'>America/Denver</option><option value='America/Phoenix'>America/Phoenix</option><option value='America/Los_Angeles'>America/Los_Angeles</option><option value='America/Anchorage'>America/Anchorage</option><option value='Pacific/Honolulu'>Pacific/Honolulu</option><option value='America/Halifax'>America/Halifax</option><option value='America/St_Johns'>America/St_Johns</option><option value='America/Mexico_City'>America/Mexico_City</option><option value='America/Sao_Paulo'>America/Sao_Paulo</option><option value='America/Argentina/Buenos_Aires'>America/Argentina/Buenos_Aires</option><option value='Europe/London'>Europe/London</option><option value='Europe/Paris'>Europe/Paris</option><option value='Europe/Athens'>Europe/Athens</option><option value='Atlantic/Reykjavik'>Atlantic/Reykjavik</option><option value='Europe/Moscow'>Europe/Moscow</option><option value='Africa/Lagos'>Africa/Lagos</option><option value='Africa/Nairobi'>Africa/Nairobi</option><option value='Africa/Johannesburg'>Africa/Johannesburg</option><option value='Asia/Dubai'>Asia/Dubai</option><option value='Asia/Riyadh'>Asia/Riyadh</option><option value='Europe/Istanbul'>Europe/Istanbul</option><option value='Asia/Kolkata'>Asia/Kolkata</option><option value='Asia/Karachi'>Asia/Karachi</option><option value='Asia/Dhaka'>Asia/Dhaka</option><option value='Asia/Kathmandu'>Asia/Kathmandu</option><option value='Asia/Shanghai'>Asia/Shanghai</option><option value='Asia/Tokyo'>Asia/Tokyo</option><option value='Asia/Seoul'>Asia/Seoul</option><option value='Asia/Singapore'>Asia/Singapore</option><option value='Asia/Jakarta'>Asia/Jakarta</option><option value='Asia/Bangkok'>Asia/Bangkok</option><option value='Asia/Manila'>Asia/Manila</option><option value='Australia/Sydney'>Australia/Sydney</option><option value='Australia/Brisbane'>Australia/Brisbane</option><option value='Australia/Adelaide'>Australia/Adelaide</option><option value='Australia/Perth'>Australia/Perth</option><option value='Pacific/Auckland'>Pacific/Auckland</option></select>
       <p class="hint">Night threshold and clear-sky delta thresholds have moved to
       <a href="#safety-checks">Safety Checks</a> below, next to the checks they control.</p>
@@ -318,11 +321,17 @@ a{color:var(--accent-safety);}
       the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
       classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
       (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
-      <label><input type="checkbox" name="aiModelEnable" > AI Model check</label>
+      <label><input type="checkbox" name="aiModelEnable" checked> AI Model check</label>
       <p class="hint">Include the trained AI model's prediction in the SAFE/UNSAFE decision. Falls back to
       the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
       predict from. Train the model and set which predicted labels count as SAFE on the
       <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
+      <label><input type="checkbox" name="cloudModelEnable" checked> Cloud Image Model check</label>
+      <p class="hint">Include the cloud-trained image model's prediction in the SAFE/UNSAFE decision. Falls
+      back to the other enabled checks above whenever no model has been downloaded yet, tflite-runtime isn't
+      installed on this Pi, or there's no current All Sky frame to classify. Train it via the cloud training
+      server and set which predicted labels count as SAFE on the <a href="#ai-learning-settings">AI
+      Learning</a> settings below (shares the same SAFE-labels list as the AI Model check above).</p>
       <label><input type="checkbox" name="safedelay" > Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="5">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
@@ -347,7 +356,7 @@ a{color:var(--accent-safety);}
        checked> Take images with logs</label>
       <p class="hint">Master switch for every image below — while off, NO log entry ever gets an All Sky
       snapshot attached, regardless of the per-event settings underneath. Turn it back on to go back to
-      whatever those five were already set to.</p>
+      whatever those seven were already set to.</p>
       <fieldset id="imgPerEventFields" >
       <p class="hint">Attach an All Sky snapshot to the log entry when each of these changes. Handy for
       checking "what did the sky actually look like when this changed" while a new setup is being shaken
@@ -365,6 +374,12 @@ a{color:var(--accent-safety);}
         <label><input type="checkbox" name="imgMlcloud" checked> ML cloud detection change</label>
       </div>
       <div class="setting-row">
+        <label><input type="checkbox" name="imgAiModel" checked> AI Sky Prediction(Sensor Based) change</label>
+      </div>
+      <div class="setting-row">
+        <label><input type="checkbox" name="imgCloudModel" checked> AI Cloud Detect(All Sky) change</label>
+      </div>
+      <div class="setting-row">
         <label><input type="checkbox" name="imgOverall" checked> Overall SAFE/UNSAFE change</label>
       </div>
       </fieldset>
@@ -374,6 +389,8 @@ a{color:var(--accent-safety);}
     <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
     unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
     nothing left to show.</p>
+    <p class="hint">Log images folder: <b id="logImagesSize">768.5 KB</b> across
+    <span id="logImagesCount">4</span> image(s).</p>
     <div class="btn-row">
       <button type="button" class="btn btn-unsafe"
        onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
@@ -555,8 +572,16 @@ a{color:var(--accent-safety);}
     <a href="/ai-classify">Classify page</a>, then train a model there once you have enough labeled
     samples of at least two labels.</p>
     <form action="/save-ai-learning" method="get">
-      <label><input type="checkbox" name="aiLearningEnable" checked>
+      <label><input type="checkbox" name="aiLearningEnable" >
       Enable AI Learning data capture</label>
+      <label><input type="checkbox" name="keepFullResImages" checked>
+      Keep full resolution Images</label>
+      <p class="hint">On (default): once a sample is absorbed into a successful AI Cloud Detect training run,
+      its full-resolution image is left exactly as it is. Off: instead of deleting it, the image is replaced
+      in place with a smaller compressed copy — still viewable and downloadable on the
+      <a href="/ai-classify">Classify page</a> — nothing is ever silently deleted outright. Turning this off
+      does not by itself touch any backlog of already-absorbed full-resolution images — use "Compress
+      already-trained images" on the <a href="/ai-classify">Classify page</a> for those.</p>
       <label>Capture interval (minutes)</label>
       <input type="number" name="aiCaptureIntervalMin" min="1" value="15" class="narrow-number">
       <label>Keep UNLABELED samples for this many days (0 = never auto-delete)</label>
@@ -572,12 +597,37 @@ a{color:var(--accent-safety);}
       with — this section only configures the model itself.</p>
       <label>Predicted labels that count as SAFE (comma-separated, case-insensitive)</label>
       <input type="text" name="aiSafeLabels" value="Clear" placeholder="e.g. Clear">
-      <p class="hint">Off — a trained model (if any) still shows on the dashboard for comparison only and never affects the SAFE/UNSAFE decision. Enable it under <a href="#safety-checks">Settings → Safety Checks</a>.</p>
+      <p class="hint">Active — currently predicting <b>Clear</b>, trained on 342 classified samples.</p>
+      <hr>
+      <p class="hint">Cloud-trained image model — a separate, standalone server (see
+      <code>cloud-training-server/</code> in this repo) that trains a real image classifier from these same
+      labeled samples. Kick off training and see its status on the <a href="/ai-classify">Classify page</a>
+      once these are set. The SAFE-labels list above is shared with this model too.</p>
+      <label>Cloud training server URL</label>
+      <input type="text" name="cloudServerUrl" value="" placeholder="http://192.168.1.50:8787/">
+      <label>Cloud training server API key</label>
+      <input type="text" name="cloudApiKey" value="" placeholder="(from that machine's install.ps1 summary)">
+      <p class="hint">Active — currently predicting <b>Clear</b>, trained on 18 classified samples.</p>
+      <label><input type="checkbox" name="autoTrainEnable" >
+      Auto-train automatically (cloud image model + local AI Model together)</label>
+      <p class="hint">When on, this checks every few minutes and starts a new cloud training job (uploading
+      only the newly labeled samples since the last run - see the incremental training note in
+      <code>cloud-training-server/README.md</code>) once enough have piled up, and refits the local AI Model
+      at the same time. Off by default since it means unattended network uploads to the server URL above -
+      the manual "Train via cloud server"/"Train model now" buttons on the
+      <a href="/ai-classify">Classify page</a> always work regardless of this setting.</p>
+      <label>Minimum newly labeled samples before auto-training</label>
+      <input type="number" name="autoTrainMinNewSamples" min="1" value="20" class="narrow-number">
+      <label>Minimum hours between auto-train attempts</label>
+      <input type="number" name="autoTrainMinIntervalHours" min="1" value="24" class="narrow-number">
+      <p class="hint">Currently <b>0</b> labeled sample(s) not yet absorbed into a
+      successful cloud training run.</p>
       <button type="submit" class="btn btn-neutral">Save AI Learning</button>
     </form>
-    <p class="hint">Samples collected so far: <b id="aiSampleCount">12</b>
-    (<span id="aiUnlabeledCount">2</span> not yet
-    classified) — <a href="/ai-classify">go classify them &rarr;</a></p>
+    <p class="hint">Samples collected so far: <b id="aiSampleCount">18</b>
+    (<span id="aiUnlabeledCount">0</span> not yet
+    classified) — training images folder: <b>0 B</b> across 0 image(s) —
+    <a href="/ai-classify">go classify them &rarr;</a></p>
   </div>
 
   <div class="settings-group" id="service-control">
@@ -628,6 +678,22 @@ function clearLogImages(){
 
 var holdEndTime=null; // ms epoch when the safe-report hold finishes, or null when not counting down
 
+// Browser-tab safety icon - same green/red as the SAFE/UNSAFE badge and
+// every status dot on this page. The <link id="safetyFavicon"> in <head>
+// already starts out correct for whatever was true at page load; this just
+// keeps it in sync with poll()'s live d.overall_safe every few seconds
+// without a page reload, and only touches the DOM on an actual change so a
+// steady SAFE/UNSAFE state doesn't re-set the same href every poll.
+var FAVICON_SAFE='data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%231a7f37%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%231a7f37%22%2F%3E%3Cpath%20d%3D%22M20%2033%20L27%2041%20L45%2020%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E';
+var FAVICON_UNSAFE='data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M21%2020%20L43%2044%20M43%2020%20L21%2044%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E';
+var faviconIsSafe=true;
+function updateFavicon(isSafe){
+  if(isSafe===faviconIsSafe) return;
+  faviconIsSafe=isSafe;
+  var el=document.getElementById('safetyFavicon');
+  if(el) el.href=isSafe?FAVICON_SAFE:FAVICON_UNSAFE;
+}
+
 function fmtMMSS(totalSeconds){
   totalSeconds=Math.max(0,Math.round(totalSeconds));
   var m=Math.floor(totalSeconds/60), sec=totalSeconds%60;
@@ -658,6 +724,7 @@ function poll(){
     var safeEl=document.getElementById('safeState');
     safeEl.textContent=d.overall_safe?'SAFE':'UNSAFE';
     safeEl.className='badge '+(d.overall_safe?'badge-safe':'badge-unsafe');
+    updateFavicon(d.overall_safe);
 
     var holdEl=document.getElementById('safeHoldCountdown');
     var holdTimeEl=document.getElementById('safeHoldTime');
