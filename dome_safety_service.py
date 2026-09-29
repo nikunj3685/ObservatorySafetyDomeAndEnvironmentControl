@@ -7038,7 +7038,7 @@ def ai_classify_delete():
 def _ai_classify_sensor_backup_zip():
     """In-memory .zip containing one JSON file (sensor_records.json) with
     every classified sample's id/label/timestamps/sensor snapshot - the
-    "Download sensor data / records" backup for the local AI Model card,
+    "Download sensor records" backup for the local AI Model card,
     independent of images entirely (see _ai_training_export_zip() for
     those). Returns (zip_bytes_io, record_count)."""
     idx = _load_ai_training_index()
@@ -7057,7 +7057,7 @@ def _ai_classify_delete_sensor_data():
     currently has one - the record itself (id/label/image/timestamps) is
     kept, so the Classify page and every label count are unaffected; only
     the raw sensor readings the local AI Model trains from are freed.
-    Paired with "Download sensor data / records" above so this is always
+    Paired with "Download sensor records" above so this is always
     reversible from a zip you kept. Returns the number of samples
     cleared."""
     idx = _load_ai_training_index()
@@ -7242,7 +7242,7 @@ def _ai_classify_delete_fullsize_images():
 
 @app.route("/ai-classify-backup-sensor-data", methods=["GET"])
 def ai_classify_backup_sensor_data():
-    """Downloads the local AI Model card's "Download sensor data /
+    """Downloads the local AI Model card's "Download sensor
     records" backup zip - always available (not just as a pre-delete
     step), so it can also just be a routine backup."""
     buf, count = _ai_classify_sensor_backup_zip()
@@ -7255,7 +7255,7 @@ def ai_classify_backup_sensor_data():
 
 @app.route("/ai-classify-delete-sensor-data", methods=["GET"])
 def ai_classify_delete_sensor_data():
-    """The local AI Model card's "Delete sensor data / records" action."""
+    """The local AI Model card's "Delete sensor records" action."""
     cleared = _ai_classify_delete_sensor_data()
     if cleared:
         _log_event("Settings", f"AI Learning: cleared sensor data from {cleared} classified sample(s)")
@@ -7265,7 +7265,7 @@ def ai_classify_delete_sensor_data():
 @app.route("/ai-classify-upload-sensor-data", methods=["POST"])
 def ai_classify_upload_sensor_data():
     """Restores sensor data from a zip produced by the backup route above -
-    the local AI Model card's "Upload sensor data / records" action."""
+    the local AI Model card's "Upload sensor records" action."""
     f = request.files.get("file")
     if not f:
         return jsonify({"ok": False, "error": "No file uploaded"})
@@ -7615,21 +7615,21 @@ def ai_classify_page():
         f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}</span>'
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
 
-    # "Delete sensor data / records" (local AI Model card) - clears just the
+    # "Delete sensor records" (local AI Model card) - clears just the
     # sensor snapshot from a classified sample, keeping its label/image
     # intact, so the local model's raw training rows can be purged
     # independently of anything image-related. Always reversible from a
-    # zip via "Download sensor data / records" below.
+    # zip via "Download sensor records" below.
     sensor_records_count = sum(1 for s in all_samples if s.get("label") and s.get("sensors"))
     sensor_data_delete_html = (
         f'<button type="button" class="btn ai-delete-btn" '
-        f'onclick="deleteSensorData({sensor_records_count})">Delete sensor data / records</button>'
+        f'onclick="deleteSensorData({sensor_records_count})">Delete sensor records</button>'
         if sensor_records_count else
-        '<span class="btn ai-nav-btn-disabled">Delete sensor data / records</span>')
+        '<span class="btn ai-nav-btn-disabled">Delete sensor records</span>')
     sensor_data_download_html = (
-        '<a class="btn" href="/ai-classify-backup-sensor-data">Download sensor data / records (.zip)</a>'
+        '<a class="btn" href="/ai-classify-backup-sensor-data">Download sensor records (.zip)</a>'
         if sensor_records_count else
-        '<span class="btn ai-nav-btn-disabled">Download sensor data / records (.zip)</span>')
+        '<span class="btn ai-nav-btn-disabled">Download sensor records (.zip)</span>')
 
     # "Delete resized images" (Cloud Image Model card) - deletes only the
     # already-compressed copies (image_compressed=True), keeping label +
@@ -7817,7 +7817,7 @@ a{{color:var(--accent);}}
   {reset_model_html}
   {sensor_data_delete_html}
   {sensor_data_download_html}
-  <label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor data / records (.zip)</label>
+  <label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor records (.zip)</label>
   <input type="file" id="sensorDataUploadInput" accept=".zip" style="display:none" onchange="uploadSensorData(this)">
   <p id="trainStatus" class="hint"></p>
   <p id="sensorDataStatus" class="hint"></p>
@@ -8026,7 +8026,7 @@ function compressTrained() {{
 function deleteSensorData(count) {{
   if (!count) return;
   if (!confirm('Clear sensor data from ' + count + ' classified sample(s)? Labels and images are kept, ' +
-               'and this cannot be undone unless you have a backup zip. Tip: use "Download sensor data / ' +
+               'and this cannot be undone unless you have a backup zip. Tip: use "Download sensor ' +
                'records" first if you have not already.')) return;
   const status = document.getElementById('sensorDataStatus');
   status.textContent = 'Clearing...';
