@@ -5317,13 +5317,22 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     if rain_prev:
         rain_row += _field_row("", "", rain_prev, "prev-status")
 
-    ml_row = _field_row(ml_cloud_dot, "☁️", f"""Simple Cloud Detect: <b>{s['cloud_class']}</b> <span class="muted">({s['cloud_confidence']:.0f}%)</span>
+    # Simple Cloud Detect - unlike the AI Model/Cloud Image Model rows above
+    # (which stay visible with an informational note even when their gate is
+    # off, as long as a model exists), this section is hidden ENTIRELY
+    # whenever the "Simple Cloud Detect ML check" toggle under Safety Checks
+    # is off - not just annotated as disabled like the Rain row above. Only
+    # this one section works this way; nothing else on the dashboard changes.
+    if checks["ml_cloud_enabled"]:
+        ml_row = _field_row(ml_cloud_dot, "☁️", f"""Simple Cloud Detect: <b>{s['cloud_class']}</b> <span class="muted">({s['cloud_confidence']:.0f}%)</span>
   &nbsp; <a href="{clouddetect_link}" target="_blank" rel="noopener">View cloud detect &rarr;</a>""")
-    if s.get("cloud_ignored"):
-        ml_row += _field_row("", "", "Latest frame was an ignored class - showing the last trusted reading above.", "prev-status")
-    mlcloud_prev = _prev_status_text(s["mlcloud_prev_state"], s["mlcloud_prev_since"], tz_name)
-    if mlcloud_prev:
-        ml_row += _field_row("", "", mlcloud_prev, "prev-status")
+        if s.get("cloud_ignored"):
+            ml_row += _field_row("", "", "Latest frame was an ignored class - showing the last trusted reading above.", "prev-status")
+        mlcloud_prev = _prev_status_text(s["mlcloud_prev_state"], s["mlcloud_prev_since"], tz_name)
+        if mlcloud_prev:
+            ml_row += _field_row("", "", mlcloud_prev, "prev-status")
+    else:
+        ml_row = ""
 
     # Grouped into four visually-separated sections (a light divider between
     # each, matching the one already used between the Day/Night block above
