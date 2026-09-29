@@ -5063,6 +5063,21 @@ def allsky_check():
         return jsonify({"ok": True, "version": str(mtime)})
 
 
+def _safety_favicon_href(is_safe):
+    """A tiny solid-circle favicon, colored the same green/red already used
+    for the SAFE/UNSAFE badge and every status dot on this page (--safe/
+    --unsafe below) - so the browser tab itself shows at a glance whether
+    the observatory is currently SAFE or UNSAFE, without needing the tab to
+    be focused. Built as an inline SVG data: URI rather than a static file
+    on disk, since there's nothing to cache/serve - it's regenerated fresh
+    from whatever `is_safe` the caller already has on hand (initial page
+    render), and updated client-side (see the dashboard's poll() JS, which
+    swaps this same href every /fragments cycle) without a page reload."""
+    color = "%231a7f37" if is_safe else "%23c62828"  # --safe / --unsafe, URL-encoded '#'
+    return (f'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+            f'<circle cx="16" cy="16" r="14" fill="{color}"/></svg>')
+
+
 def _status_dot(effective_pass, enabled, tooltip_off, tooltip_ok, tooltip_fail, neutral_when_disabled=False):
     """A small circle for a safety-check reading, with a hover tooltip
     explaining exactly why it's that color. By default (neutral_when_
@@ -5721,9 +5736,16 @@ def web_index():
     heater_mode_badge_class = "badge-disabled" if not heater_enabled else ("badge-moving" if manual_heater else "badge-closed")
 
     safe_badge_class = "badge-safe" if s["overall_safe"] else "badge-unsafe"
+    favicon_href = _safety_favicon_href(s["overall_safe"])
+    # Both colors, precomputed once here rather than re-built in JS each
+    # poll cycle - poll()'s updateFavicon() below just swaps between these
+    # two fixed strings based on the fresh d.overall_safe it already reads.
+    favicon_safe_href = _safety_favicon_href(True)
+    favicon_unsafe_href = _safety_favicon_href(False)
     tz_options = tz_options_html(loc["tz_name"])
 
     html = f"""<!DOCTYPE html><html><head><title>Observatory Control</title>
+<link rel="icon" id="safetyFavicon" href="{favicon_href}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{{
@@ -6411,6 +6433,22 @@ function clearLogImages(){{
 
 var holdEndTime=null; // ms epoch when the safe-report hold finishes, or null when not counting down
 
+// Browser-tab safety icon - same green/red as the SAFE/UNSAFE badge and
+// every status dot on this page. The <link id="safetyFavicon"> in <head>
+// already starts out correct for whatever was true at page load; this just
+// keeps it in sync with poll()'s live d.overall_safe every few seconds
+// without a page reload, and only touches the DOM on an actual change so a
+// steady SAFE/UNSAFE state doesn't re-set the same href every poll.
+var FAVICON_SAFE='{favicon_safe_href}';
+var FAVICON_UNSAFE='{favicon_unsafe_href}';
+var faviconIsSafe={('true' if s['overall_safe'] else 'false')};
+function updateFavicon(isSafe){{
+  if(isSafe===faviconIsSafe) return;
+  faviconIsSafe=isSafe;
+  var el=document.getElementById('safetyFavicon');
+  if(el) el.href=isSafe?FAVICON_SAFE:FAVICON_UNSAFE;
+}}
+
 function fmtMMSS(totalSeconds){{
   totalSeconds=Math.max(0,Math.round(totalSeconds));
   var m=Math.floor(totalSeconds/60), sec=totalSeconds%60;
@@ -6441,6 +6479,7 @@ function poll(){{
     var safeEl=document.getElementById('safeState');
     safeEl.textContent=d.overall_safe?'SAFE':'UNSAFE';
     safeEl.className='badge '+(d.overall_safe?'badge-safe':'badge-unsafe');
+    updateFavicon(d.overall_safe);
 
     var holdEl=document.getElementById('safeHoldCountdown');
     var holdTimeEl=document.getElementById('safeHoldTime');
