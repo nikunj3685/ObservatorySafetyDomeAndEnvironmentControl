@@ -5253,7 +5253,18 @@ def render_daynight_html(s, night_threshold_deg, daynight_enabled, tz_name="UTC"
     return html
 
 
-def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name="UTC"):
+def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name="UTC", cloud_total_labeled=0):
+    # cloud_total_labeled: cumulative classified-sample count (every labeled
+    # AI Learning sample, regardless of whether it's already been absorbed
+    # into a past cloud training run) - shown in the Cloud Image Model row
+    # below INSTEAD OF s['cloud_model_sample_count'], which is only the size
+    # of the last cloud-training job's own upload batch (only newly-labeled,
+    # not-yet-absorbed samples at the time it ran - see
+    # _ai_training_export_zip()'s only_untrained docstring) and reads as a
+    # mismatch next to the Classify page's own cumulative total. Passed in
+    # by both callers (web_index()/web_fragments()) rather than computed
+    # here, since they already load the AI training index for their own
+    # stats and this avoids a second redundant disk read per request.
     mlx_disabled_tag = ' <span class="muted">(disabled)</span>' if not MLX_INSTALLED else ''
 
     # Outside/Box readings have no status dot and aren't part of the SAFE/
@@ -5445,7 +5456,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         confidence_str = (f" ({cloud_confidence * 100:.0f}%)"
                            if cloud_confidence is not None and not cloud_ignored else "")
         cloud_model_row = _field_row(cloud_dot, "📷", f"""AI Cloud Detect(All Sky): <b>{cloud_display}</b>{confidence_str}
-  <span class="muted">(trained on {s.get('cloud_model_sample_count')} classified samples on the
+  <span class="muted">(trained on {cloud_total_labeled} classified samples on the
   <a href="/ai-classify">Classify page</a> - {cloud_using_note})</span>""")
     elif cloud_model_wanted and cloud_status == "tflite_missing":
         cloud_model_row = _field_row("", "⚠️",
@@ -5617,6 +5628,7 @@ def web_fragments():
     _ai_idx_for_stats = _load_ai_training_index()
     ai_sample_count = len(_ai_idx_for_stats["samples"])
     ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
+    ai_total_labeled = ai_sample_count - ai_unlabeled_count
 
     return jsonify({
         "dome_state": dome_state,
@@ -5625,7 +5637,8 @@ def web_fragments():
         "override_label": override_label,
         "warning_html": warning_html,
         "daynight_html": render_daynight_html(s, loc["night_threshold_deg"], checks["daynight_enabled"], loc["tz_name"]),
-        "env_html": render_env_readings_html(s, checks, clouddetect_link_for(request), sensor_names, loc["tz_name"]),
+        "env_html": render_env_readings_html(s, checks, clouddetect_link_for(request), sensor_names, loc["tz_name"],
+                                              cloud_total_labeled=ai_total_labeled),
         "heater_info_html": render_heater_info_html(h, features["heater_enabled"], sensor_names["mosfet"]),
         "heater_enabled": features["heater_enabled"],
         "heater_mode": heater_mode,
@@ -5687,6 +5700,15 @@ def web_index():
     _ai_idx_for_stats = _load_ai_training_index()
     ai_sample_count = len(_ai_idx_for_stats["samples"])
     ai_unlabeled_count = sum(1 for smp in _ai_idx_for_stats["samples"] if smp.get("label") is None)
+    # Cumulative classified count (every labeled sample ever, regardless of
+    # whether it's already been absorbed into a past cloud training run) -
+    # NOT the same as cloud_model_sample_count, which is only the size of
+    # the most recent cloud-training upload batch (only newly-labeled,
+    # not-yet-absorbed samples at the time that job ran - see
+    # _ai_training_export_zip()'s only_untrained docstring). The Cloud
+    # Image Model status line below shows this total instead, so it isn't
+    # mistaken for the full classified set.
+    ai_total_labeled = ai_sample_count - ai_unlabeled_count
     # Plain directory stat (not index-derived) for the "training images
     # folder" line - see _ai_training_images_folder_stats()'s docstring for
     # why this is a disk walk rather than summing index.json's records.
@@ -5745,8 +5767,12 @@ def web_index():
                         "back to the standard safety checks.",
             "error": "Enabled, but the last prediction failed — falling back to the standard safety checks. "
                      "Check the service log for details.",
+            # Shows the cumulative total classified so far (ai_total_labeled)
+            # rather than cloud_model_sample_count (the last cloud-training
+            # job's own upload size, which is only the newly-labeled batch
+            # at the time it ran) - see ai_total_labeled's comment above.
             "active": f"Active — currently predicting <b>{cloud_settings_display}</b>, trained on "
-                      f"{s.get('cloud_model_sample_count')} classified samples.",
+                      f"{ai_total_labeled} classified samples.",
         }
         cloud_model_status_hint = _cloud_status_hints.get(s.get("cloud_model_status"), "")
     else:
@@ -5791,7 +5817,8 @@ def web_index():
                        "FORCE_UNSAFE": "Forced UNSAFE — sensors ignored"}[override_mode]
 
     daynight_html = render_daynight_html(s, loc["night_threshold_deg"], checks["daynight_enabled"], loc["tz_name"])
-    env_html = render_env_readings_html(s, checks, clouddetect_link, sensor_names, loc["tz_name"])
+    env_html = render_env_readings_html(s, checks, clouddetect_link, sensor_names, loc["tz_name"],
+                                          cloud_total_labeled=ai_total_labeled)
     heater_info_html = render_heater_info_html(h, heater_enabled, sensor_names["mosfet"])
 
     manual_heater = (heater_mode == "MANUAL")
@@ -7827,6 +7854,11 @@ def ai_classify_page():
         "only — it does not yet affect the SAFE/UNSAFE decision "
         "(<a href='/#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
     )
+    # How many labeled samples aren't yet absorbed into a successful cloud
+    # training run - needed above (folded into cloud_model_status_html, so
+    # trained-on/total/new all read together on one line) as well as by the
+    # "Train via cloud server" button's enabled state below.
+    cloud_new_count = sum(1 for s in all_samples if s.get("label") and not s.get("cloud_trained_at"))
     if cloud_meta:
         try:
             cloud_trained_tz_str = _format_ampm(datetime.fromtimestamp(cloud_meta["trained_at"], tz).strftime(
@@ -7834,8 +7866,16 @@ def ai_classify_page():
         except Exception:
             cloud_trained_tz_str = "unknown time"
         cloud_classes_str = ", ".join(cloud_meta.get("classes") or [])
+        # trained_on (cloud_meta['sample_count']) is only the size of THAT
+        # job's upload batch (only newly-labeled, not-yet-absorbed samples
+        # at the time it ran - see _ai_training_export_zip()'s
+        # only_untrained docstring), which reads as a mismatch next to
+        # total_labeled (every classified sample ever) unless both numbers
+        # are shown together, along with how many are new since this run.
         cloud_model_status_html = (f"Model trained <b>{cloud_trained_tz_str}</b> on "
-                                    f"<b>{cloud_meta.get('sample_count')}</b> classified samples "
+                                    f"<b>{cloud_meta.get('sample_count')}</b> classified samples — "
+                                    f"<b>{total_labeled}</b> total classified so far, "
+                                    f"<b>{cloud_new_count}</b> new since this training "
                                     f"(classes: {cloud_classes_str}). {cloud_usage_note}")
     elif cloud_model_wanted:
         cloud_model_status_html = ("<b>⚠️ No model has been downloaded yet</b>, but the Cloud Image Model "
@@ -7843,7 +7883,6 @@ def ai_classify_page():
                                     "standard safety checks until you train one here.")
     else:
         cloud_model_status_html = "No model has been trained via the cloud server yet."
-    cloud_new_count = sum(1 for s in all_samples if s.get("label") and not s.get("cloud_trained_at"))
     if not cloud_server_configured:
         cloud_train_button_html = ('<span class="btn ai-nav-btn-disabled" title="Set a server URL and API key '
                                     'under Settings first">Train via cloud server</span>')
@@ -7963,8 +8002,7 @@ a{{color:var(--accent);}}
   <input type="file" id="resizedImagesUploadInput" accept=".zip" style="display:none" onchange="uploadResizedImages(this)">
   {cloud_cancel_button_html}
   <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
-  <p class="hint">{cloud_new_count} labeled sample(s) not yet absorbed into a successful cloud training run.
-  {"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
+  <p class="hint">{"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
   <a href="/#ai-learning-settings">Settings → AI Learning</a> to change it.</p>
   <p id="resizedImagesStatus" class="hint"></p>
 </div>
