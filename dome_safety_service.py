@@ -1483,6 +1483,30 @@ def _ai_training_images_folder_stats():
     return count, total
 
 
+def _log_images_folder_stats():
+    """(image_count, total_bytes) for whatever is actually sitting on disk
+    under LOG_IMAGES_DIR right now - same plain directory walk as
+    _ai_training_images_folder_stats() above, just for the All Sky log-image
+    folder instead of the AI training one. Feeds the folder-size line shown
+    next to "Clear all log images" under Settings -> Logging. Never raises;
+    returns (0, 0) if the directory doesn't exist yet."""
+    count = 0
+    total = 0
+    try:
+        if os.path.isdir(LOG_IMAGES_DIR):
+            for name in os.listdir(LOG_IMAGES_DIR):
+                path = os.path.join(LOG_IMAGES_DIR, name)
+                try:
+                    if os.path.isfile(path):
+                        total += os.path.getsize(path)
+                        count += 1
+                except OSError:
+                    continue
+    except Exception as e:
+        print(f"[logs] failed to stat log images folder: {e}")
+    return count, total
+
+
 def _format_size_general(n):
     """Human-readable size up to GB - used for the training-images folder
     line (routinely gigabytes over time), unlike _format_bytes() above
@@ -4912,7 +4936,8 @@ def clear_log_images():
             except Exception as e:
                 print(f"[logs] failed to remove image {name} during manual clear: {e}")
     _log_event("Settings", f"All Sky log images cleared manually ({count} file(s) removed)")
-    return jsonify({"ok": True, "message": f"Cleared {count} image(s)."})
+    return jsonify({"ok": True, "message": f"Cleared {count} image(s). Reload this page to see the "
+                                            f"updated folder size."})
 
 
 @app.route("/save-device-names", methods=["GET"])
@@ -5667,6 +5692,11 @@ def web_index():
     # why this is a disk walk rather than summing index.json's records.
     ai_images_count, ai_images_bytes = _ai_training_images_folder_stats()
     ai_images_size_str = _format_size_general(ai_images_bytes)
+    # Same idea as the training-images folder line above, but for the All
+    # Sky log-image folder that "Clear all log images" (below, under
+    # Settings -> Logging) empties.
+    log_images_count, log_images_bytes = _log_images_folder_stats()
+    log_images_size_str = _format_size_general(log_images_bytes)
     ai_new_since_cloud_train = sum(1 for smp in _ai_idx_for_stats["samples"]
                                     if smp.get("label") and not smp.get("cloud_trained_at"))
     dome_snap = dome.snapshot()
@@ -6194,6 +6224,8 @@ a{{color:var(--accent-safety);}}
     <p class="hint">Deletes every stored All Sky log image right now — separate from, and immediate
     unlike, the day-count cleanup above. Log text entries are kept; a deleted entry's thumbnail just has
     nothing left to show.</p>
+    <p class="hint">Log images folder: <b id="logImagesSize">{log_images_size_str}</b> across
+    <span id="logImagesCount">{log_images_count}</span> image(s).</p>
     <div class="btn-row">
       <button type="button" class="btn btn-unsafe"
        onclick="if(confirm('Delete ALL stored All Sky log images? This cannot be undone.')) clearLogImages()">Clear all log images</button>
