@@ -1780,9 +1780,24 @@ def poll_cloud_model():
 
     meta = _load_cloud_model_meta()
     with sensor_lock:
-        sensor_state["cloud_model_status"] = status
-        sensor_state["cloud_model_predicted"] = predicted
-        sensor_state["cloud_model_confidence"] = confidence
+        if status == "active" and predicted is not None and predicted.strip().lower() == "ignore":
+            # "Ignore" is a configurable training label (ai_learning.
+            # label_classes), not a real sky condition, so a frame the model
+            # calls "Ignore" must never itself flip the gate or overwrite the
+            # dashboard's last trusted prediction - same "freeze at the last
+            # trusted reading" treatment poll_clouddetect() already gives
+            # simpleCloudDetect's own ignore-classes list above. Leave
+            # cloud_model_status/predicted/confidence exactly as they already
+            # are (untouched); cloud_model_ignored just flags that THIS
+            # cycle's raw read was Ignore, so the dashboard can show
+            # "Ignore(<held value>)" instead of silently showing the held
+            # value with no indication anything happened this cycle.
+            sensor_state["cloud_model_ignored"] = True
+        else:
+            sensor_state["cloud_model_ignored"] = False
+            sensor_state["cloud_model_status"] = status
+            sensor_state["cloud_model_predicted"] = predicted
+            sensor_state["cloud_model_confidence"] = confidence
         sensor_state["cloud_model_sample_count"] = meta.get("sample_count") if meta else None
         sensor_state["cloud_model_last_predict"] = time.time()
 
@@ -2587,10 +2602,18 @@ sensor_state = {
     # (a real prediction was made this cycle). ai_model_predicted/
     # ai_model_sample_count are None until status is "active".
     "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_sample_count": None,
+    # True only on a cycle where the model's raw prediction this cycle was
+    # the "Ignore" label (one of ai_learning.label_classes) - the gate then
+    # freezes ai_model_predicted/gate_ai_model at their last non-Ignore
+    # values instead of adopting "Ignore" itself (see recompute_overall_
+    # safe()), and the dashboard shows "Ignore(<held value>)" while this is
+    # True. Same idea as simpleCloudDetect's cloud_ignored, mirrored here.
+    "ai_model_ignored": False,
     # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
     # for the full set of status values), independent of cloud_model_enabled.
     "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
     "cloud_model_sample_count": None, "cloud_model_last_predict": 0.0,
+    "cloud_model_ignored": False,  # same meaning as ai_model_ignored above, set by poll_cloud_model()
 
     # Tri-state MLX90614 sky reading for display - "Clear"/"Cloudy" only when
     # we actually have a fresh reading; "Unknown" (with a reason) otherwise.
@@ -3098,6 +3121,24 @@ def recompute_overall_safe():
                 "mlx_delta_c": delta,
             }
             ai_predicted, _ai_scores = _predict_ai_sky_class(ai_model, ai_features)
+
+        # "Ignore" is a configurable training label (ai_learning.
+        # label_classes), not a real sky condition - a fresh prediction of
+        # it must never itself flip the gate or overwrite the dashboard's
+        # last trusted prediction. Same "freeze at the last trusted
+        # reading" treatment poll_clouddetect() already gives simpleCloud
+        # Detect's own ignore-classes list, and poll_cloud_model() now gives
+        # the Cloud Image Model below. ai_model_ignored just flags that
+        # THIS cycle's raw read was Ignore, so the dashboard can show
+        # "Ignore(<held value>)" instead of silently showing the held value
+        # with no indication anything happened this cycle.
+        ai_model_ignored = ai_predicted is not None and ai_predicted.strip().lower() == "ignore"
+        if ai_model_ignored:
+            # Hold at the last real prediction - may still be None if the
+            # model has never produced a non-Ignore prediction yet, which
+            # correctly falls through to "no_data" (fail-open) below.
+            ai_predicted = sensor_state.get("ai_model_predicted")
+        sensor_state["ai_model_ignored"] = ai_model_ignored
 
         if not ai_model_valid:
             ai_model_status = "untrained"
@@ -4551,9 +4592,11 @@ def livestatus():
             "mlx_cloud": {"enabled": checks["mlx_gate_enabled"], "pass": s["gate_mlx_cloud"]},
             "ml_cloud": {"enabled": checks["ml_cloud_enabled"], "pass": s["gate_ml_cloud"]},
             "ai_model": {"enabled": checks.get("ai_model_enabled", False), "pass": s["gate_ai_model"],
-                         "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted")},
+                         "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted"),
+                         "ignored": s.get("ai_model_ignored", False)},
             "cloud_model": {"enabled": checks.get("cloud_model_enabled", False), "pass": s["gate_cloud_model"],
-                            "status": s.get("cloud_model_status"), "predicted": s.get("cloud_model_predicted")},
+                            "status": s.get("cloud_model_status"), "predicted": s.get("cloud_model_predicted"),
+                            "ignored": s.get("cloud_model_ignored", False)},
         },
         "solar_elevation_deg": s["solar_elevation_deg"],
         "daytime_now": s["daytime_now"],
@@ -5247,17 +5290,23 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     ai_predicted = s.get("ai_model_predicted")
     ai_model_row = ""
     if ai_status == "active":
+        # While this cycle's raw read was the "Ignore" label,
+        # recompute_overall_safe() already froze ai_predicted at the last
+        # non-Ignore prediction (and the gate along with it) - show that
+        # plainly as "Ignore(<held value>)" rather than silently displaying
+        # the held value with no sign anything happened this cycle.
+        ai_display = f"Ignore({ai_predicted})" if s.get("ai_model_ignored") else ai_predicted
         ai_dot = _status_dot(
             s.get("ai_model_pass", True), ai_model_wanted,
             f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
-            f"{ai_predicted}).",
-            f"AI Model check: passing — model predicts {ai_predicted}.",
-            f"AI Model check: FAILING — model predicts {ai_predicted}.",
+            f"{ai_display}).",
+            f"AI Model check: passing — model predicts {ai_display}.",
+            f"AI Model check: FAILING — model predicts {ai_display}.",
             neutral_when_disabled=True,
         )
         using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
                       else "informational only, not used in the SAFE/UNSAFE decision")
-        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_predicted}</b>
+        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>
   <span class="muted">(trained on {s.get('ai_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {using_note})</span>""")
     elif ai_model_wanted and ai_status == "untrained":
@@ -5279,19 +5328,29 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     cloud_predicted = s.get("cloud_model_predicted")
     cloud_model_row = ""
     if cloud_status == "active":
+        # Same "Ignore(<held value>)" treatment as the AI Model row above -
+        # poll_cloud_model() already froze cloud_model_predicted/confidence
+        # at their last non-Ignore values while cloud_model_ignored is True.
+        cloud_ignored = s.get("cloud_model_ignored")
+        cloud_display = f"Ignore({cloud_predicted})" if cloud_ignored else cloud_predicted
         cloud_dot = _status_dot(
             s.get("cloud_model_pass", True), cloud_model_wanted,
             f"Cloud Image Model check: not currently used in the SAFE/UNSAFE decision (model currently "
-            f"predicts {cloud_predicted}).",
-            f"Cloud Image Model check: passing — model predicts {cloud_predicted}.",
-            f"Cloud Image Model check: FAILING — model predicts {cloud_predicted}.",
+            f"predicts {cloud_display}).",
+            f"Cloud Image Model check: passing — model predicts {cloud_display}.",
+            f"Cloud Image Model check: FAILING — model predicts {cloud_display}.",
             neutral_when_disabled=True,
         )
         cloud_using_note = ("actively contributing to the SAFE/UNSAFE decision" if cloud_model_wanted
                              else "informational only, not used in the SAFE/UNSAFE decision")
         cloud_confidence = s.get("cloud_model_confidence")
-        confidence_str = f" ({cloud_confidence * 100:.0f}%)" if cloud_confidence is not None else ""
-        cloud_model_row = _field_row(cloud_dot, "📷", f"""AI Cloud Detect(All Sky): <b>{cloud_predicted}</b>{confidence_str}
+        # Suppress the held confidence % while ignored - it was the reading
+        # for whatever earlier non-Ignore frame is being displayed, not for
+        # "right now", and showing it next to "Ignore(...)" would read as if
+        # it were the model's confidence in the Ignore call itself.
+        confidence_str = (f" ({cloud_confidence * 100:.0f}%)"
+                           if cloud_confidence is not None and not cloud_ignored else "")
+        cloud_model_row = _field_row(cloud_dot, "📷", f"""AI Cloud Detect(All Sky): <b>{cloud_display}</b>{confidence_str}
   <span class="muted">(trained on {s.get('cloud_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {cloud_using_note})</span>""")
     elif cloud_model_wanted and cloud_status == "tflite_missing":
@@ -5555,12 +5614,14 @@ def web_index():
     # true right now if it just changed - this is the same information,
     # always visible, not just at the moment it changes.
     if checks.get("ai_model_enabled"):
+        ai_settings_display = (f"Ignore({s['ai_model_predicted']})" if s.get("ai_model_ignored")
+                                else s['ai_model_predicted'])
         _ai_status_hints = {
             "untrained": "Enabled, but no trained model exists yet — falling back to the standard safety "
                          "checks. Train one on the <a href=\"/ai-classify\">Classify page</a> first.",
             "no_data": "Enabled, but there's no fresh overlapping sensor data to predict from right now — "
                        "falling back to the standard safety checks.",
-            "active": f"Active — currently predicting <b>{s['ai_model_predicted']}</b>, trained on "
+            "active": f"Active — currently predicting <b>{ai_settings_display}</b>, trained on "
                       f"{s.get('ai_model_sample_count')} classified samples.",
         }
         ai_model_status_hint = _ai_status_hints.get(s.get("ai_model_status"), "")
@@ -5572,6 +5633,8 @@ def web_index():
     # Phase 5 - same plain-language status line as ai_model_status_hint
     # above, but for the cloud-trained image model gate.
     if checks.get("cloud_model_enabled"):
+        cloud_settings_display = (f"Ignore({s['cloud_model_predicted']})" if s.get("cloud_model_ignored")
+                                   else s['cloud_model_predicted'])
         _cloud_status_hints = {
             "tflite_missing": "Enabled, but no tflite runtime is installed on this Pi — falling back to the "
                                "standard safety checks. Run <code>pip3 install --break-system-packages "
@@ -5583,7 +5646,7 @@ def web_index():
                         "back to the standard safety checks.",
             "error": "Enabled, but the last prediction failed — falling back to the standard safety checks. "
                      "Check the service log for details.",
-            "active": f"Active — currently predicting <b>{s['cloud_model_predicted']}</b>, trained on "
+            "active": f"Active — currently predicting <b>{cloud_settings_display}</b>, trained on "
                       f"{s.get('cloud_model_sample_count')} classified samples.",
         }
         cloud_model_status_hint = _cloud_status_hints.get(s.get("cloud_model_status"), "")
