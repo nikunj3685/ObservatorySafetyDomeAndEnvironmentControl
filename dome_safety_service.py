@@ -5064,28 +5064,71 @@ def allsky_check():
         return jsonify({"ok": True, "version": str(mtime)})
 
 
+# Shield outline for the safety favicon (see _safety_favicon_href() below) -
+# a single SVG path (M/L/C only, no arcs) in a 64x64 box: a peak at top
+# center, straight diagonal shoulders, then a long sweeping curve down to a
+# point at the bottom. _scale_svg_path() re-emits this same path shrunk
+# around its own center to build the inset "ring" layers (outer color ->
+# white ring -> inner color fill) without hand-writing three coordinate
+# sets, matching the look of a common shield-check security icon.
+_FAVICON_SHIELD_PATH = ("M 32 3 L 52 11 C 58 13 60 17 60 22 C 60 40 50 54 32 61 "
+                        "C 14 54 4 40 4 22 C 4 17 6 13 12 11 Z")
+_FAVICON_CHECK_PATH = "M20 33 L27 41 L45 20"     # SAFE - checkmark
+_FAVICON_X_PATH = "M21 20 L43 44 M43 20 L21 44"  # UNSAFE - X
+
+
+def _scale_svg_path(path, scale, cx=32, cy=33):
+    """Uniformly scales every numeric x/y coordinate pair in a simple SVG
+    path string (M/L/C commands only - no arcs/flags, which is all
+    _FAVICON_SHIELD_PATH uses) about the point (cx, cy). Used to shrink the
+    shield outline toward its own center for the favicon's inset "ring"
+    layers, rather than hand-writing a separate coordinate set for each."""
+    tokens = path.replace(",", " ").split()
+    out = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.isalpha():
+            out.append(tok)
+            i += 1
+        else:
+            x, y = float(tok), float(tokens[i + 1])
+            out.append(f"{cx + (x - cx) * scale:.2f} {cy + (y - cy) * scale:.2f}")
+            i += 2
+    return " ".join(out)
+
+
 def _safety_favicon_href(is_safe):
-    """A tiny solid-circle favicon, colored the same green/red already used
-    for the SAFE/UNSAFE badge and every status dot on this page (--safe/
-    --unsafe below) - so the browser tab itself shows at a glance whether
-    the observatory is currently SAFE or UNSAFE, without needing the tab to
-    be focused. Built as an inline SVG data: URI rather than a static file
-    on disk, since there's nothing to cache/serve - it's regenerated fresh
-    from whatever `is_safe` the caller already has on hand (initial page
-    render), and updated client-side (see the dashboard's poll() JS, which
-    swaps this same href every /fragments cycle) without a page reload.
+    """A small shield favicon - green with a checkmark while SAFE, red with
+    an X while UNSAFE (same --safe/--unsafe colors already used for the
+    SAFE/UNSAFE badge and every status dot on this page) - so the browser
+    tab itself shows the observatory's state at a glance without needing
+    the tab focused. Built as an inline SVG data: URI rather than a static
+    file on disk, since there's nothing to cache/serve - it's regenerated
+    fresh from whatever `is_safe` the caller already has on hand (initial
+    page render), and updated client-side (see the dashboard's poll() JS,
+    which swaps this same href every /fragments cycle) without a page
+    reload. Left as vector SVG (not rasterized to a PNG) so it stays crisp
+    at any tab/bookmark icon size the browser asks for.
 
     Fully percent-encoded (urllib.parse.quote, safe="") rather than embedding
-    the raw SVG markup - the raw form's own double quotes (xmlns="...",
-    fill="...") would otherwise break out of this same string's HTML
+    the raw SVG markup - the raw form's own double quotes (fill="...",
+    stroke="...") would otherwise break out of this same string's HTML
     attribute context (href="...") in the <head> AND its JS single-quoted
     string context (var FAVICON_SAFE='...') in poll()'s script, spilling
-    literal markup like an orphaned '">' onto the rendered page. Percent-
-    encoding leaves no literal quote, angle-bracket, or space characters at
-    all, so the exact same string is safe to embed in both places."""
+    literal markup like an orphaned '">' onto the rendered page (a real bug
+    hit and fixed here - see git history). Percent-encoding leaves no
+    literal quote, angle-bracket, or space characters at all, so the exact
+    same string is safe to embed in both places."""
     color = "#1a7f37" if is_safe else "#c62828"  # --safe / --unsafe
-    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-           f'<circle cx="16" cy="16" r="14" fill="{color}"/></svg>')
+    mark_path = _FAVICON_CHECK_PATH if is_safe else _FAVICON_X_PATH
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+           f'<path d="{_FAVICON_SHIELD_PATH}" fill="{color}"/>'
+           f'<path d="{_scale_svg_path(_FAVICON_SHIELD_PATH, 0.80)}" fill="white"/>'
+           f'<path d="{_scale_svg_path(_FAVICON_SHIELD_PATH, 0.60)}" fill="{color}"/>'
+           f'<path d="{mark_path}" stroke="white" stroke-width="6" '
+           f'stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+           f'</svg>')
     return "data:image/svg+xml," + urllib.parse.quote(svg, safe="")
 
 
