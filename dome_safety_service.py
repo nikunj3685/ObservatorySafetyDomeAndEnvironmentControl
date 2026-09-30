@@ -7865,13 +7865,43 @@ def ai_classify_page():
                       f'Compress already-trained images</button>'
                       if compress_trained_count else
                       '<span class="btn ai-nav-btn-disabled">Compress already-trained images</span>')
+    # Effective per-label counts for the LOCAL (sensor-based) model only -
+    # this is what _train_ai_sky_model() actually trains on, via the same
+    # _sensor_training_label() used there: a raw "Ignore"-labeled sample
+    # with no sensor training label set doesn't count toward ANY label
+    # here, and one that does have one counts under THAT label instead,
+    # never under "Ignore" itself (Ignore can never be one of this model's
+    # classes). classified_counts above stays the raw, per-label breakdown
+    # - that's still correct for the Cloud Image Model card below, where
+    # Ignore is a genuine, trainable class.
+    effective_counts = {}
+    for sample in all_samples:
+        eff = _sensor_training_label(sample)
+        if eff is not None:
+            effective_counts[eff] = effective_counts.get(eff, 0) + 1
+    ignore_label_name = next((c for c in label_classes if c.strip().lower() == "ignore"), None)
+    ignore_unassigned_count = sum(
+        1 for sample in all_samples
+        if (sample.get("label") or "").strip().lower() == "ignore" and _sensor_training_label(sample) is None
+    )
     eligibility_html = "".join(
-        f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
-        for c in label_classes) or "<span class='hint'>No labels configured.</span>"
-    # Same per-label breakdown as the local model's eligibility_html above,
-    # but without a "/N" minimum - there's no configured per-class training
-    # floor for the cloud-trained model the way AI_MODEL_MIN_SAMPLES_PER_
-    # CLASS is for the local one.
+        f'<span class="ai-chip">{c}: {effective_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
+        for c in label_classes if c.strip().lower() != "ignore"
+    ) or "<span class='hint'>No labels configured.</span>"
+    # Tells you how many Ignore samples are still sitting unassigned rather
+    # than letting them just silently vanish from the row above.
+    ignore_unassigned_note_html = (
+        f" <span class='hint'>({ignore_unassigned_count} &ldquo;{ignore_label_name}&rdquo; sample(s) not yet "
+        f"counted toward any label &mdash; <a href='/ai-classify?show=label:"
+        f"{urllib.parse.quote(ignore_label_name)}'>review them</a> and set a sensor training label on the "
+        f"ones with a photo still attached to include them here.)</span>"
+        if ignore_unassigned_count and ignore_label_name else ""
+    )
+    # Same per-label breakdown as classified_counts above, but without a
+    # "/N" minimum - there's no configured per-class training floor for the
+    # cloud-trained model the way AI_MODEL_MIN_SAMPLES_PER_CLASS is for the
+    # local one. Ignore is a legitimate class here (unlike the local model
+    # above), so it keeps its real raw count with no special-casing.
     cloud_eligibility_html = "".join(
         f'<span class="ai-chip">{c}: {classified_counts.get(c, 0)}</span>'
         for c in label_classes) or "<span class='hint'>No labels configured.</span>"
@@ -8037,6 +8067,7 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .subtitle a{{color:var(--accent);text-decoration:none;}}
 .card{{background:var(--card-bg);border-radius:14px;padding:16px 18px;margin:0 0 16px;
        box-shadow:0 1px 4px rgba(0,0,0,.08);}}
+.card-title{{font-size:15px;font-weight:700;margin:0 0 10px;color:var(--text);}}
 .hint{{color:var(--muted);font-size:12.5px;}}
 .btn{{padding:7px 14px;border-radius:8px;border:none;font-size:14px;font-weight:600;cursor:pointer;
       background:var(--accent);color:#fff;text-decoration:none;display:inline-block;}}
@@ -8086,15 +8117,17 @@ a{{color:var(--accent);}}
 <a href="/logs">🗒 Logs</a></p>
 
 <div class="card">
+  <p class="card-title">📊 Training data overview</p>
   <p class="hint" style="margin:0;">Samples collected so far: <b>{total_count}</b>
   ({unlabeled_count} not yet classified) — training images folder: <b>{ai_images_size_str}</b>
   across {ai_images_count} image(s).</p>
 </div>
 
 <div class="card">
+  <p class="card-title">🤖 AI Sky Prediction(Sensor Based)</p>
   <p class="hint" id="modelStatus">{model_status_html}</p>
   <p class="hint">Classified so far, per label (need at least {AI_MODEL_MIN_SAMPLES_PER_CLASS} of each to
-  train): {eligibility_html}</p>
+  train): {eligibility_html}{ignore_unassigned_note_html}</p>
   <button type="button" class="btn" onclick="trainModel()">Train model now</button>
   {reset_model_html}
   {sensor_data_delete_html}
@@ -8106,6 +8139,7 @@ a{{color:var(--accent);}}
 </div>
 
 <div class="card">
+  <p class="card-title">📷 AI Cloud Detect(All Sky)</p>
   <p class="hint" id="cloudModelStatus">{cloud_model_status_html}</p>
   <p class="hint">Classified so far, per label: {cloud_eligibility_html}</p>
   {"" if cloud_server_configured else
@@ -8126,6 +8160,7 @@ a{{color:var(--accent);}}
 </div>
 
 <div class="card">
+  <p class="card-title">📦 Export &amp; bulk image actions</p>
   <p class="hint">{total_labeled} labeled sample(s) total, across {len(classified_counts)} label(s). Bundles
   as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
   your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
@@ -8133,6 +8168,7 @@ a{{color:var(--accent);}}
 </div>
 
 <div class="card">
+  <p class="card-title">🏷️ Classify samples</p>
   <p class="hint">{instructions_html}
   Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
   <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
