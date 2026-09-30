@@ -1213,22 +1213,50 @@ def _save_ai_sky_model(model):
         print(f"[ai-learning] Failed to save trained model: {e}")
 
 
+def _sensor_training_label(sample):
+    """The label this sample should train the sensor-based AI model
+    under, or None if it should be excluded from that training entirely.
+    A normally-classified sample (anything other than "Ignore") trains
+    under its own label, same as always - the sensor readings and the
+    photo are assumed to agree. An "Ignore" sample is different: that
+    label means the PHOTO was bad/unreliable (glare, condensation, an
+    obstruction), which says nothing about whether the sensor readings
+    taken at the same moment were a real reading of an actual sky
+    condition. So an Ignore-labeled sample only counts toward sensor
+    training if its separate `sensor_label` field has been set (on the
+    Classify page, after reviewing the photo) - and never under "Ignore"
+    itself, so that label can never become one of this model's classes."""
+    label = sample.get("label")
+    if not label:
+        return None
+    if label.strip().lower() != "ignore":
+        return label
+    sensor_label = sample.get("sensor_label")
+    if not sensor_label or sensor_label.strip().lower() == "ignore":
+        return None
+    return sensor_label
+
+
 def _train_ai_sky_model():
     """Fits a Gaussian Naive Bayes classifier from every manually
-    classified AI Learning sample: for each label, the mean/std of each
-    AI_MODEL_FEATURES reading (a feature a given sample never had fresh -
-    e.g. the MLX90614 wasn't installed yet when it was captured - is simply
-    excluded from that feature's statistics, not treated as zero), plus
-    each label's share of the classified samples (its prior). Returns
-    (model_dict, None) on success, or (None, error_message) when there
-    isn't enough classified data yet to fit anything meaningful - never
-    raises, and never leaves a partially-written model file (the old one,
-    if any, is left untouched on failure)."""
+    classified AI Learning sample eligible for sensor training (see
+    _sensor_training_label() - this excludes "Ignore"-labeled samples
+    that haven't been given a separate sensor-training label): for each
+    label, the mean/std of each AI_MODEL_FEATURES reading (a feature a
+    given sample never had fresh - e.g. the MLX90614 wasn't installed yet
+    when it was captured - is simply excluded from that feature's
+    statistics, not treated as zero), plus each label's share of the
+    eligible samples (its prior). Returns (model_dict, None) on success,
+    or (None, error_message) when there isn't enough classified data yet
+    to fit anything meaningful - never raises, and never leaves a
+    partially-written model file (the old one, if any, is left untouched
+    on failure)."""
     idx = _load_ai_training_index()
-    labeled = [s for s in idx["samples"] if s.get("label")]
     by_class = {}
-    for sample in labeled:
-        by_class.setdefault(sample["label"], []).append(sample)
+    for sample in idx["samples"]:
+        effective_label = _sensor_training_label(sample)
+        if effective_label is not None:
+            by_class.setdefault(effective_label, []).append(sample)
 
     if not by_class:
         return None, "No classified samples yet - classify some on the Classify page first."
@@ -1239,7 +1267,7 @@ def _train_ai_sky_model():
         return None, (f"These labels have fewer than {AI_MODEL_MIN_SAMPLES_PER_CLASS} classified samples so far: "
                        f"{', '.join(too_few)}. Classify more of those before training.")
 
-    total = len(labeled)
+    total = sum(len(samples) for samples in by_class.values())
     class_counts = {}
     class_stats = {}
     for cls, samples in by_class.items():
@@ -2627,18 +2655,19 @@ sensor_state = {
     # (a real prediction was made this cycle). ai_model_predicted/
     # ai_model_sample_count are None until status is "active".
     "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_sample_count": None,
-    # True only on a cycle where the model's raw prediction this cycle was
-    # the "Ignore" label (one of ai_learning.label_classes) - the gate then
-    # freezes ai_model_predicted/gate_ai_model at their last non-Ignore
-    # values instead of adopting "Ignore" itself (see recompute_overall_
-    # safe()), and the dashboard shows "Ignore(<held value>)" while this is
-    # True. Same idea as simpleCloudDetect's cloud_ignored, mirrored here.
-    "ai_model_ignored": False,
     # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
     # for the full set of status values), independent of cloud_model_enabled.
     "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
     "cloud_model_sample_count": None, "cloud_model_last_predict": 0.0,
-    "cloud_model_ignored": False,  # same meaning as ai_model_ignored above, set by poll_cloud_model()
+    # True only on a cycle where the Cloud Image Model's raw prediction was
+    # the "Ignore" label (one of ai_learning.label_classes) - the gate then
+    # freezes cloud_model_predicted/gate_cloud_model at their last non-Ignore
+    # values instead of adopting "Ignore" itself (see poll_cloud_model()), and
+    # the dashboard shows "Ignore(<held value>)" while this is True. Same idea
+    # as simpleCloudDetect's cloud_ignored, mirrored here. The sensor-based AI
+    # Model gate above has no equivalent - "Ignore" isn't one of its classes
+    # (see _sensor_training_label()), so it can never predict it.
+    "cloud_model_ignored": False,
 
     # Tri-state MLX90614 sky reading for display - "Clear"/"Cloudy" only when
     # we actually have a fresh reading; "Unknown" (with a reason) otherwise.
@@ -3147,23 +3176,12 @@ def recompute_overall_safe():
             }
             ai_predicted, _ai_scores = _predict_ai_sky_class(ai_model, ai_features)
 
-        # "Ignore" is a configurable training label (ai_learning.
-        # label_classes), not a real sky condition - a fresh prediction of
-        # it must never itself flip the gate or overwrite the dashboard's
-        # last trusted prediction. Same "freeze at the last trusted
-        # reading" treatment poll_clouddetect() already gives simpleCloud
-        # Detect's own ignore-classes list, and poll_cloud_model() now gives
-        # the Cloud Image Model below. ai_model_ignored just flags that
-        # THIS cycle's raw read was Ignore, so the dashboard can show
-        # "Ignore(<held value>)" instead of silently showing the held value
-        # with no indication anything happened this cycle.
-        ai_model_ignored = ai_predicted is not None and ai_predicted.strip().lower() == "ignore"
-        if ai_model_ignored:
-            # Hold at the last real prediction - may still be None if the
-            # model has never produced a non-Ignore prediction yet, which
-            # correctly falls through to "no_data" (fail-open) below.
-            ai_predicted = sensor_state.get("ai_model_predicted")
-        sensor_state["ai_model_ignored"] = ai_model_ignored
+        # Unlike simpleCloudDetect and the Cloud Image Model below - both of
+        # which classify a photo, where "Ignore" (a bad/unreliable frame) is
+        # a real phenomenon - this model is trained on sensor readings only,
+        # and "Ignore" is never one of its classes (see
+        # _sensor_training_label()/_train_ai_sky_model()), so it can never
+        # predict it. No freeze/hold-at-last-value handling is needed here.
 
         if not ai_model_valid:
             ai_model_status = "untrained"
@@ -4617,8 +4635,7 @@ def livestatus():
             "mlx_cloud": {"enabled": checks["mlx_gate_enabled"], "pass": s["gate_mlx_cloud"]},
             "ml_cloud": {"enabled": checks["ml_cloud_enabled"], "pass": s["gate_ml_cloud"]},
             "ai_model": {"enabled": checks.get("ai_model_enabled", False), "pass": s["gate_ai_model"],
-                         "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted"),
-                         "ignored": s.get("ai_model_ignored", False)},
+                         "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted")},
             "cloud_model": {"enabled": checks.get("cloud_model_enabled", False), "pass": s["gate_cloud_model"],
                             "status": s.get("cloud_model_status"), "predicted": s.get("cloud_model_predicted"),
                             "ignored": s.get("cloud_model_ignored", False)},
@@ -5395,12 +5412,11 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     ai_predicted = s.get("ai_model_predicted")
     ai_model_row = ""
     if ai_status == "active":
-        # While this cycle's raw read was the "Ignore" label,
-        # recompute_overall_safe() already froze ai_predicted at the last
-        # non-Ignore prediction (and the gate along with it) - show that
-        # plainly as "Ignore(<held value>)" rather than silently displaying
-        # the held value with no sign anything happened this cycle.
-        ai_display = f"Ignore({ai_predicted})" if s.get("ai_model_ignored") else ai_predicted
+        # No "Ignore(<held>)" handling needed here - unlike the Cloud Image
+        # Model below, "Ignore" is never one of this model's classes (see
+        # _sensor_training_label()), so ai_predicted is always a genuine
+        # sky-condition prediction.
+        ai_display = ai_predicted
         ai_dot = _status_dot(
             s.get("ai_model_pass", True), ai_model_wanted,
             f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
@@ -5735,8 +5751,7 @@ def web_index():
     # true right now if it just changed - this is the same information,
     # always visible, not just at the moment it changes.
     if checks.get("ai_model_enabled"):
-        ai_settings_display = (f"Ignore({s['ai_model_predicted']})" if s.get("ai_model_ignored")
-                                else s['ai_model_predicted'])
+        ai_settings_display = s['ai_model_predicted']
         _ai_status_hints = {
             "untrained": "Enabled, but no trained model exists yet — falling back to the standard safety "
                          "checks. Train one on the <a href=\"/ai-classify\">Classify page</a> first.",
@@ -6887,6 +6902,24 @@ def ai_training_image(name):
     return resp
 
 
+def _ai_samples_matching_filter(idx, filt):
+    """Every sample matching a Classify-page filter value: "all" (every
+    sample), "unclassified" (no label yet), or "label:<name>" (exactly
+    that label) - shared by the page's own display filtering and the
+    "Select ALL" bulk actions below, so both always agree on what a given
+    filter actually means. Returns [] for anything else (including a
+    missing/None filter)."""
+    samples = idx["samples"]
+    if filt == "all":
+        return list(samples)
+    if filt == "unclassified":
+        return [s for s in samples if s.get("label") is None]
+    if filt and filt.startswith("label:"):
+        wanted = filt[len("label:"):]
+        return [s for s in samples if s.get("label") == wanted]
+    return []
+
+
 @app.route("/ai-classify-save", methods=["GET"])
 def ai_classify_save():
     """Applies one label to one or more sample IDs at once - the batch
@@ -6896,20 +6929,19 @@ def ai_classify_save():
     (not a redirect) since the page calls this via fetch() and updates
     itself in place rather than reloading.
 
-    `all=unclassified` or `all=all` selects EVERY sample matching that
-    filter (not just whatever's on the current page) instead of an
-    explicit `ids` list - the Classify page's "Select ALL" button, which
-    spans every page rather than just the ~24 checkboxes currently
-    rendered. Looked up fresh right here rather than the page sending a
-    (potentially huge, and possibly stale by the time the button is
-    clicked) id list, so it always reflects whatever's actually in the
-    index at the moment the action runs."""
+    `all=unclassified`, `all=all`, or `all=label:<name>` selects EVERY
+    sample matching that filter (not just whatever's on the current page)
+    instead of an explicit `ids` list - the Classify page's "Select ALL"
+    button, which spans every page rather than just the ~24 checkboxes
+    currently rendered. Looked up fresh right here rather than the page
+    sending a (potentially huge, and possibly stale by the time the
+    button is clicked) id list, so it always reflects whatever's actually
+    in the index at the moment the action runs."""
     label = request.args.get("label", "").strip()
     all_filter = request.args.get("all")
     idx = _load_ai_training_index()
-    if all_filter in ("unclassified", "all"):
-        ids = [s["id"] for s in idx["samples"]
-               if all_filter == "all" or s.get("label") is None]
+    if all_filter in ("unclassified", "all") or (all_filter or "").startswith("label:"):
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids or not label:
@@ -6930,6 +6962,40 @@ def ai_classify_save():
     unlabeled_count = sum(1 for s in idx["samples"] if s.get("label") is None)
     return jsonify({"ok": True, "matched": matched, "unlabeled_count": unlabeled_count,
                      "total_count": len(idx["samples"])})
+
+
+@app.route("/ai-classify-set-sensor-label", methods=["GET"])
+def ai_classify_set_sensor_label():
+    """Sets (or clears, with an empty `label`) one sample's separate
+    `sensor_label` field - only meaningful on a sample whose main `label`
+    is "Ignore" (see _sensor_training_label()): the photo was bad/
+    unreliable, but the sensor readings taken at that same moment may
+    still be a genuine reading of an actual sky condition, so this lets
+    you say what that condition actually was without touching the main
+    Ignore classification (which still governs the Cloud Image Model and
+    everything else). Acts on exactly one sample at a time - a single
+    Classify-page card's own secondary control, not a bulk/select-many
+    action like /ai-classify-save. Rejects "Ignore" itself as a value,
+    same as leaving it unset (both simply mean "excluded"). JSON, since
+    the page updates just that one card in place rather than reloading."""
+    sid = request.args.get("id", "").strip()
+    label = request.args.get("label", "").strip()
+    if not sid:
+        return jsonify({"ok": False, "error": "missing id"}), 400
+    idx = _load_ai_training_index()
+    sample = next((s for s in idx["samples"] if s["id"] == sid), None)
+    if sample is None:
+        return jsonify({"ok": False, "error": "sample not found"}), 404
+    if not label or label.strip().lower() == "ignore":
+        sample.pop("sensor_label", None)
+        sample.pop("sensor_labeled_at", None)
+        stored_label = None
+    else:
+        sample["sensor_label"] = label
+        sample["sensor_labeled_at"] = time.time()
+        stored_label = label
+    _save_ai_training_index(idx)
+    return jsonify({"ok": True, "id": sid, "sensor_label": stored_label})
 
 
 @app.route("/ai-train-model", methods=["GET"])
@@ -7163,17 +7229,16 @@ def ai_classify_delete():
     Works on labeled and unlabeled samples alike. JSON, not a redirect,
     for the same reason as /ai-classify-save.
 
-    `all=unclassified` or `all=all` deletes EVERY sample matching that
-    filter instead of an explicit `ids` list - see /ai-classify-save's
-    docstring for why this is looked up fresh here rather than sent by
-    the page. `all=all` here is a blunter version of the existing
-    /ai-classify-delete-classified (which only ever touches LABELED
-    samples) - this one respects whichever filter is showing."""
+    `all=unclassified`, `all=all`, or `all=label:<name>` deletes EVERY
+    sample matching that filter instead of an explicit `ids` list - see
+    /ai-classify-save's docstring for why this is looked up fresh here
+    rather than sent by the page. `all=all` here is a blunter version of
+    the existing /ai-classify-delete-classified (which only ever touches
+    LABELED samples) - this one respects whichever filter is showing."""
     all_filter = request.args.get("all")
-    if all_filter in ("unclassified", "all"):
+    if all_filter in ("unclassified", "all") or (all_filter or "").startswith("label:"):
         idx = _load_ai_training_index()
-        ids = [s["id"] for s in idx["samples"]
-               if all_filter == "all" or s.get("label") is None]
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids:
@@ -7528,7 +7593,43 @@ def _ai_classify_chips_html(sensors):
     return "".join(f'<span class="ai-chip">{c}</span>' for c in chips)
 
 
-def _render_ai_classify_card(sample, tz):
+def _ai_sensor_label_row_html(sample, label_classes):
+    """The Classify page's secondary "sensor training label" control,
+    rendered only under a sample whose main label is "Ignore" (see
+    _sensor_training_label()) - every other label needs nothing extra
+    here, since the sensor model already trains on it directly. "Ignore"
+    only ever describes the PHOTO (glare, condensation, an obstruction);
+    the sensor readings taken at that same moment may still be a genuine
+    reading of an actual sky condition, and this is where that gets
+    recorded, without touching the main Ignore classification (which
+    still governs the Cloud Image Model and everything else unchanged).
+    Same button set as the main label row, minus "Ignore" itself -
+    setting it to Ignore would just mean "leave unset", which is already
+    the default. Returns "" for any sample not labeled Ignore."""
+    if (sample.get("label") or "").strip().lower() != "ignore":
+        return ""
+    sid = sample["id"]
+    current = sample.get("sensor_label")
+    options = [c for c in label_classes if c.strip().lower() != "ignore"]
+    buttons_html = "".join(
+        f'<button type="button" class="btn ai-sensor-btn{" active" if c == current else ""}" '
+        f'data-label="{c}" onclick="setSensorLabel(\'{sid}\', \'{c}\')">{c}</button>'
+        for c in options)
+    if current:
+        note_html = (f'<span class="ai-sensor-note ai-sensor-note-set">&#10003; Sensor training label: '
+                     f'{current}</span> <a href="#" class="ai-sensor-clear" '
+                     f'onclick="setSensorLabel(\'{sid}\', \'\'); return false;">&#10005; unset</a>')
+    else:
+        note_html = '<span class="ai-sensor-note">Not set — excluded from sensor-model training.</span>'
+    return f"""<div class="ai-sensor-row" data-sensor-id="{sid}">
+  <div class="ai-sensor-caption">Bad photo — but were the sensor readings above still a real reading of an
+  actual sky condition? Pick one to use them for AI Sky Prediction (sensor-based) training:</div>
+  <div class="ai-sensor-btns">{buttons_html}</div>
+  <div class="ai-sensor-note-wrap">{note_html}</div>
+</div>"""
+
+
+def _render_ai_classify_card(sample, tz, label_classes):
     sid = sample["id"]
     label = sample.get("label")
     label_badge_html = f'<span class="ai-label-badge">{label}</span>' if label else ""
@@ -7536,6 +7637,7 @@ def _render_ai_classify_card(sample, tz):
     time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
                 if ts else "Unknown time")
     chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
+    sensor_row_html = _ai_sensor_label_row_html(sample, label_classes)
 
     # A sample's image is deliberately deleted once it's been absorbed into
     # a successful cloud training run (see _absorb_cloud_training_success())
@@ -7563,10 +7665,11 @@ def _render_ai_classify_card(sample, tz):
   <div class="ai-card-time">{time_str}</div>
   <div class="ai-card-chips">{chips_html}</div>
   {fullsize_html}
+  {sensor_row_html}
 </div>"""
 
 
-def _render_ai_classify_single_card(sample, tz, position, total):
+def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
     """The one-by-one view's card - the same info as a grid card, but one
     at a time and at full size, since the whole point of this view is
     "let me actually see this frame clearly" rather than a 220px
@@ -7579,6 +7682,7 @@ def _render_ai_classify_single_card(sample, tz, position, total):
     time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
                 if ts else "Unknown time")
     chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
+    sensor_row_html = _ai_sensor_label_row_html(sample, label_classes)
     # See _render_ai_classify_card()'s comment above - same reasoning here.
     if sample.get("image"):
         full_url = f"/ai-training-image/{sample['image']}"
@@ -7593,6 +7697,7 @@ def _render_ai_classify_single_card(sample, tz, position, total):
   {label_badge_html}
   <div class="ai-card-time">{time_str}</div>
   <div class="ai-card-chips">{chips_html}</div>
+  {sensor_row_html}
   <button type="button" class="btn ai-delete-btn" onclick="deleteSingle()">🗑 Delete this image</button>
 </div>"""
 
@@ -7602,7 +7707,7 @@ def ai_classify_page():
     ai_cfg = get_setting("ai_learning")
     label_classes = [c.strip() for c in ai_cfg.get("label_classes", "").split(",") if c.strip()]
     show = request.args.get("show", "unclassified")
-    if show not in ("unclassified", "all"):
+    if show not in ("unclassified", "all") and not (show.startswith("label:") and show[len("label:"):] in label_classes):
         show = "unclassified"
     view = request.args.get("view", "grid")
     if view not in ("grid", "single"):
@@ -7626,7 +7731,7 @@ def ai_classify_page():
     ai_images_count, ai_images_bytes = _ai_training_images_folder_stats()
     ai_images_size_str = _format_size_general(ai_images_bytes)
 
-    filtered = list(all_samples) if show == "all" else [s for s in all_samples if s.get("label") is None]
+    filtered = _ai_samples_matching_filter(idx, show)
     # Newest first - the most recent capture is what you actually want to
     # check right after it's taken (e.g. "did the sky just clear up?"),
     # and it's what a person expects Prev/Next to walk through in order.
@@ -7646,7 +7751,7 @@ def ai_classify_page():
     except Exception:
         tz = timezone.utc
 
-    cards_html = ("".join(_render_ai_classify_card(s, tz) for s in page_samples) if page_samples else
+    cards_html = ("".join(_render_ai_classify_card(s, tz, label_classes) for s in page_samples) if page_samples else
                   "<p class='hint'>Nothing to classify right now — samples build up over time once AI "
                   "Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
 
@@ -7659,7 +7764,7 @@ def ai_classify_page():
         single_card_html = ("<p class='hint'>Nothing to classify right now — samples build up over time once "
                              "AI Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
     else:
-        single_card_html = _render_ai_classify_single_card(filtered[sidx], tz, sidx, total_filtered)
+        single_card_html = _render_ai_classify_single_card(filtered[sidx], tz, sidx, total_filtered, label_classes)
     prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx - 1}">&larr; Prev</a>'
                          if sidx > 0 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
     next_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx + 1}">Next &rarr;</a>'
@@ -7675,6 +7780,10 @@ def ai_classify_page():
     show_options = "".join(
         f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
         for v, t in [("unclassified", "Unclassified only"), ("all", "All samples")])
+    if label_classes:
+        show_options += "<optgroup label='By label'>" + "".join(
+            f"<option value='label:{c}'{' selected' if show == f'label:{c}' else ''}>{c}</option>"
+            for c in label_classes) + "</optgroup>"
 
     view_toggle_html = (f'<a class="btn" href="/ai-classify?show={show}&amp;view=single&amp;idx=0">👁 One by one</a>'
                          if view == "grid" else
@@ -7960,6 +8069,15 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .ai-single-position{{font-size:12px;color:var(--muted);margin-bottom:6px;}}
 .ai-single-card .ai-card-chips{{justify-content:center;}}
 .ai-single-card .ai-delete-btn{{margin-top:10px;}}
+.ai-sensor-row{{margin-top:8px;padding-top:8px;border-top:1px dashed #d3d8dc;text-align:left;}}
+.ai-sensor-caption{{font-size:11px;color:var(--muted);margin-bottom:6px;}}
+.ai-sensor-btns{{display:flex;flex-wrap:wrap;gap:4px;}}
+.ai-sensor-btn{{background:#eceff1;color:var(--muted);padding:3px 8px;font-size:11.5px;font-weight:600;}}
+.ai-sensor-btn.active{{background:#1f7a3f;color:#fff;}}
+.ai-sensor-note-wrap{{margin-top:6px;font-size:11.5px;}}
+.ai-sensor-note{{color:var(--muted);font-style:italic;}}
+.ai-sensor-note-set{{color:#1f7a3f;font-style:normal;font-weight:600;}}
+.ai-sensor-clear{{margin-left:6px;color:#c0392b;font-size:11px;}}
 a{{color:var(--accent);}}
 </style></head><body>
 
@@ -8151,6 +8269,46 @@ function deleteSelected() {{
       maybeAutoAdvance();
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
+}}
+// Sets (label truthy) or clears (label === '') one Ignore-labeled sample's
+// separate sensor-training label - see _ai_sensor_label_row_html(). Acts on
+// just the one card/id passed in, in either the grid or single-image view;
+// updates that card's own buttons/note in place rather than reloading.
+function setSensorLabel(id, label) {{
+  const status = document.getElementById('classifyStatus');
+  status.textContent = label ? 'Saving...' : 'Clearing...';
+  fetch('/ai-classify-set-sensor-label?id=' + encodeURIComponent(id) + '&label=' + encodeURIComponent(label))
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.ok) {{
+        status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+        return;
+      }}
+      let card = document.getElementById('ai-card-' + id);
+      if (!card) {{
+        const single = document.getElementById('singleCard');
+        if (single && single.dataset.id === id) card = single;
+      }}
+      if (card) {{
+        const row = card.querySelector('.ai-sensor-row');
+        if (row) {{
+          row.querySelectorAll('.ai-sensor-btn').forEach(btn => {{
+            btn.classList.toggle('active', btn.dataset.label === data.sensor_label);
+          }});
+          const noteWrap = row.querySelector('.ai-sensor-note-wrap');
+          if (noteWrap) {{
+            noteWrap.innerHTML = data.sensor_label
+              ? ('<span class="ai-sensor-note ai-sensor-note-set">&#10003; Sensor training label: ' +
+                 data.sensor_label + '</span> <a href="#" class="ai-sensor-clear" ' +
+                 'onclick="setSensorLabel(&#39;' + id + '&#39;, &#39;&#39;); return false;">&#10005; unset</a>')
+              : '<span class="ai-sensor-note">Not set — excluded from sensor-model training.</span>';
+          }}
+        }}
+      }}
+      status.textContent = data.sensor_label ? ('Sensor training label set: ' + data.sensor_label + '.')
+                                              : 'Sensor training label cleared.';
+    }})
+    .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
 }}
 function deleteClassifiedFullSize(count) {{
   if (!count) return;
