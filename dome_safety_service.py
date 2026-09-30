@@ -576,10 +576,22 @@ AI_CLASSIFY_PAGE_SIZE = 24  # how many sample cards the /ai-classify page shows 
 # already-decided Clear/Cloudy tri-state, since the whole point is to let
 # the model learn its own mapping from raw readings to your labels instead
 # of just re-deriving today's fixed-threshold logic.
+#
+# CHANGED: this used to also include "mlx_sky_c" and "mlx_ambient_ref_c"
+# alongside "mlx_delta_c" - but delta IS ambient minus sky, an exact
+# function of those other two, not independent information. Gaussian Naive
+# Bayes assumes every feature is conditionally independent given the class,
+# so feeding it all three let the same underlying signal get multiplied
+# into the score three times over, overstating confidence whenever they
+# happened to agree on the training set. Dropped the two redundant raw
+# components; "mlx_delta_anomaly_c" (see _train_ai_sky_model()) replaces
+# what they were meant to contribute - a version of the sky/ambient
+# relationship that's actually a second, genuinely distinct signal from raw
+# delta, not a restatement of it.
 AI_MODEL_PATH = os.path.join(AI_TRAINING_DIR, "sky_model.json")
 AI_MODEL_FEATURES = [
     "environment_temp_c", "environment_humidity", "box_temp_c", "box_humidity",
-    "mlx_sky_c", "mlx_ambient_ref_c", "mlx_delta_c",
+    "mlx_delta_c", "mlx_delta_anomaly_c",
 ]
 AI_MODEL_MIN_SAMPLES_PER_CLASS = 5  # below this, a class's mean/std would be near-meaningless
 AI_MODEL_MIN_STD = 0.5  # floor on a feature's std-dev so a near-zero-variance class never blows up the Gaussian
@@ -1237,6 +1249,65 @@ def _sensor_training_label(sample):
     return sensor_label
 
 
+def _fit_mlx_delta_correction(by_class):
+    """CloudWatcher-style learned delta correction: a clear sky's own
+    ambient-vs-sky IR delta isn't a fixed number - warmer, more humid air
+    radiates more IR itself, so the same genuinely clear sky reads a
+    smaller delta on a warm humid night than a cold dry one. Commercial IR
+    cloud sensors (e.g. the AAG CloudWatcher) correct for this with a
+    manually-calibrated multi-constant curve; this does the same job with a
+    single straight line - delta vs. ambient temperature - fitted from just
+    this site's own SAFE-labeled samples (Settings -> AI Learning ->
+    "Predicted labels that count as SAFE"), so it's calibrated from your
+    actual history instead of hand-tuned constants.
+
+    Returns (slope, intercept) such that slope*ambient_temp + intercept is
+    this site's own expected "clear" delta at a given ambient temperature.
+    Falls back to (0.0, 0.0) - meaning the correction is a no-op and the
+    anomaly feature below just equals the raw delta - whenever there isn't
+    at least 2 SAFE-labeled samples with both readings, or those samples
+    were all captured at essentially the same ambient temperature (nothing
+    to fit a slope from). Never raises."""
+    ai_cfg = get_setting("ai_learning")
+    safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
+    xs, ys = [], []
+    for cls, samples in by_class.items():
+        if cls.strip().lower() not in safe_labels:
+            continue
+        for sample in samples:
+            sensors = sample.get("sensors", {})
+            amb = sensors.get("mlx_ambient_ref_c")
+            delta = sensors.get("mlx_delta_c")
+            if amb is not None and delta is not None:
+                xs.append(amb)
+                ys.append(delta)
+    if len(xs) < 2:
+        return 0.0, 0.0
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    if var_x <= 1e-9:
+        return 0.0, 0.0
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / var_x
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def _mlx_delta_anomaly(sample, slope, intercept):
+    """How far a sample's actual sky/ambient delta is from THIS SITE's own
+    expected-clear-delta at that same ambient temperature (see
+    _fit_mlx_delta_correction()) - a temperature-normalized version of the
+    raw delta, and (unlike raw delta alongside raw sky/ambient) a genuinely
+    distinct signal for the classifier rather than a restatement of numbers
+    it already has. None if either underlying reading is missing."""
+    sensors = sample.get("sensors", {})
+    amb = sensors.get("mlx_ambient_ref_c")
+    delta = sensors.get("mlx_delta_c")
+    if amb is None or delta is None:
+        return None
+    return delta - (slope * amb + intercept)
+
+
 def _train_ai_sky_model():
     """Fits a Gaussian Naive Bayes classifier from every manually
     classified AI Learning sample eligible for sensor training (see
@@ -1246,11 +1317,14 @@ def _train_ai_sky_model():
     given sample never had fresh - e.g. the MLX90614 wasn't installed yet
     when it was captured - is simply excluded from that feature's
     statistics, not treated as zero), plus each label's share of the
-    eligible samples (its prior). Returns (model_dict, None) on success,
-    or (None, error_message) when there isn't enough classified data yet
-    to fit anything meaningful - never raises, and never leaves a
-    partially-written model file (the old one, if any, is left untouched
-    on failure)."""
+    eligible samples (its prior). Also fits this site's own learned
+    sky/ambient delta correction (see _fit_mlx_delta_correction()) and
+    saves its (slope, intercept) on the model so prediction time can
+    reproduce the exact same "mlx_delta_anomaly_c" feature. Returns
+    (model_dict, None) on success, or (None, error_message) when there
+    isn't enough classified data yet to fit anything meaningful - never
+    raises, and never leaves a partially-written model file (the old one,
+    if any, is left untouched on failure)."""
     idx = _load_ai_training_index()
     by_class = {}
     for sample in idx["samples"]:
@@ -1267,6 +1341,8 @@ def _train_ai_sky_model():
         return None, (f"These labels have fewer than {AI_MODEL_MIN_SAMPLES_PER_CLASS} classified samples so far: "
                        f"{', '.join(too_few)}. Classify more of those before training.")
 
+    mlx_correction_slope, mlx_correction_intercept = _fit_mlx_delta_correction(by_class)
+
     total = sum(len(samples) for samples in by_class.values())
     class_counts = {}
     class_stats = {}
@@ -1274,7 +1350,11 @@ def _train_ai_sky_model():
         class_counts[cls] = len(samples)
         stats = {}
         for feat in AI_MODEL_FEATURES:
-            values = [v for v in (sample.get("sensors", {}).get(feat) for sample in samples) if v is not None]
+            if feat == "mlx_delta_anomaly_c":
+                values = [v for v in (_mlx_delta_anomaly(sample, mlx_correction_slope, mlx_correction_intercept)
+                                       for sample in samples) if v is not None]
+            else:
+                values = [v for v in (sample.get("sensors", {}).get(feat) for sample in samples) if v is not None]
             if len(values) < 2:
                 continue  # not enough real readings of this feature for this class - omit it entirely
             mean = sum(values) / len(values)
@@ -1287,6 +1367,8 @@ def _train_ai_sky_model():
         "sample_count": total,
         "classes": sorted(by_class.keys()),
         "class_counts": class_counts,
+        "mlx_correction_slope": mlx_correction_slope,
+        "mlx_correction_intercept": mlx_correction_intercept,
         "priors": {cls: class_counts[cls] / total for cls in by_class},
         "class_stats": class_stats,
     }
@@ -1300,8 +1382,14 @@ def _predict_ai_sky_class(model, features):
     and this reading have a real number for - a feature missing from
     either side is simply skipped for that class (never treated as
     disqualifying, and never substituted with zero). Returns
-    (predicted_class, {class: log_score}) or (None, {}) if no class has
-    any usable feature overlap with this reading at all."""
+    (predicted_class, {class: log_score}, confidence) or (None, {}, None)
+    if no class has any usable feature overlap with this reading at all.
+    confidence is the winning class's posterior probability (softmax over
+    the other classes' log-scores, so it reflects how much better this
+    class scored relative to the runner-up, not an absolute probability of
+    being "correct") - purely informational, shown next to the prediction;
+    it does not change which class is predicted or feed the SAFE/UNSAFE
+    gate, which still keys off predicted_class alone."""
     scores = {}
     for cls in model["classes"]:
         stats = model.get("class_stats", {}).get(cls, {})
@@ -1322,9 +1410,16 @@ def _predict_ai_sky_class(model, features):
         if used_any_feature:
             scores[cls] = log_score
     if not scores:
-        return None, {}
+        return None, {}, None
     best_cls = max(scores, key=scores.get)
-    return best_cls, scores
+    # Softmax over the log-scores for a 0-1 confidence - subtracting the max
+    # first keeps exp() from overflowing on a very confident (very negative
+    # or very positive) log-score before it ever reaches this line.
+    max_score = max(scores.values())
+    exp_scores = {c: math.exp(s - max_score) for c, s in scores.items()}
+    total_exp = sum(exp_scores.values())
+    confidence = (exp_scores[best_cls] / total_exp) if total_exp > 0 else None
+    return best_cls, scores, confidence
 
 
 # ==========================================================================
@@ -2654,7 +2749,8 @@ sensor_state = {
     # model exists but nothing fresh to predict from right now), or "active"
     # (a real prediction was made this cycle). ai_model_predicted/
     # ai_model_sample_count are None until status is "active".
-    "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_sample_count": None,
+    "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_confidence": None,
+    "ai_model_sample_count": None,
     # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
     # for the full set of status values), independent of cloud_model_enabled.
     "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
@@ -3161,20 +3257,33 @@ def recompute_overall_safe():
         ai_model = _load_ai_sky_model()
         ai_model_valid = bool(ai_model and ai_model.get("classes") and ai_model.get("class_stats"))
         ai_predicted = None
+        ai_confidence = None
         if ai_model_valid:
             ai_env_fresh = sensor_state["env_temp_c"] is not None and (
                 bme_fresh if sensor_state["env_source"] == "BME280"
                 else dht_fresh if sensor_state["env_source"] == "DHT11" else False)
+            # mlx_delta_anomaly_c reproduces, at prediction time, the exact
+            # same site-calibrated correction _train_ai_sky_model() fit from
+            # this model's own SAFE-labeled training samples (see
+            # _fit_mlx_delta_correction()/_mlx_delta_anomaly()) - falls back
+            # to None (skipped like any other missing feature) whenever
+            # either underlying reading isn't available right now, or the
+            # model predates this feature and never saved the coefficients.
+            mlx_correction_slope = ai_model.get("mlx_correction_slope", 0.0)
+            mlx_correction_intercept = ai_model.get("mlx_correction_intercept", 0.0)
+            mlx_delta_anomaly_c = (
+                delta - (mlx_correction_slope * ambient_ref_c + mlx_correction_intercept)
+                if (delta is not None and ambient_ref_c is not None) else None
+            )
             ai_features = {
                 "environment_temp_c": sensor_state["env_temp_c"] if ai_env_fresh else None,
                 "environment_humidity": sensor_state["env_humidity"] if ai_env_fresh else None,
                 "box_temp_c": sensor_state["dht_temp_c"] if dht_fresh else None,
                 "box_humidity": sensor_state["dht_humidity"] if dht_fresh else None,
-                "mlx_sky_c": sensor_state["mlx_sky_c"] if mlx_fresh else None,
-                "mlx_ambient_ref_c": ambient_ref_c,
                 "mlx_delta_c": delta,
+                "mlx_delta_anomaly_c": mlx_delta_anomaly_c,
             }
-            ai_predicted, _ai_scores = _predict_ai_sky_class(ai_model, ai_features)
+            ai_predicted, _ai_scores, ai_confidence = _predict_ai_sky_class(ai_model, ai_features)
 
         # Unlike simpleCloudDetect and the Cloud Image Model below - both of
         # which classify a photo, where "Ignore" (a bad/unreliable frame) is
@@ -3191,6 +3300,7 @@ def recompute_overall_safe():
             ai_model_status = "active"
         sensor_state["ai_model_status"] = ai_model_status
         sensor_state["ai_model_predicted"] = ai_predicted
+        sensor_state["ai_model_confidence"] = ai_confidence
         sensor_state["ai_model_sample_count"] = ai_model.get("sample_count") if ai_model_valid else None
         # "Previous status" history for the dashboard's light-gray line under
         # this row - same pattern as mlx_cloud/ml_cloud above. Only tracked
@@ -5417,6 +5527,11 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         # _sensor_training_label()), so ai_predicted is always a genuine
         # sky-condition prediction.
         ai_display = ai_predicted
+        ai_confidence = s.get("ai_model_confidence")
+        # Purely informational (see _predict_ai_sky_class()'s docstring) -
+        # same treatment as the Cloud Image Model's own confidence % below,
+        # so both models read consistently on this same dashboard.
+        ai_confidence_str = f" ({ai_confidence * 100:.0f}%)" if ai_confidence is not None else ""
         ai_dot = _status_dot(
             s.get("ai_model_pass", True), ai_model_wanted,
             f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
@@ -5427,7 +5542,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         )
         using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
                       else "informational only, not used in the SAFE/UNSAFE decision")
-        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>
+        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>{ai_confidence_str}
   <span class="muted">(trained on {s.get('ai_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {using_note})</span>""")
     elif ai_model_wanted and ai_status == "untrained":
