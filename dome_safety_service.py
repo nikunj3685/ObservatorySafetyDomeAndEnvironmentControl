@@ -646,7 +646,17 @@ AI_MODEL_MIN_THRESHOLD_SAMPLES = 10  # below this many family-mapped samples, ke
 AI_HISTORY_WINDOW_HOURS = 48
 AI_HISTORY_CHART_W = 6062.5      # SVG viewBox width (px) - the scrollable 48h trace
 AI_HISTORY_LEFT_PAD = 62.5       # reserved strip at the left edge for the "Now" marker/label
-AI_HISTORY_BAND_H = 167.0        # SVG viewBox height (px), split into 3 equal Overcast/Cloudy/Clear bands
+AI_HISTORY_BAND_H = 167.0        # height (px) of the 3 equal Overcast/Cloudy/Clear colour bands only -
+                                 # NOT the SVG's total viewBox height (see AI_HISTORY_AXIS_H below)
+AI_HISTORY_AXIS_H = 20.0         # extra strip (px) reserved below the colour bands for the x-axis
+                                 # clock-time labels. The SVG viewBox height must be
+                                 # AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H, not AI_HISTORY_BAND_H alone -
+                                 # an SVG clips anything drawn outside its viewBox by default, and the
+                                 # time labels are drawn at a y below AI_HISTORY_BAND_H, so when the
+                                 # viewBox height was just AI_HISTORY_BAND_H they were silently clipped
+                                 # out and never visible, even though every other element (bands,
+                                 # gridlines, the trace itself) sat inside 0..AI_HISTORY_BAND_H and
+                                 # rendered fine.
 AI_HISTORY_GAP_SEC = 30 * 60     # a longer break than this between two samples starts a new trace segment,
                                  # instead of drawing a misleading line straight through a real data gap
 AI_HISTORY_DEFAULT_SATURATION_C = 15.0  # how many degrees past a threshold counts as "fully saturated" (pinned
@@ -6047,7 +6057,8 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
         x = AI_HISTORY_LEFT_PAD + frac * plot_w
         anchor = "start" if i == 0 else ("end" if i == n_ticks else "middle")
         label = _format_ampm(datetime.fromtimestamp(ts, tz).strftime("%I:%M %p"))
-        label_lines.append(f'<text x="{x:.1f}" y="179.0" font-size="8.5" font-weight="700" '
+        label_y = AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H - 8.0
+        label_lines.append(f'<text x="{x:.1f}" y="{label_y:.1f}" font-size="8.5" font-weight="700" '
                             f'fill="#6a7178" text-anchor="{anchor}">{label}</text>')
     x_labels_html = "\n  ".join(label_lines)
 
@@ -6064,7 +6075,7 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
                                f'stroke="#ffffff" stroke-width="0.9" opacity="0.28"/>')
     grid_html = "\n    ".join(grid_lines)
 
-    svg = f"""<svg class="hist-chart-compact" viewBox="0 0 {AI_HISTORY_CHART_W} {AI_HISTORY_BAND_H}" preserveAspectRatio="none">
+    svg = f"""<svg class="hist-chart-compact" viewBox="0 0 {AI_HISTORY_CHART_W} {AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H}" preserveAspectRatio="none">
   <rect x="0" y="0" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#e6bcc3"/>
   <rect x="0" y="{band:.2f}" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#f4e5c2"/>
   <rect x="0" y="{2*band:.2f}" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#c9e7b7"/>
