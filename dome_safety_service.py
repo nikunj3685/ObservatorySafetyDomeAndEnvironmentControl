@@ -3641,6 +3641,23 @@ def _log_startup_connectivity():
                            "persisted across restarts)")
 
 
+def _diag_step(name, fn):
+    """TEMPORARY diagnostic wrapper (remove once the "poll_cloud_model()
+    never even runs" mystery is solved) - times one step of
+    sensor_poll_loop()'s cycle and prints a line if it was slow. The
+    point isn't the timing threshold itself - it's that this print only
+    happens AFTER `fn()` returns, so if the thread is truly hung inside
+    one particular call (blocked forever on an I2C read, a lock, a
+    socket with no timeout - any of which would never raise and so
+    would never be caught by a try/except), the last-printed step name
+    in the log is exactly the one right before the one that's hanging."""
+    t0 = time.time()
+    fn()
+    dt = time.time() - t0
+    if dt > 0.5:
+        print(f"[sensor-poll][diag] {name} took {dt:.2f}s")
+
+
 def sensor_poll_loop():
     """Background thread entry point - runs forever, one cycle every
     SENSOR_POLL_INTERVAL_SEC, polling every sensor/model and recomputing
@@ -3669,25 +3686,29 @@ def sensor_poll_loop():
     last_ai_capture = 0.0
     last_autotrain_check = 0.0
     last_cloud_job_health_check = 0.0
+    cycle_num = 0
     while True:
+        cycle_num += 1
+        cycle_start = time.time()
         try:
-            poll_bme280()
-            poll_mlx90614()
-            poll_rain()
-            poll_dht11()
-            refresh_env_selection()
-            refresh_daynight()
+            _diag_step("poll_bme280", poll_bme280)
+            _diag_step("poll_mlx90614", poll_mlx90614)
+            _diag_step("poll_rain", poll_rain)
+            _diag_step("poll_dht11", poll_dht11)
+            _diag_step("refresh_env_selection", refresh_env_selection)
+            _diag_step("refresh_daynight", refresh_daynight)
 
             now = time.time()
             if now - last_cloud_poll >= CLOUDDETECT_POLL_INTERVAL_SEC:
-                poll_clouddetect()
+                _diag_step("poll_clouddetect", poll_clouddetect)
                 last_cloud_poll = now
 
             if now - last_cloud_model_predict >= CLOUD_MODEL_PREDICT_INTERVAL_SEC:
-                poll_cloud_model()
+                _diag_step("poll_cloud_model", poll_cloud_model)
                 last_cloud_model_predict = now
 
-            recompute_overall_safe()
+            _diag_step("recompute_overall_safe", recompute_overall_safe)
+            print(f"[sensor-poll][diag] cycle {cycle_num} complete in {time.time() - cycle_start:.2f}s")
 
             if not _startup_connectivity_logged:
                 _startup_connectivity_logged = True
