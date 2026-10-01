@@ -2000,6 +2000,14 @@ def poll_cloud_model():
     deliberately no connectivity tracking here the way polled sensors get -
     "no model trained yet" isn't a fault, just the expected state until
     you've trained one."""
+    # TEMPORARY diagnostic (remove once the "stuck on untrained despite
+    # files existing" mystery is solved) - prints exactly what this live
+    # process sees on disk, every cycle, so a real path/permission/timing
+    # mismatch between this process and a manual shell check becomes
+    # visible instead of guessed at.
+    print(f"[cloud-model][diag] TFLITE_AVAILABLE={TFLITE_AVAILABLE} "
+          f"tflite_path={CLOUD_MODEL_TFLITE_PATH!r} exists={os.path.isfile(CLOUD_MODEL_TFLITE_PATH)} "
+          f"classes_path={CLOUD_MODEL_CLASSES_PATH!r} exists={os.path.isfile(CLOUD_MODEL_CLASSES_PATH)}")
     if not TFLITE_AVAILABLE:
         status, predicted, confidence = "tflite_missing", None, None
     elif not _cloud_model_files_present():
