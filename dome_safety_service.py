@@ -2017,14 +2017,6 @@ def poll_cloud_model():
     deliberately no connectivity tracking here the way polled sensors get -
     "no model trained yet" isn't a fault, just the expected state until
     you've trained one."""
-    # TEMPORARY diagnostic (remove once the "stuck on untrained despite
-    # files existing" mystery is solved) - prints exactly what this live
-    # process sees on disk, every cycle, so a real path/permission/timing
-    # mismatch between this process and a manual shell check becomes
-    # visible instead of guessed at.
-    print(f"[cloud-model][diag] TFLITE_AVAILABLE={TFLITE_AVAILABLE} "
-          f"tflite_path={CLOUD_MODEL_TFLITE_PATH!r} exists={os.path.isfile(CLOUD_MODEL_TFLITE_PATH)} "
-          f"classes_path={CLOUD_MODEL_CLASSES_PATH!r} exists={os.path.isfile(CLOUD_MODEL_CLASSES_PATH)}")
     if not TFLITE_AVAILABLE:
         status, predicted, confidence = "tflite_missing", None, None
     elif not _cloud_model_files_present():
@@ -2041,23 +2033,34 @@ def poll_cloud_model():
             else:
                 status, predicted, confidence = "active", label, result
 
-    print(f"[cloud-model][diag] this cycle computed status={status!r} predicted={predicted!r}")
-
     meta = _load_cloud_model_meta()
     with sensor_lock:
         if status == "active" and predicted is not None and predicted.strip().lower() == "ignore":
             # "Ignore" is a configurable training label (ai_learning.
             # label_classes), not a real sky condition, so a frame the model
             # calls "Ignore" must never itself flip the gate or overwrite the
-            # dashboard's last trusted prediction - same "freeze at the last
-            # trusted reading" treatment poll_clouddetect() already gives
-            # simpleCloudDetect's own ignore-classes list above. Leave
-            # cloud_model_status/predicted/confidence exactly as they already
-            # are (untouched); cloud_model_ignored just flags that THIS
-            # cycle's raw read was Ignore, so the dashboard can show
-            # "Ignore(<held value>)" instead of silently showing the held
-            # value with no indication anything happened this cycle.
+            # dashboard's last trusted PREDICTED CLASS - same "freeze at the
+            # last trusted reading" treatment poll_clouddetect() already
+            # gives simpleCloudDetect's own ignore-classes list above. Only
+            # cloud_model_predicted/confidence are held at their old values
+            # here; cloud_model_status is still set to "active" below (note:
+            # this branch only runs when status IS already "active"), since
+            # the model itself is genuinely running and producing results -
+            # this one frame being unusable doesn't change that. Bug fixed
+            # here: this used to leave cloud_model_status untouched too,
+            # which meant a freshly (re)started service that happened to
+            # classify Ignore on every cycle since startup (no non-Ignore
+            # reading yet to "freeze" at) would never move its status off
+            # the compile-time default "untrained" - showing "no model has
+            # been downloaded yet" even though a real model was active the
+            # whole time and genuinely producing (all-Ignore) predictions.
+            # cloud_model_ignored flags that THIS cycle's raw read was
+            # Ignore, so the dashboard can show "Ignore(<held value>)" (or
+            # just "Ignore" if there's no held value yet) instead of
+            # silently showing a stale value with no indication anything
+            # happened this cycle.
             sensor_state["cloud_model_ignored"] = True
+            sensor_state["cloud_model_status"] = status
         else:
             sensor_state["cloud_model_ignored"] = False
             sensor_state["cloud_model_status"] = status
@@ -2065,8 +2068,6 @@ def poll_cloud_model():
             sensor_state["cloud_model_confidence"] = confidence
         sensor_state["cloud_model_sample_count"] = meta.get("sample_count") if meta else None
         sensor_state["cloud_model_last_predict"] = time.time()
-        print(f"[cloud-model][diag] sensor_state now holds cloud_model_status="
-              f"{sensor_state['cloud_model_status']!r} cloud_model_ignored={sensor_state['cloud_model_ignored']!r}")
 
 
 def _start_cloud_training(triggered_by="manual"):
@@ -5809,7 +5810,12 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         # poll_cloud_model() already froze cloud_model_predicted/confidence
         # at their last non-Ignore values while cloud_model_ignored is True.
         cloud_ignored = s.get("cloud_model_ignored")
-        cloud_display = f"Ignore({cloud_predicted})" if cloud_ignored else cloud_predicted
+        # cloud_predicted can still be None here if the model has been
+        # active since startup but has classified EVERY frame Ignore so
+        # far (nothing non-Ignore to hold/show yet) - show plain "Ignore"
+        # rather than the literal "Ignore(None)".
+        cloud_display = (f"Ignore({cloud_predicted})" if (cloud_ignored and cloud_predicted is not None)
+                          else "Ignore" if cloud_ignored else cloud_predicted)
         cloud_dot = _status_dot(
             s.get("cloud_model_pass", True), cloud_model_wanted,
             f"Cloud Image Model check: not currently used in the SAFE/UNSAFE decision (model currently "
