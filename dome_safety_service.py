@@ -3641,21 +3641,68 @@ def _log_startup_connectivity():
                            "persisted across restarts)")
 
 
-def _diag_step(name, fn):
-    """TEMPORARY diagnostic wrapper (remove once the "poll_cloud_model()
-    never even runs" mystery is solved) - times one step of
-    sensor_poll_loop()'s cycle and prints a line if it was slow. The
-    point isn't the timing threshold itself - it's that this print only
-    happens AFTER `fn()` returns, so if the thread is truly hung inside
-    one particular call (blocked forever on an I2C read, a lock, a
-    socket with no timeout - any of which would never raise and so
-    would never be caught by a try/except), the last-printed step name
-    in the log is exactly the one right before the one that's hanging."""
-    t0 = time.time()
-    fn()
-    dt = time.time() - t0
-    if dt > 0.5:
-        print(f"[sensor-poll][diag] {name} took {dt:.2f}s")
+_poll_step_in_flight = {}
+_poll_step_lock = threading.Lock()
+
+
+def _run_bounded(name, fn, timeout_sec):
+    """Runs one step of sensor_poll_loop()'s cycle on its own short-lived
+    daemon thread with a hard wall-clock timeout, so a single call that
+    BLOCKS FOREVER (a wedged I2C bus, an unresponsive local HTTP
+    service, a socket that somehow outlives its own declared timeout -
+    any of which never raises, so a try/except can never catch it)
+    can't freeze the whole polling cycle - and by extension every other
+    sensor reading and both AI gates - forever the way it was doing
+    before this existed (confirmed live: the loop completed a full
+    cycle on one restart, then hung with zero further progress across
+    multiple later restarts, all running the exact same code - an
+    intermittent hardware/network fault, not a deterministic bug).
+
+    Python cannot forcibly kill a thread that's stuck in a blocking
+    call, so a genuinely wedged call is simply abandoned here: this
+    function returns once the timeout elapses, while the orphaned
+    thread (if truly stuck) is left to finish - or never finish - on
+    its own, and whatever it was updating under its own locks just
+    stays at its last good value, same as any other stale reading
+    already handled via the *_last_poll staleness checks elsewhere. To
+    avoid piling up an unbounded number of these orphaned threads if
+    the same call keeps hanging cycle after cycle, a new attempt for
+    the same `name` is skipped entirely (not stacked) while a previous
+    attempt is still outstanding - it'll be tried again once/if that
+    one eventually returns."""
+    with _poll_step_lock:
+        if _poll_step_in_flight.get(name):
+            return  # a previous attempt for this exact step hasn't returned yet - don't pile on another
+        _poll_step_in_flight[name] = True
+
+    done = threading.Event()
+
+    def runner():
+        try:
+            fn()
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[sensor-poll] {name} raised (caught inside _run_bounded, loop continues):\n{tb}")
+            try:
+                _log_event("Settings",
+                           f"Internal error in the sensor polling loop's {name} step (skipped, loop "
+                           f"continues) - see the console/service log for the full traceback: "
+                           f"{tb.strip().splitlines()[-1]}",
+                           severity="warn")
+            except Exception:
+                pass  # logging the error must never itself be able to take this thread down
+        finally:
+            with _poll_step_lock:
+                _poll_step_in_flight[name] = False
+            done.set()
+
+    threading.Thread(target=runner, daemon=True).start()
+    if not done.wait(timeout=timeout_sec):
+        print(f"[sensor-poll][WARN] {name} did not return within {timeout_sec}s - likely blocked on a "
+              f"wedged sensor bus or an unresponsive network call. Abandoning this cycle's attempt and "
+              f"moving on; {name} will be attempted again on a later cycle once/if the stuck call "
+              f"eventually finishes on its own. If this keeps recurring, the affected hardware/service "
+              f"likely needs a physical power-cycle to clear.")
 
 
 def sensor_poll_loop():
@@ -3663,22 +3710,36 @@ def sensor_poll_loop():
     SENSOR_POLL_INTERVAL_SEC, polling every sensor/model and recomputing
     the overall SAFE/UNSAFE gate.
 
-    Every individual poll_*()/refresh_*() function below is already
-    self-guarding (each wraps its own hardware/network/file access in its
-    own try/except and documents "never raises"), but recompute_overall_safe()
-    itself - and this loop as a whole - historically had no outer safety
-    net: a single uncaught exception ANYWHERE in one cycle (an edge case
-    in a brand-new code path, a corrupt settings value, anything) would
-    silently kill this entire thread forever, freezing every sensor
-    reading, both AI gates, day/night tracking, and the SAFE/UNSAFE
-    fusion itself at whatever they last were - with nothing in the logs
-    to say why. That's a serious risk for a thread that gates physical
-    dome/heater hardware, so the whole cycle is now wrapped: an exception
-    here is logged (console + the Logs page) with its full traceback and
-    the loop moves on to the next cycle instead of dying, so a single bad
-    cycle can never again take down the whole safety loop, and the next
-    time something like this happens there's an actual traceback to
-    diagnose instead of a silent freeze."""
+    Two independent safety nets wrap every cycle, for two different
+    failure modes that were both confirmed happening live on this exact
+    system:
+
+    1. An uncaught EXCEPTION anywhere in one cycle (an edge case in a
+       brand-new code path, a corrupt settings value, anything) is
+       caught by the outer try/except below, logged (console + the Logs
+       page) with its full traceback, and the loop moves on to the next
+       cycle instead of dying - so a single bad cycle can never again
+       take down the whole safety loop.
+    2. A call that BLOCKS FOREVER instead of raising - a wedged I2C bus,
+       an unresponsive local HTTP service - is a different failure mode
+       that no try/except can ever catch, since nothing raises. Every
+       individual step is run through _run_bounded() (see its own
+       docstring), which gives it a hard wall-clock timeout on its own
+       thread and abandons waiting on it if it doesn't return in time,
+       so the cycle keeps moving instead of freezing forever. This was
+       confirmed live on this Pi: the loop completed full cycles for a
+       while, then produced zero further progress indefinitely across
+       several restarts, with the main Flask thread staying fully
+       responsive throughout - an intermittent hang in one blocking
+       call, not a deterministic bug, and not something any try/except
+       could have caught.
+
+    Before either of these existed, EITHER failure mode would silently
+    freeze this entire thread forever - every sensor reading, both AI
+    gates, day/night tracking, and the SAFE/UNSAFE fusion itself stuck
+    at whatever they last were - with nothing in the logs to say why.
+    That's a serious risk for a thread that gates physical dome/heater
+    hardware."""
     global _startup_connectivity_logged
     last_cloud_poll = 0.0
     last_cloud_model_predict = 0.0
@@ -3691,47 +3752,48 @@ def sensor_poll_loop():
         cycle_num += 1
         cycle_start = time.time()
         try:
-            _diag_step("poll_bme280", poll_bme280)
-            _diag_step("poll_mlx90614", poll_mlx90614)
-            _diag_step("poll_rain", poll_rain)
-            _diag_step("poll_dht11", poll_dht11)
-            _diag_step("refresh_env_selection", refresh_env_selection)
-            _diag_step("refresh_daynight", refresh_daynight)
+            _run_bounded("poll_bme280", poll_bme280, 3.0)
+            _run_bounded("poll_mlx90614", poll_mlx90614, 3.0)
+            _run_bounded("poll_rain", poll_rain, 2.0)
+            _run_bounded("poll_dht11", poll_dht11, 4.0)
+            _run_bounded("refresh_env_selection", refresh_env_selection, 2.0)
+            _run_bounded("refresh_daynight", refresh_daynight, 3.0)
 
             now = time.time()
             if now - last_cloud_poll >= CLOUDDETECT_POLL_INTERVAL_SEC:
-                _diag_step("poll_clouddetect", poll_clouddetect)
+                _run_bounded("poll_clouddetect", poll_clouddetect, 6.0)
                 last_cloud_poll = now
 
             if now - last_cloud_model_predict >= CLOUD_MODEL_PREDICT_INTERVAL_SEC:
-                _diag_step("poll_cloud_model", poll_cloud_model)
+                _run_bounded("poll_cloud_model", poll_cloud_model, 10.0)
                 last_cloud_model_predict = now
 
-            _diag_step("recompute_overall_safe", recompute_overall_safe)
-            print(f"[sensor-poll][diag] cycle {cycle_num} complete in {time.time() - cycle_start:.2f}s")
+            _run_bounded("recompute_overall_safe", recompute_overall_safe, 8.0)
+            print(f"[sensor-poll][diag] cycle {cycle_num} complete in {time.time() - cycle_start:.2f}s "
+                  f"(in-flight: {[k for k, v in _poll_step_in_flight.items() if v]})")
 
             if not _startup_connectivity_logged:
                 _startup_connectivity_logged = True
                 _log_startup_connectivity()
 
             if now - last_log_cleanup >= LOG_CLEANUP_INTERVAL_SEC:
-                _log_cleanup()
-                _ai_training_cleanup()
+                _run_bounded("_log_cleanup", _log_cleanup, 5.0)
+                _run_bounded("_ai_training_cleanup", _ai_training_cleanup, 5.0)
                 last_log_cleanup = now
 
             ai_cfg = get_setting("ai_learning")
             if ai_cfg.get("enabled"):
                 capture_interval_sec = max(60, int(ai_cfg.get("capture_interval_min", 15)) * 60)
                 if now - last_ai_capture >= capture_interval_sec:
-                    _capture_ai_training_sample()
+                    _run_bounded("_capture_ai_training_sample", _capture_ai_training_sample, 10.0)
                     last_ai_capture = now
 
             if now - last_autotrain_check >= AUTO_TRAIN_CHECK_INTERVAL_SEC:
-                maybe_auto_train()
+                _run_bounded("maybe_auto_train", maybe_auto_train, 15.0)
                 last_autotrain_check = now
 
             if now - last_cloud_job_health_check >= CLOUD_JOB_HEALTH_CHECK_INTERVAL_SEC:
-                _check_cloud_job_health()
+                _run_bounded("_check_cloud_job_health", _check_cloud_job_health, 10.0)
                 last_cloud_job_health_check = now
         except Exception:
             tb = traceback.format_exc()
