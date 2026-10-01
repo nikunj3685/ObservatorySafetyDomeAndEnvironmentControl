@@ -2041,6 +2041,8 @@ def poll_cloud_model():
             else:
                 status, predicted, confidence = "active", label, result
 
+    print(f"[cloud-model][diag] this cycle computed status={status!r} predicted={predicted!r}")
+
     meta = _load_cloud_model_meta()
     with sensor_lock:
         if status == "active" and predicted is not None and predicted.strip().lower() == "ignore":
@@ -2063,6 +2065,8 @@ def poll_cloud_model():
             sensor_state["cloud_model_confidence"] = confidence
         sensor_state["cloud_model_sample_count"] = meta.get("sample_count") if meta else None
         sensor_state["cloud_model_last_predict"] = time.time()
+        print(f"[cloud-model][diag] sensor_state now holds cloud_model_status="
+              f"{sensor_state['cloud_model_status']!r} cloud_model_ignored={sensor_state['cloud_model_ignored']!r}")
 
 
 def _start_cloud_training(triggered_by="manual"):
