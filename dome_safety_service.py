@@ -55,6 +55,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -66,6 +67,22 @@ from zoneinfo import ZoneInfo, available_timezones
 
 import requests
 from flask import Flask, request, jsonify, send_file, Response
+
+# Running under systemd, stdout is a pipe rather than a TTY, and Python's
+# default buffering for a non-TTY stream is fully-buffered (not
+# line-buffered) - every print() in this file can sit unflushed for
+# minutes before `journalctl` ever shows it, which made a real,
+# intermittent poll-loop hang (see sensor_poll_loop()/_run_bounded())
+# look indistinguishable from "nothing is printing anything at all"
+# during live debugging. Forcing line buffering here makes every print()
+# below show up in the journal immediately, the same way it would in an
+# interactive terminal - this is purely an I/O behavior change, nothing
+# about program logic.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import board
 import RPi.GPIO as GPIO
