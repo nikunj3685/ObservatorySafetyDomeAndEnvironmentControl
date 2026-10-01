@@ -57,6 +57,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 import urllib.parse
 import uuid
 import zipfile
@@ -3633,6 +3634,26 @@ def _log_startup_connectivity():
 
 
 def sensor_poll_loop():
+    """Background thread entry point - runs forever, one cycle every
+    SENSOR_POLL_INTERVAL_SEC, polling every sensor/model and recomputing
+    the overall SAFE/UNSAFE gate.
+
+    Every individual poll_*()/refresh_*() function below is already
+    self-guarding (each wraps its own hardware/network/file access in its
+    own try/except and documents "never raises"), but recompute_overall_safe()
+    itself - and this loop as a whole - historically had no outer safety
+    net: a single uncaught exception ANYWHERE in one cycle (an edge case
+    in a brand-new code path, a corrupt settings value, anything) would
+    silently kill this entire thread forever, freezing every sensor
+    reading, both AI gates, day/night tracking, and the SAFE/UNSAFE
+    fusion itself at whatever they last were - with nothing in the logs
+    to say why. That's a serious risk for a thread that gates physical
+    dome/heater hardware, so the whole cycle is now wrapped: an exception
+    here is logged (console + the Logs page) with its full traceback and
+    the loop moves on to the next cycle instead of dying, so a single bad
+    cycle can never again take down the whole safety loop, and the next
+    time something like this happens there's an actual traceback to
+    diagnose instead of a silent freeze."""
     global _startup_connectivity_logged
     last_cloud_poll = 0.0
     last_cloud_model_predict = 0.0
@@ -3641,47 +3662,59 @@ def sensor_poll_loop():
     last_autotrain_check = 0.0
     last_cloud_job_health_check = 0.0
     while True:
-        poll_bme280()
-        poll_mlx90614()
-        poll_rain()
-        poll_dht11()
-        refresh_env_selection()
-        refresh_daynight()
+        try:
+            poll_bme280()
+            poll_mlx90614()
+            poll_rain()
+            poll_dht11()
+            refresh_env_selection()
+            refresh_daynight()
 
-        now = time.time()
-        if now - last_cloud_poll >= CLOUDDETECT_POLL_INTERVAL_SEC:
-            poll_clouddetect()
-            last_cloud_poll = now
+            now = time.time()
+            if now - last_cloud_poll >= CLOUDDETECT_POLL_INTERVAL_SEC:
+                poll_clouddetect()
+                last_cloud_poll = now
 
-        if now - last_cloud_model_predict >= CLOUD_MODEL_PREDICT_INTERVAL_SEC:
-            poll_cloud_model()
-            last_cloud_model_predict = now
+            if now - last_cloud_model_predict >= CLOUD_MODEL_PREDICT_INTERVAL_SEC:
+                poll_cloud_model()
+                last_cloud_model_predict = now
 
-        recompute_overall_safe()
+            recompute_overall_safe()
 
-        if not _startup_connectivity_logged:
-            _startup_connectivity_logged = True
-            _log_startup_connectivity()
+            if not _startup_connectivity_logged:
+                _startup_connectivity_logged = True
+                _log_startup_connectivity()
 
-        if now - last_log_cleanup >= LOG_CLEANUP_INTERVAL_SEC:
-            _log_cleanup()
-            _ai_training_cleanup()
-            last_log_cleanup = now
+            if now - last_log_cleanup >= LOG_CLEANUP_INTERVAL_SEC:
+                _log_cleanup()
+                _ai_training_cleanup()
+                last_log_cleanup = now
 
-        ai_cfg = get_setting("ai_learning")
-        if ai_cfg.get("enabled"):
-            capture_interval_sec = max(60, int(ai_cfg.get("capture_interval_min", 15)) * 60)
-            if now - last_ai_capture >= capture_interval_sec:
-                _capture_ai_training_sample()
-                last_ai_capture = now
+            ai_cfg = get_setting("ai_learning")
+            if ai_cfg.get("enabled"):
+                capture_interval_sec = max(60, int(ai_cfg.get("capture_interval_min", 15)) * 60)
+                if now - last_ai_capture >= capture_interval_sec:
+                    _capture_ai_training_sample()
+                    last_ai_capture = now
 
-        if now - last_autotrain_check >= AUTO_TRAIN_CHECK_INTERVAL_SEC:
-            maybe_auto_train()
-            last_autotrain_check = now
+            if now - last_autotrain_check >= AUTO_TRAIN_CHECK_INTERVAL_SEC:
+                maybe_auto_train()
+                last_autotrain_check = now
 
-        if now - last_cloud_job_health_check >= CLOUD_JOB_HEALTH_CHECK_INTERVAL_SEC:
-            _check_cloud_job_health()
-            last_cloud_job_health_check = now
+            if now - last_cloud_job_health_check >= CLOUD_JOB_HEALTH_CHECK_INTERVAL_SEC:
+                _check_cloud_job_health()
+                last_cloud_job_health_check = now
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[sensor-poll] Unhandled exception in sensor_poll_loop - this cycle's updates were "
+                  f"skipped, but the loop itself will keep running on the next cycle:\n{tb}")
+            try:
+                _log_event("Settings",
+                           "Internal error in the sensor polling loop this cycle (skipped, loop continues) - "
+                           f"see the console/service log for the full traceback: {tb.strip().splitlines()[-1]}",
+                           severity="warn")
+            except Exception:
+                pass  # logging the error must never itself be able to take the loop down
 
         time.sleep(SENSOR_POLL_INTERVAL_SEC)
 
