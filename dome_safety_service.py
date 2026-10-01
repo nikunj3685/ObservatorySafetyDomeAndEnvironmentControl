@@ -569,71 +569,32 @@ AI_TRAINING_INDEX_PATH = os.path.join(AI_TRAINING_DIR, "index.json")
 AI_CLASSIFY_PAGE_SIZE = 24  # how many sample cards the /ai-classify page shows at once
 
 # AI Learning Phase 3 - the sky-condition model trained from classified
-# samples (see _train_ai_sky_model() below).
+# samples (see _train_ai_sky_model() below). AI_MODEL_FEATURES are the only
+# numeric readings it learns from - deliberately the RAW sensor numbers
+# (including the MLX90614's raw sky/ambient/delta, which _log_sensor_
+# snapshot() doesn't carry - see _ai_training_sensor_features()), never the
+# already-decided Clear/Cloudy tri-state, since the whole point is to let
+# the model learn its own mapping from raw readings to your labels instead
+# of just re-deriving today's fixed-threshold logic.
 #
-# CHANGED (corrected-delta method): this used to be a 6-feature Gaussian
-# Naive Bayes classifier (environment_temp_c, environment_humidity,
-# box_temp_c, box_humidity, mlx_delta_c, mlx_delta_anomaly_c). On real
-# logged data it scored only 61% - a borderline incident came back
-# "Clear (50%)", a coin flip, when the all-sky camera's own image model
-# correctly read it as cloudy. The replacement uses just the MLX90614
-# sky/ambient delta, corrected for ambient temperature the same way a
-# commercial IR cloud sensor (e.g. the AAG CloudWatcher) does - see
-# _fit_mlx_delta_correction()/_mlx_delta_anomaly() - and classifies the
-# corrected value against two learned thresholds instead of scoring 6
-# features probabilistically. Validated at 77% on the same real data.
-# It lives inside this exact same row/model/retrain cycle rather than a
-# new field, so AI_MODEL_MIN_SAMPLES_PER_CLASS and the periodic auto-
-# retrain trigger (maybe_auto_train) are unchanged by this.
+# CHANGED: this used to also include "mlx_sky_c" and "mlx_ambient_ref_c"
+# alongside "mlx_delta_c" - but delta IS ambient minus sky, an exact
+# function of those other two, not independent information. Gaussian Naive
+# Bayes assumes every feature is conditionally independent given the class,
+# so feeding it all three let the same underlying signal get multiplied
+# into the score three times over, overstating confidence whenever they
+# happened to agree on the training set. Dropped the two redundant raw
+# components; "mlx_delta_anomaly_c" (see _train_ai_sky_model()) replaces
+# what they were meant to contribute - a version of the sky/ambient
+# relationship that's actually a second, genuinely distinct signal from raw
+# delta, not a restatement of it.
 AI_MODEL_PATH = os.path.join(AI_TRAINING_DIR, "sky_model.json")
-AI_MODEL_MIN_SAMPLES_PER_CLASS = 5  # below this, a label's history is too thin to fit anything from
-
-# Folds every label down to one of the 3 zones this model actually
-# predicts (Clear/Cloudy/Overcast) so _fit_corrected_delta_thresholds()
-# can compare history that may use finer sub-labels (Partly Cloudy, Rain,
-# Snow, ...) against a 3-zone prediction on equal footing. A label not
-# listed here (a custom one of your own) is simply left out of the
-# threshold fit - it still counts toward everything else (class_counts,
-# the correction line's SAFE-labeled samples, etc.).
-AI_MODEL_FAMILY_MAP = {
-    "clear": "Clear",
-    "cloudy": "Cloudy",
-    "partly cloudy": "Cloudy",
-    "mostly cloudy": "Cloudy",
-    "overcast": "Overcast",
-    "rain": "Overcast",
-    "snow": "Overcast",
-    "freezing rain": "Overcast",
-}
-# This site's own real-data-validated starting point (fit from the first
-# real export this method was validated against) - used whenever there
-# isn't yet enough classified history with a recognized family label (see
-# AI_MODEL_FAMILY_MAP) to fit the two thresholds from scratch. Once there
-# is, every retrain refits them from this site's own growing history
-# instead, same as the correction line above.
-AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C = -4.2
-AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C = -14.4
-AI_MODEL_MIN_THRESHOLD_SAMPLES = 10  # below this many family-mapped samples, keep the defaults above
-
-# Sky History card (dashboard) - a scrollable 48-hour trace of this same
-# corrected-delta AI Sky Prediction, reusing the AI Learning training index
-# (see _load_ai_training_index()/AI_TRAINING_INDEX_PATH) as its data source
-# rather than a new logging mechanism: every periodic AI Learning capture
-# (Settings -> AI Learning -> "Capture interval") already stores a full
-# sensor snapshot - including the raw MLX90614 readings this needs -
-# whether or not that sample has been manually labeled yet, and unlabeled
-# ones only age out after unlabeled_retention_days (45 days by default) -
-# comfortably longer than this card's own 48-hour window. See
-# render_sky_history_html().
-AI_HISTORY_WINDOW_HOURS = 48
-AI_HISTORY_CHART_W = 6062.5      # SVG viewBox width (px) - the scrollable 48h trace
-AI_HISTORY_LEFT_PAD = 62.5       # reserved strip at the left edge for the "Now" marker/label
-AI_HISTORY_BAND_H = 167.0        # SVG viewBox height (px), split into 3 equal Overcast/Cloudy/Clear bands
-AI_HISTORY_GAP_SEC = 30 * 60     # a longer break than this between two samples starts a new trace segment,
-                                 # instead of drawing a misleading line straight through a real data gap
-AI_HISTORY_DEFAULT_SATURATION_C = 15.0  # how many degrees past a threshold counts as "fully saturated" (pinned
-                                         # to the outer edge of its band) whenever this window has no real
-                                         # reading that far past it yet to scale against
+AI_MODEL_FEATURES = [
+    "environment_temp_c", "environment_humidity", "box_temp_c", "box_humidity",
+    "mlx_delta_c", "mlx_delta_anomaly_c",
+]
+AI_MODEL_MIN_SAMPLES_PER_CLASS = 5  # below this, a class's mean/std would be near-meaningless
+AI_MODEL_MIN_STD = 0.5  # floor on a feature's std-dev so a near-zero-variance class never blows up the Gaussian
 
 # Cloud-trained image model (Phase 5) - a genuine image classifier, unlike
 # the from-scratch numeric model above, trained on the RAW PIXELS of your
@@ -1131,11 +1092,10 @@ def _ai_training_sensor_features():
     page's chips keep working unchanged) PLUS the raw MLX90614 numbers
     that function leaves out: mlx_sky_c, mlx_ambient_ref_c, mlx_delta_c.
     Those raw numbers, not the already-decided Clear/Cloudy tri-state, are
-    what _train_ai_sky_model() actually learns from (mlx_sky_c/
-    mlx_ambient_ref_c/mlx_delta_c - see _mlx_delta_anomaly()). Stale/no
-    reading is stored as None, same convention as every other field here,
-    so training simply excludes it rather than treating a missing sensor
-    as a real zero."""
+    what _train_ai_sky_model() actually learns from - see AI_MODEL_FEATURES
+    above. Stale/no reading is stored as None, same convention as every
+    other field here, so training simply excludes it rather than treating
+    a missing sensor as a real zero."""
     snapshot = _log_sensor_snapshot()
     with sensor_lock:
         s = dict(sensor_state)
@@ -1348,103 +1308,23 @@ def _mlx_delta_anomaly(sample, slope, intercept):
     return delta - (slope * amb + intercept)
 
 
-def _fit_corrected_delta_thresholds(by_class, slope, intercept):
-    """Finds the two corrected-delta cut points (see _mlx_delta_anomaly())
-    that best separate this site's own classified history into its three
-    top-level sky families - Clear / Cloudy / Overcast (see
-    AI_MODEL_FAMILY_MAP, which folds finer sub-labels like "Partly Cloudy"
-    or "Rain" into whichever of the three this model actually predicts).
-
-    Sorting every (anomaly, family) pair by anomaly value turns "pick 2
-    cut points" into "pick 2 split indices in the sorted list": below the
-    lower split predicts Overcast, above the higher split predicts Clear,
-    between them predicts Cloudy (lower anomaly = a colder-than-expected
-    sky reading = more cloud in the way). Trying every pair of split
-    indices and keeping whichever correctly places the most historical
-    samples is an exhaustive search, but it's O(n^2) over at most a few
-    thousand classified samples, so it finishes in well under a second
-    even on a Raspberry Pi - no gradient descent or external ML library
-    needed, same philosophy as the rest of this model.
-
-    Returns (threshold_clear_c, threshold_overcast_c). Falls back to this
-    site's own real-data-validated starting point
-    (AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C/_OVERCAST_C) whenever there isn't
-    yet at least AI_MODEL_MIN_THRESHOLD_SAMPLES worth of classified
-    history with a recognized family label and both underlying readings -
-    so a brand-new or lightly-classified site still gets a sensible
-    starting point instead of two meaningless, overfit numbers. Never
-    raises."""
-    points = []  # (anomaly, family) for every eligible sample
-    for label, samples in by_class.items():
-        family = AI_MODEL_FAMILY_MAP.get(label.strip().lower())
-        if family is None:
-            continue  # a custom/unrecognized label - can't place it in Clear/Cloudy/Overcast order
-        for sample in samples:
-            anomaly = _mlx_delta_anomaly(sample, slope, intercept)
-            if anomaly is not None:
-                points.append((anomaly, family))
-
-    if len(points) < AI_MODEL_MIN_THRESHOLD_SAMPLES or len({f for _, f in points}) < 2:
-        return AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C, AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C
-
-    points.sort(key=lambda p: p[0])
-    n = len(points)
-    prefix_overcast = [0] * (n + 1)
-    prefix_cloudy = [0] * (n + 1)
-    prefix_clear = [0] * (n + 1)
-    for i, (_, family) in enumerate(points):
-        prefix_overcast[i + 1] = prefix_overcast[i] + (1 if family == "Overcast" else 0)
-        prefix_cloudy[i + 1] = prefix_cloudy[i] + (1 if family == "Cloudy" else 0)
-        prefix_clear[i + 1] = prefix_clear[i] + (1 if family == "Clear" else 0)
-    total_clear = prefix_clear[n]
-
-    # score(i1, i2) = correctly-placed count if everything before i1 is
-    # called Overcast, everything from i1 up to i2 is called Cloudy, and
-    # everything from i2 on is called Clear (i1 <= i2).
-    best_score, best_i1, best_i2 = -1, 0, n
-    for i1 in range(0, n + 1):
-        overcast_correct = prefix_overcast[i1]
-        for i2 in range(i1, n + 1):
-            cloudy_correct = prefix_cloudy[i2] - prefix_cloudy[i1]
-            clear_correct = total_clear - prefix_clear[i2]
-            score = overcast_correct + cloudy_correct + clear_correct
-            if score > best_score:
-                best_score, best_i1, best_i2 = score, i1, i2
-
-    def _cut_value(i):
-        if i <= 0:
-            return points[0][0] - 1.0
-        if i >= n:
-            return points[-1][0] + 1.0
-        return (points[i - 1][0] + points[i][0]) / 2.0
-
-    threshold_overcast_c = _cut_value(best_i1)
-    threshold_clear_c = _cut_value(best_i2)
-    return threshold_clear_c, threshold_overcast_c
-
-
 def _train_ai_sky_model():
-    """Fits the corrected-delta sky model from every manually classified
-    AI Learning sample eligible for sensor training (see
+    """Fits a Gaussian Naive Bayes classifier from every manually
+    classified AI Learning sample eligible for sensor training (see
     _sensor_training_label() - this excludes "Ignore"-labeled samples
-    that haven't been given a separate sensor-training label).
-
-    CHANGED: this used to fit a 6-feature Gaussian Naive Bayes classifier
-    (mean/std per feature per label). It now fits just two things, both
-    refit from scratch on every call - same periodic retrain cycle as
-    before (see maybe_auto_train()/the Classify page's "Train model now"):
-
-      1. This site's own learned sky/ambient delta correction (see
-         _fit_mlx_delta_correction()), from this model's own SAFE-labeled
-         samples - unchanged from before.
-      2. The two zone-boundary thresholds (see
-         _fit_corrected_delta_thresholds()) that best separate this site's
-         history into Clear/Cloudy/Overcast once corrected.
-
-    Returns (model_dict, None) on success, or (None, error_message) when
-    there isn't enough classified data yet to fit anything meaningful -
-    never raises, and never leaves a partially-written model file (the
-    old one, if any, is left untouched on failure)."""
+    that haven't been given a separate sensor-training label): for each
+    label, the mean/std of each AI_MODEL_FEATURES reading (a feature a
+    given sample never had fresh - e.g. the MLX90614 wasn't installed yet
+    when it was captured - is simply excluded from that feature's
+    statistics, not treated as zero), plus each label's share of the
+    eligible samples (its prior). Also fits this site's own learned
+    sky/ambient delta correction (see _fit_mlx_delta_correction()) and
+    saves its (slope, intercept) on the model so prediction time can
+    reproduce the exact same "mlx_delta_anomaly_c" feature. Returns
+    (model_dict, None) on success, or (None, error_message) when there
+    isn't enough classified data yet to fit anything meaningful - never
+    raises, and never leaves a partially-written model file (the old one,
+    if any, is left untouched on failure)."""
     idx = _load_ai_training_index()
     by_class = {}
     for sample in idx["samples"]:
@@ -1462,11 +1342,25 @@ def _train_ai_sky_model():
                        f"{', '.join(too_few)}. Classify more of those before training.")
 
     mlx_correction_slope, mlx_correction_intercept = _fit_mlx_delta_correction(by_class)
-    threshold_clear_c, threshold_overcast_c = _fit_corrected_delta_thresholds(
-        by_class, mlx_correction_slope, mlx_correction_intercept)
 
     total = sum(len(samples) for samples in by_class.values())
-    class_counts = {cls: len(samples) for cls, samples in by_class.items()}
+    class_counts = {}
+    class_stats = {}
+    for cls, samples in by_class.items():
+        class_counts[cls] = len(samples)
+        stats = {}
+        for feat in AI_MODEL_FEATURES:
+            if feat == "mlx_delta_anomaly_c":
+                values = [v for v in (_mlx_delta_anomaly(sample, mlx_correction_slope, mlx_correction_intercept)
+                                       for sample in samples) if v is not None]
+            else:
+                values = [v for v in (sample.get("sensors", {}).get(feat) for sample in samples) if v is not None]
+            if len(values) < 2:
+                continue  # not enough real readings of this feature for this class - omit it entirely
+            mean = sum(values) / len(values)
+            variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+            stats[feat] = {"mean": mean, "std": max(variance ** 0.5, AI_MODEL_MIN_STD), "n": len(values)}
+        class_stats[cls] = stats
 
     model = {
         "trained_at": time.time(),
@@ -1475,40 +1369,57 @@ def _train_ai_sky_model():
         "class_counts": class_counts,
         "mlx_correction_slope": mlx_correction_slope,
         "mlx_correction_intercept": mlx_correction_intercept,
-        "threshold_clear_c": threshold_clear_c,
-        "threshold_overcast_c": threshold_overcast_c,
-        "method": "corrected_delta",
+        "priors": {cls: class_counts[cls] / total for cls in by_class},
+        "class_stats": class_stats,
     }
     _save_ai_sky_model(model)
     return model, None
 
 
 def _predict_ai_sky_class(model, features):
-    """Corrected-delta zone lookup: classifies this reading's
-    mlx_delta_anomaly_c (see _mlx_delta_anomaly()) against the model's two
-    learned thresholds - Clear at/above threshold_clear_c, Overcast below
-    threshold_overcast_c, Cloudy in between. Returns
-    (predicted_class, {"mlx_delta_anomaly_c": anomaly}, None), or
-    (None, {}, None) if the anomaly feature itself isn't available this
-    cycle (either underlying raw reading - sky temp or ambient temp - is
-    stale/missing). The third element is always None: unlike the Gaussian
-    Naive Bayes model this replaces, there's no posterior probability to
-    report here, just which side of which threshold the reading fell on -
-    callers show the signed anomaly value itself instead (see the
-    dashboard row), which is more informative than a confidence number
-    that doesn't correspond to anything underneath it."""
-    anomaly = features.get("mlx_delta_anomaly_c")
-    if anomaly is None:
+    """Gaussian Naive Bayes prediction: the class with the highest
+    log(prior) + sum of log-likelihoods over every feature BOTH the model
+    and this reading have a real number for - a feature missing from
+    either side is simply skipped for that class (never treated as
+    disqualifying, and never substituted with zero). Returns
+    (predicted_class, {class: log_score}, confidence) or (None, {}, None)
+    if no class has any usable feature overlap with this reading at all.
+    confidence is the winning class's posterior probability (softmax over
+    the other classes' log-scores, so it reflects how much better this
+    class scored relative to the runner-up, not an absolute probability of
+    being "correct") - purely informational, shown next to the prediction;
+    it does not change which class is predicted or feed the SAFE/UNSAFE
+    gate, which still keys off predicted_class alone."""
+    scores = {}
+    for cls in model["classes"]:
+        stats = model.get("class_stats", {}).get(cls, {})
+        prior = model.get("priors", {}).get(cls, 0)
+        if prior <= 0:
+            continue
+        log_score = math.log(prior)
+        used_any_feature = False
+        for feat, value in features.items():
+            if value is None:
+                continue
+            feat_stats = stats.get(feat)
+            if feat_stats is None:
+                continue
+            used_any_feature = True
+            mean, std = feat_stats["mean"], feat_stats["std"]
+            log_score += -0.5 * math.log(2 * math.pi * std * std) - ((value - mean) ** 2) / (2 * std * std)
+        if used_any_feature:
+            scores[cls] = log_score
+    if not scores:
         return None, {}, None
-    threshold_clear_c = model.get("threshold_clear_c", AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C)
-    threshold_overcast_c = model.get("threshold_overcast_c", AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C)
-    if anomaly >= threshold_clear_c:
-        predicted = "Clear"
-    elif anomaly >= threshold_overcast_c:
-        predicted = "Cloudy"
-    else:
-        predicted = "Overcast"
-    return predicted, {"mlx_delta_anomaly_c": anomaly}, None
+    best_cls = max(scores, key=scores.get)
+    # Softmax over the log-scores for a 0-1 confidence - subtracting the max
+    # first keeps exp() from overflowing on a very confident (very negative
+    # or very positive) log-score before it ever reaches this line.
+    max_score = max(scores.values())
+    exp_scores = {c: math.exp(s - max_score) for c, s in scores.items()}
+    total_exp = sum(exp_scores.values())
+    confidence = (exp_scores[best_cls] / total_exp) if total_exp > 0 else None
+    return best_cls, scores, confidence
 
 
 # ==========================================================================
@@ -2840,12 +2751,6 @@ sensor_state = {
     # ai_model_sample_count are None until status is "active".
     "ai_model_status": "untrained", "ai_model_predicted": None, "ai_model_confidence": None,
     "ai_model_sample_count": None,
-    # Corrected-delta anomaly (see _mlx_delta_anomaly()) behind the current
-    # prediction, in degrees C from this site's own expected-clear line -
-    # None except while status is "active". Shown on the dashboard instead
-    # of a confidence percentage (this method doesn't have one - see
-    # _predict_ai_sky_class()'s docstring).
-    "ai_model_anomaly_c": None,
     # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
     # for the full set of status values), independent of cloud_model_enabled.
     "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
@@ -3333,48 +3238,52 @@ def recompute_overall_safe():
                                       "info", "mlcloud"))
 
         # AI sky-condition model (Phase 4) - an optional fifth gate built on
-        # the corrected-delta model trained on the Classify page (see
+        # the from-scratch model trained on the Classify page (see
         # _train_ai_sky_model()/_predict_ai_sky_class() above). Off by
         # default (checks['ai_model_enabled']). Turning it on without a
         # valid trained model yet - never trained, or the model file went
         # missing/corrupt - is deliberately NOT treated as a failure of this
         # gate: it FAILS OPEN (behaves exactly like the toggle being off) so
         # a half-set-up AI Learning feature can never itself block the roof
-        # from opening. The same fail-open applies to a moment where the
-        # delta/ambient readings this needs aren't fresh. ai_model_status
-        # (below) records WHICH of these situations is currently true,
-        # independent of the toggle, so the dashboard can keep showing "what
-        # would the model say right now" even while the gate itself is off -
-        # exactly the Phase 3 informational display, just now also the
-        # source of truth for the live gate above it.
+        # from opening. The same fail-open applies to a moment where none of
+        # the model's features happen to have fresh readings to predict
+        # from. ai_model_status (below) records WHICH of these situations is
+        # currently true, independent of the toggle, so the dashboard can
+        # keep showing "what would the model say right now" even while the
+        # gate itself is off - exactly the Phase 3 informational display,
+        # just now also the source of truth for the live gate above it.
         ai_cfg = get_setting("ai_learning")
         ai_model_wanted = checks.get("ai_model_enabled", False)
         ai_model = _load_ai_sky_model()
-        # An old (pre-corrected-delta) model file on disk has "classes"/
-        # "class_stats" but no thresholds - treated as untrained here until
-        # the next retrain overwrites it with the new format, same as "no
-        # model file at all".
-        ai_model_valid = bool(ai_model and ai_model.get("threshold_clear_c") is not None
-                               and ai_model.get("threshold_overcast_c") is not None)
+        ai_model_valid = bool(ai_model and ai_model.get("classes") and ai_model.get("class_stats"))
         ai_predicted = None
         ai_confidence = None
-        ai_anomaly_c = None
         if ai_model_valid:
+            ai_env_fresh = sensor_state["env_temp_c"] is not None and (
+                bme_fresh if sensor_state["env_source"] == "BME280"
+                else dht_fresh if sensor_state["env_source"] == "DHT11" else False)
             # mlx_delta_anomaly_c reproduces, at prediction time, the exact
             # same site-calibrated correction _train_ai_sky_model() fit from
             # this model's own SAFE-labeled training samples (see
             # _fit_mlx_delta_correction()/_mlx_delta_anomaly()) - falls back
-            # to None (treated as "no reading to predict from") whenever
-            # either underlying raw reading isn't available right now.
+            # to None (skipped like any other missing feature) whenever
+            # either underlying reading isn't available right now, or the
+            # model predates this feature and never saved the coefficients.
             mlx_correction_slope = ai_model.get("mlx_correction_slope", 0.0)
             mlx_correction_intercept = ai_model.get("mlx_correction_intercept", 0.0)
             mlx_delta_anomaly_c = (
                 delta - (mlx_correction_slope * ambient_ref_c + mlx_correction_intercept)
                 if (delta is not None and ambient_ref_c is not None) else None
             )
-            ai_predicted, _ai_scores, ai_confidence = _predict_ai_sky_class(
-                ai_model, {"mlx_delta_anomaly_c": mlx_delta_anomaly_c})
-            ai_anomaly_c = mlx_delta_anomaly_c
+            ai_features = {
+                "environment_temp_c": sensor_state["env_temp_c"] if ai_env_fresh else None,
+                "environment_humidity": sensor_state["env_humidity"] if ai_env_fresh else None,
+                "box_temp_c": sensor_state["dht_temp_c"] if dht_fresh else None,
+                "box_humidity": sensor_state["dht_humidity"] if dht_fresh else None,
+                "mlx_delta_c": delta,
+                "mlx_delta_anomaly_c": mlx_delta_anomaly_c,
+            }
+            ai_predicted, _ai_scores, ai_confidence = _predict_ai_sky_class(ai_model, ai_features)
 
         # Unlike simpleCloudDetect and the Cloud Image Model below - both of
         # which classify a photo, where "Ignore" (a bad/unreliable frame) is
@@ -3392,7 +3301,6 @@ def recompute_overall_safe():
         sensor_state["ai_model_status"] = ai_model_status
         sensor_state["ai_model_predicted"] = ai_predicted
         sensor_state["ai_model_confidence"] = ai_confidence
-        sensor_state["ai_model_anomaly_c"] = ai_anomaly_c if ai_model_status == "active" else None
         sensor_state["ai_model_sample_count"] = ai_model.get("sample_count") if ai_model_valid else None
         # "Previous status" history for the dashboard's light-gray line under
         # this row - same pattern as mlx_cloud/ml_cloud above. Only tracked
@@ -5619,15 +5527,11 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         # _sensor_training_label()), so ai_predicted is always a genuine
         # sky-condition prediction.
         ai_display = ai_predicted
-        # CHANGED (corrected-delta method): this model no longer has a
-        # Naive Bayes posterior to show as a confidence % - instead it
-        # shows the actual signed anomaly (see _mlx_delta_anomaly()) that
-        # drove the prediction, in degrees C from this site's own
-        # expected-clear line, which is more informative than a confidence
-        # number that doesn't correspond to anything underneath it.
-        ai_anomaly_c = s.get("ai_model_anomaly_c")
-        ai_anomaly_str = (f" <span class=\"muted\">(corrected &Delta; {ai_anomaly_c:+.1f}&deg;C vs "
-                           f"expected-clear)</span>" if ai_anomaly_c is not None else "")
+        ai_confidence = s.get("ai_model_confidence")
+        # Purely informational (see _predict_ai_sky_class()'s docstring) -
+        # same treatment as the Cloud Image Model's own confidence % below,
+        # so both models read consistently on this same dashboard.
+        ai_confidence_str = f" ({ai_confidence * 100:.0f}%)" if ai_confidence is not None else ""
         ai_dot = _status_dot(
             s.get("ai_model_pass", True), ai_model_wanted,
             f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
@@ -5638,8 +5542,8 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         )
         using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
                       else "informational only, not used in the SAFE/UNSAFE decision")
-        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>{ai_anomaly_str}
-  <span class="muted">(correction fit from {s.get('ai_model_sample_count')} classified samples on the
+        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>{ai_confidence_str}
+  <span class="muted">(trained on {s.get('ai_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {using_note})</span>""")
     elif ai_model_wanted and ai_status == "untrained":
         ai_model_row = _field_row("", "⚠️",
@@ -5756,196 +5660,6 @@ def render_heater_info_html(h, heater_enabled=True, mosfet_name="Heater MOSFET")
    f"<p class='field'>Dew point <b>{h['dew_point_c']:.1f}&deg;C</b> &nbsp; Spread <b>{h['dew_spread_c']:.1f}&deg;C</b> &nbsp; "
    f"Freezing <b>{'YES' if h['freezing'] else 'no'}</b> &nbsp; Dew risk <b>{'YES' if h['dew_risk'] else 'no'}</b></p>"}
   {mosfet_note}"""
-
-
-def _ai_history_points(samples, model):
-    """(ts, anomaly) for every AI Learning training sample (see
-    _load_ai_training_index()) within the last AI_HISTORY_WINDOW_HOURS that
-    has both underlying raw readings (_mlx_delta_anomaly() needs
-    mlx_ambient_ref_c and mlx_delta_c) - sorted oldest first. Labeled or
-    not doesn't matter here (unlike _train_ai_sky_model()'s by_class
-    grouping) - every periodic capture has a real sensor snapshot attached
-    whether or not a human has classified it yet, and that's all this
-    trace needs. Returns [] if there's no valid trained model (nothing to
-    score the readings against) - never raises."""
-    if not model or model.get("threshold_clear_c") is None:
-        return []
-    slope = model.get("mlx_correction_slope", 0.0)
-    intercept = model.get("mlx_correction_intercept", 0.0)
-    window_start = time.time() - AI_HISTORY_WINDOW_HOURS * 3600
-    points = []
-    for sample in samples:
-        ts = sample.get("ts")
-        if ts is None or ts < window_start:
-            continue
-        anomaly = _mlx_delta_anomaly(sample, slope, intercept)
-        if anomaly is not None:
-            points.append((ts, anomaly))
-    points.sort(key=lambda p: p[0])
-    return points
-
-
-def render_sky_history_html(samples, s, tz_name="UTC"):
-    """The Sky History card: a scrollable 48-hour trace of the corrected-
-    delta AI Sky Prediction (see _train_ai_sky_model()/_predict_ai_sky_
-    class()), reusing the AI Learning training index as its data source
-    (see AI_HISTORY_WINDOW_HOURS's comment above) rather than a new
-    logging mechanism. Always returns a complete `<div class="card
-    history-compact" id="history">...</div>` - falls back to a plain
-    explanatory message inside that same card frame (same fail-soft
-    philosophy as the AI Model row itself) whenever there's no trained
-    model yet or fewer than 2 real readings in the window, rather than
-    omitting the card entirely, so it's never a surprise where this went.
-    Called from both web_index() (initial page load) and web_fragments()
-    (periodic refresh), same pattern as render_env_readings_html() -
-    `samples` is the caller's already-loaded AI training index samples
-    list, so this never triggers a second redundant disk read per
-    request."""
-    model = _load_ai_sky_model()
-    points = _ai_history_points(samples, model)
-
-    def _card(body_html):
-        return f"""<div class="card history-compact" id="history">
-  <h2><span class="title">📈 Sky History</span></h2>
-  {body_html}
-</div>"""
-
-    if not points or len(points) < 2:
-        reason = ("Train a model on the <a href=\"/ai-classify\">Classify page</a> first."
-                   if not model or model.get("threshold_clear_c") is None else
-                   "Not enough readings logged in the last 48 hours yet - check back once a "
-                   "few more AI Learning captures have come in.")
-        return _card(f'<p class="hint">No AI Sky Prediction history to show yet. {reason}</p>')
-
-    threshold_clear_c = model.get("threshold_clear_c", AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C)
-    threshold_overcast_c = model.get("threshold_overcast_c", AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C)
-
-    # How far past each threshold counts as "fully saturated" (pinned to the
-    # outer edge of its band) - scaled from this window's own deepest
-    # reading on that side so the trace uses the full height of its band,
-    # falling back to a fixed default whenever this window doesn't have a
-    # real reading that far past the threshold yet (e.g. everything so far
-    # has been borderline).
-    overcast_vals = [a for _, a in points if a < threshold_overcast_c]
-    clear_vals = [a for _, a in points if a >= threshold_clear_c]
-    oc_deep = max(1.0, threshold_overcast_c - min(overcast_vals)) if overcast_vals else AI_HISTORY_DEFAULT_SATURATION_C
-    cl_deep = max(1.0, max(clear_vals) - threshold_clear_c) if clear_vals else AI_HISTORY_DEFAULT_SATURATION_C
-
-    band = AI_HISTORY_BAND_H / 3.0  # 3 equal bands: Overcast (top) / Cloudy (middle) / Clear (bottom)
-
-    def y_for_anomaly(a):
-        if a >= threshold_clear_c:
-            frac = max(0.0, min(1.0, (a - threshold_clear_c) / cl_deep))
-            return 2 * band + frac * band
-        elif a >= threshold_overcast_c:
-            frac = (a - threshold_overcast_c) / (threshold_clear_c - threshold_overcast_c)
-            return band + frac * band
-        else:
-            frac = max(0.0, min(1.0, (threshold_overcast_c - a) / oc_deep))
-            return band * (1 - frac)
-
-    now = time.time()
-    window_sec = AI_HISTORY_WINDOW_HOURS * 3600.0
-    plot_w = AI_HISTORY_CHART_W - AI_HISTORY_LEFT_PAD
-
-    def x_for_ts(ts):
-        return AI_HISTORY_LEFT_PAD + (now - ts) / window_sec * plot_w
-
-    # Break into a new <polyline> whenever two consecutive readings are
-    # further apart than AI_HISTORY_GAP_SEC, instead of drawing a straight
-    # (and misleading) line through a real gap in the data - AI Learning
-    # being off for a while, a power cut, etc.
-    segments = [[]]
-    prev_ts = None
-    for ts, anomaly in points:
-        if prev_ts is not None and (ts - prev_ts) > AI_HISTORY_GAP_SEC:
-            segments.append([])
-        segments[-1].append(f"{x_for_ts(ts):.2f},{y_for_anomaly(anomaly):.2f}")
-        prev_ts = ts
-    polylines = "\n  ".join(
-        f'<polyline fill="none" stroke="#2c3e50" stroke-width="1.4" stroke-linejoin="round" '
-        f'stroke-linecap="round" opacity="0.9" points="{" ".join(seg)}"/>'
-        for seg in segments if len(seg) >= 2)
-
-    # "Now" marker - the LIVE prediction (same value the AI Sky Prediction
-    # row above shows this cycle), not the last historical capture, so the
-    # dot never lags behind what the rest of the page is currently saying.
-    now_anomaly = s.get("ai_model_anomaly_c")
-    now_predicted = s.get("ai_model_predicted") if s.get("ai_model_status") == "active" else None
-    if now_anomaly is not None and now_predicted is not None:
-        now_y = y_for_anomaly(now_anomaly)
-        now_label_y = max(9.0, now_y - 4.0)
-        now_marker = f"""<circle cx="{AI_HISTORY_LEFT_PAD}" cy="{now_y:.2f}" r="4" fill="#c62828" stroke="#ffffff" stroke-width="1.2"><animate attributeName="r" values="4;6.5;4" dur="1.8s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;0.4;1" dur="1.8s" repeatCount="indefinite"/></circle>
-  <text x="20" y="10" font-size="8" font-weight="700" fill="#c62828" text-anchor="start">Now</text>
-  <text x="{AI_HISTORY_LEFT_PAD + 5.5:.1f}" y="{now_label_y:.2f}" font-size="7.8" font-weight="700" fill="#2c3e50" text-anchor="start">AI Sky Prediction: {now_predicted}</text>"""
-    else:
-        now_marker = ""
-
-    # 9 evenly-spaced x-axis clock-time labels across the 48h window (6
-    # hours apart), same local timezone/AM-PM styling as the rest of the
-    # page (_format_ampm()).
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    label_lines = []
-    n_ticks = 8
-    for i in range(n_ticks + 1):
-        frac = i / n_ticks
-        ts = now - (1 - frac) * window_sec
-        x = AI_HISTORY_LEFT_PAD + frac * plot_w
-        anchor = "start" if i == 0 else ("end" if i == n_ticks else "middle")
-        label = _format_ampm(datetime.fromtimestamp(ts, tz).strftime("%I:%M %p"))
-        label_lines.append(f'<text x="{x:.1f}" y="179.0" font-size="8.5" font-weight="700" '
-                            f'fill="#6a7178" text-anchor="{anchor}">{label}</text>')
-    x_labels_html = "\n  ".join(label_lines)
-
-    # Minor/major vertical gridlines, purely cosmetic - a major line at
-    # every labeled tick, one lighter minor line at each tick's midpoint.
-    grid_lines = []
-    for i in range(n_ticks + 1):
-        x = AI_HISTORY_LEFT_PAD + (i / n_ticks) * plot_w
-        grid_lines.append(f'<line x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{AI_HISTORY_BAND_H}" '
-                           f'stroke="#ffffff" stroke-width="1.1" opacity="0.65"/>')
-        if i < n_ticks:
-            xm = AI_HISTORY_LEFT_PAD + ((i + 0.5) / n_ticks) * plot_w
-            grid_lines.append(f'<line x1="{xm:.1f}" y1="0" x2="{xm:.1f}" y2="{AI_HISTORY_BAND_H}" '
-                               f'stroke="#ffffff" stroke-width="0.9" opacity="0.28"/>')
-    grid_html = "\n    ".join(grid_lines)
-
-    svg = f"""<svg class="hist-chart-compact" viewBox="0 0 {AI_HISTORY_CHART_W} {AI_HISTORY_BAND_H}" preserveAspectRatio="none">
-  <rect x="0" y="0" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#e6bcc3"/>
-  <rect x="0" y="{band:.2f}" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#f4e5c2"/>
-  <rect x="0" y="{2*band:.2f}" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#c9e7b7"/>
-  <line x1="0" y1="{band:.2f}" x2="{AI_HISTORY_CHART_W}" y2="{band:.2f}" stroke="#ffffff" stroke-width="1.6" opacity="0.9"/>
-  <line x1="0" y1="{2*band:.2f}" x2="{AI_HISTORY_CHART_W}" y2="{2*band:.2f}" stroke="#ffffff" stroke-width="1.6" opacity="0.9"/>
-  <g>
-    {grid_html}
-  </g>
-  {x_labels_html}
-  {polylines}
-  <line x1="{AI_HISTORY_LEFT_PAD}" y1="0" x2="{AI_HISTORY_LEFT_PAD}" y2="{AI_HISTORY_BAND_H}" stroke="#c62828" stroke-width="1.2" stroke-dasharray="3,2.2"/>
-  {now_marker}
-  <line x1="0" y1="{AI_HISTORY_BAND_H}" x2="{AI_HISTORY_CHART_W}" y2="{AI_HISTORY_BAND_H}" stroke="#d7dbe0" stroke-width="1"/>
-</svg>"""
-
-    body = f"""<div class="hist-wrap-c">
-    <div class="hist-zone-axis-c">
-      <span class="zlabel" style="top:21px;color:#8a3236;">Overcast</span>
-      <span class="zlabel" style="top:77px;color:#8a6a00;">Cloudy</span>
-      <span class="zlabel" style="top:133px;color:#1a7f37;">Clear</span>
-    </div>
-    <div class="hist-scroll-c" id="hist-scroll-slot">
-{svg}
-    </div>
-    <div class="hist-zone-sub-c">
-      <span class="sublabel" style="top:2px;color:#555;font-size:7.5px;">deep</span>
-      <span class="sublabel" style="top:{band-5:.1f}px;color:#8a3236;font-size:7.5px;">{threshold_overcast_c:.1f}&deg;C</span>
-      <span class="sublabel" style="top:{2*band-5:.1f}px;color:#8a6a00;font-size:7.5px;">{threshold_clear_c:.1f}&deg;C</span>
-      <span class="sublabel" style="top:158px;color:#555;font-size:7.5px;">deep clear</span>
-    </div>
-  </div>"""
-    return _card(body)
 
 
 def clouddetect_link_for(req):
@@ -6065,23 +5779,6 @@ def web_fragments():
         "ai_sample_count": ai_sample_count,
         "ai_unlabeled_count": ai_unlabeled_count,
     })
-
-
-@app.route("/sky-history", methods=["GET"])
-def web_sky_history():
-    """The Sky History card's own refresh endpoint, polled far less often
-    than /fragments (see the JS below) - its underlying data only changes
-    at most as often as AI Learning's own capture interval (15 minutes by
-    default), so rebuilding its SVG (a few hundred points, formatted as
-    text) on every 3-second /fragments poll forever would be pure waste on
-    a Raspberry Pi for no visible benefit. The "Now" marker is only as
-    fresh as this endpoint's own refresh cadence as a result - a
-    deliberate trade-off, not an oversight."""
-    loc = get_setting("location")
-    with sensor_lock:
-        s = dict(sensor_state)
-    idx = _load_ai_training_index()
-    return jsonify({"ok": True, "html": render_sky_history_html(idx["samples"], s, loc["tz_name"])})
 
 
 @app.route("/", methods=["GET"])
@@ -6252,7 +5949,6 @@ def web_index():
     daynight_html = render_daynight_html(s, loc["night_threshold_deg"], checks["daynight_enabled"], loc["tz_name"])
     env_html = render_env_readings_html(s, checks, clouddetect_link, sensor_names, loc["tz_name"],
                                           cloud_total_labeled=ai_total_labeled)
-    sky_history_html = render_sky_history_html(_ai_idx_for_stats["samples"], s, loc["tz_name"])
     heater_info_html = render_heater_info_html(h, heater_enabled, sensor_names["mosfet"])
 
     manual_heater = (heater_mode == "MANUAL")
@@ -6322,30 +6018,11 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .card.safety{{--accent:var(--accent-safety);}}
 .card.dome{{--accent:var(--accent-dome);}}
 .card.heater{{--accent:var(--accent-heater);}}
+.card.allsky{{--accent:var(--accent-allsky);}}
 .card.settings{{--accent:var(--accent-schedule);}}
 .allsky-img-wrap{{width:100%;border-radius:10px;overflow:hidden;background:#14161a;min-height:140px;
-  flex:none;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;}}
-.allsky-img-wrap img{{width:100%;height:100%;object-fit:cover;display:block;}}
-/* All Sky + Sky History sit together in their own vertical flex column
-   (not plain grid items) so Sky History can grow to fill exactly whatever
-   height All Sky's own (now fixed 1:1) aspect ratio leaves free, matching
-   the Safety Monitor card's height alongside it - see .card.history-compact
-   below. Only used when All Sky is enabled; with it off, Sky History (if it
-   has anything to show) is just a normal grid item like Dome/Heater. */
-.right-col{{display:flex;flex-direction:column;gap:16px;}}
-.card.allsky{{--accent:var(--accent-allsky);flex:none;}}
-.card.history-compact{{--accent:#0f766e;padding:12px 14px 8px;flex:1 1 auto;display:flex;
-  flex-direction:column;min-height:0;}}
-.card.history-compact h2{{margin:0 0 6px;font-size:13px;flex:none;}}
-.hist-wrap-c{{display:flex;border:1px solid #e3e6ea;border-radius:8px;overflow:hidden;
-  background:#fafbfc;flex:1 1 auto;min-height:0;}}
-.hist-zone-axis-c{{flex:0 0 48px;position:relative;background:#fafbfc;border-right:1px solid #e3e6ea;}}
-.hist-zone-axis-c .zlabel{{position:absolute;left:4px;right:2px;font-size:9px;font-weight:700;line-height:1.05;}}
-.hist-scroll-c{{flex:1 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;}}
-.hist-chart-compact{{display:block;width:{AI_HISTORY_CHART_W}px;height:100%;}}
-.hist-zone-sub-c{{flex:0 0 56px;position:relative;background:#fafbfc;border-left:1px solid #e3e6ea;}}
-.hist-zone-sub-c .sublabel{{position:absolute;left:4px;right:2px;font-size:6.4px;font-weight:600;
-  opacity:0.85;line-height:1.0;}}
+  flex:1;display:flex;align-items:center;justify-content:center;}}
+.allsky-img-wrap img{{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;}}
 @media (min-width:741px){{
   /* Three independent vertical stacks, not a shared grid: column 1 is
      Location & Timezone, Safety Checks, then Logging; column 2 is
@@ -6479,8 +6156,7 @@ a{{color:var(--accent-safety);}}
   <a href="#safety-checks">Settings → Safety Checks</a>.</p>
 </div>
 
-{"" if not allsky_enabled else f'''<div class="right-col">
-<div class="card allsky" id="allsky">
+{"" if not allsky_enabled else f'''<div class="card allsky" id="allsky">
   <h2><span class="title">🌌 All Sky</span></h2>
   <div class="allsky-img-wrap">
     <img id="allskyImg" src="{allsky_img_initial_src}" alt="Latest all-sky camera image"
@@ -6489,11 +6165,7 @@ a{{color:var(--accent-safety);}}
   </div>
   <p class="hint" id="allskyStatus">Loading&hellip;</p>
   {"" if not allsky_page_url else f"<p class='hint'><a href='{allsky_page_url}' target='_blank' rel='noopener'>View full All Sky page &rarr;</a></p>"}
-</div>
-<div id="historyBlock">{sky_history_html}</div>
 </div>'''}
-
-{"" if allsky_enabled else f'<div id="historyBlock">{sky_history_html}</div>'}
 
 <div class="card dome" id="dome">
   <h2><span class="title">🚪 Dome <span id="domeState" class="badge {dome_badge_class}">{dome_state}</span></span></h2>
@@ -7136,16 +6808,6 @@ function checkAllsky(){{
   }}).catch(function(){{}});
 }}
 setInterval(checkAllsky, 5000);
-
-function refreshSkyHistory(){{
-  fetch('/sky-history').then(function(r){{ return r.json(); }}).then(function(d){{
-    if (d.ok){{
-      var hb = document.getElementById('historyBlock');
-      if (hb) hb.innerHTML = d.html;
-    }}
-  }}).catch(function(){{}});
-}}
-setInterval(refreshSkyHistory, 60000);
 </script>
 </body></html>"""
     return html
@@ -8030,7 +7692,7 @@ def _ai_classify_chips_html(sensors):
         chips.append(f"Box {sensors['box_temp_c']:.1f}C {sensors.get('box_humidity') or 0:.0f}%RH")
     if sensors.get("sky_mlx"):
         # The raw MLX90614 numbers - what a trained model actually learns
-        # from (see _mlx_delta_anomaly()) - shown alongside the already-
+        # from (see AI_MODEL_FEATURES) - shown alongside the already-
         # decided Clear/Cloudy word, not just the word alone, so classifying
         # by eye can be checked against the same number the model uses.
         # Older samples captured before this field existed won't have it.
