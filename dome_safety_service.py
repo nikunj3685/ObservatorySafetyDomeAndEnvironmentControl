@@ -62,7 +62,7 @@ import traceback
 import urllib.parse
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, available_timezones
 
 import requests
@@ -644,11 +644,15 @@ AI_MODEL_MIN_THRESHOLD_SAMPLES = 10  # below this many family-mapped samples, ke
 # comfortably longer than this card's own 48-hour window. See
 # render_sky_history_html().
 AI_HISTORY_WINDOW_HOURS = 48
-AI_HISTORY_CHART_W = 6062.5      # SVG viewBox width (px) - the scrollable 48h trace
+AI_HISTORY_CHART_W = 3062.5      # SVG viewBox width (px) - the scrollable 48h trace. Halved from the
+                                 # original 6062.5 so the chart's real density is 2x what it was
+                                 # (62.5px/hour instead of 125px/hour) - same 48h window, half the
+                                 # horizontal pixels/scrolling, so the same hourly tick labels sit
+                                 # half as far apart.
 AI_HISTORY_LEFT_PAD = 62.5       # reserved strip at the left edge for the "Now" marker/label
 AI_HISTORY_BAND_H = 167.0        # height (px) of the 3 equal Overcast/Cloudy/Clear colour bands only -
                                  # NOT the SVG's total viewBox height (see AI_HISTORY_AXIS_H below)
-AI_HISTORY_AXIS_H = 20.0         # extra strip (px) reserved below the colour bands for the x-axis
+AI_HISTORY_AXIS_H = 30.0         # extra strip (px) reserved below the colour bands for the x-axis
                                  # clock-time labels. The SVG viewBox height must be
                                  # AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H, not AI_HISTORY_BAND_H alone -
                                  # an SVG clips anything drawn outside its viewBox by default, and the
@@ -656,7 +660,8 @@ AI_HISTORY_AXIS_H = 20.0         # extra strip (px) reserved below the colour ba
                                  # viewBox height was just AI_HISTORY_BAND_H they were silently clipped
                                  # out and never visible, even though every other element (bands,
                                  # gridlines, the trace itself) sat inside 0..AI_HISTORY_BAND_H and
-                                 # rendered fine.
+                                 # rendered fine. Tall enough for two lines now (the clock-time label
+                                 # plus, on a 12:00AM tick, the calendar date right below it).
 AI_HISTORY_GAP_SEC = 30 * 60     # a longer break than this between two samples starts a new trace segment,
                                  # instead of drawing a misleading line straight through a real data gap
 AI_HISTORY_DEFAULT_SATURATION_C = 15.0  # how many degrees past a threshold counts as "fully saturated" (pinned
@@ -3044,6 +3049,20 @@ def _format_ampm(s):
     """'03:42 PM' -> '03:42 P.M.' (periods, matches the ESP32-era styling this
     was ported from) - works on any string produced by strftime's %p/%I."""
     return s.replace("AM", "A.M.").replace("PM", "P.M.")
+
+
+def _format_axis_time(dt):
+    """'03:00 AM' -> '3:00AM' - compact clock-time format used ONLY by the
+    Sky History chart's x-axis labels (see render_sky_history_html()): no
+    leading zero, no space, no periods, so a dense run of hourly labels
+    stays short enough to fit without crowding. Deliberately separate from
+    _format_ampm(), whose '03:42 P.M.' styling is used everywhere else on
+    the page."""
+    raw = dt.strftime("%I:%M %p")          # '03:00 AM'
+    hour, rest = raw.split(":", 1)
+    hour = str(int(hour))                   # '03' -> '3'
+    minute, ampm = rest.split(" ")          # '00', 'AM'
+    return f"{hour}:{minute}{ampm}"         # '3:00AM'
 
 
 def _prev_status_text(prev_value, prev_since, tz_name, label_map=None):
@@ -6042,37 +6061,51 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
     else:
         now_marker = ""
 
-    # 9 evenly-spaced x-axis clock-time labels across the 48h window (6
-    # hours apart), same local timezone/AM-PM styling as the rest of the
-    # page (_format_ampm()).
+    # Hourly x-axis clock-time labels across the 48h window, CLOCK-ALIGNED
+    # (every tick lands exactly on the hour - :00 - rather than being offset
+    # by "now"'s own minutes/seconds the way a simple "now minus k hours"
+    # walk would be), so a 12:00AM tick is a real, recurring label rather
+    # than a rare coincidence - with the calendar date on a second line
+    # right below any such 12:00AM tick, so a 48h trace that crosses
+    # midnight stays unambiguous about which day each half belongs to.
+    # Positioned with the SAME x_for_ts() used for the trace/the "Now" dot
+    # above, not a separate "oldest reading at the left edge" formula - the
+    # old 9-tick scheme actually ran in the OPPOSITE direction from the
+    # trace/"Now" dot (which sit with "Now" at the LEFT edge), so the old
+    # labels/gridlines never actually lined up with where the data really
+    # was. Compact format (_format_axis_time(), e.g. "3:00AM") instead of
+    # _format_ampm()'s "03:00 A.M." so a dense run of hourly labels stays
+    # short enough to fit without crowding.
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
-    label_lines = []
-    n_ticks = 8
-    for i in range(n_ticks + 1):
-        frac = i / n_ticks
-        ts = now - (1 - frac) * window_sec
-        x = AI_HISTORY_LEFT_PAD + frac * plot_w
-        anchor = "start" if i == 0 else ("end" if i == n_ticks else "middle")
-        label = _format_ampm(datetime.fromtimestamp(ts, tz).strftime("%I:%M %p"))
-        label_y = AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H - 8.0
-        label_lines.append(f'<text x="{x:.1f}" y="{label_y:.1f}" font-size="8.5" font-weight="700" '
-                            f'fill="#6a7178" text-anchor="{anchor}">{label}</text>')
-    x_labels_html = "\n  ".join(label_lines)
+    now_dt = datetime.fromtimestamp(now, tz)
+    window_start_dt = datetime.fromtimestamp(now - window_sec, tz)
+    first_tick = window_start_dt.replace(minute=0, second=0, microsecond=0)
+    if first_tick < window_start_dt:
+        first_tick += timedelta(hours=1)
+    ticks = []
+    t = first_tick
+    while t <= now_dt:
+        ticks.append(t)
+        t += timedelta(hours=1)
 
-    # Minor/major vertical gridlines, purely cosmetic - a major line at
-    # every labeled tick, one lighter minor line at each tick's midpoint.
+    label_lines = []
     grid_lines = []
-    for i in range(n_ticks + 1):
-        x = AI_HISTORY_LEFT_PAD + (i / n_ticks) * plot_w
+    for dt in ticks:
+        x = x_for_ts(dt.timestamp())
+        label = _format_axis_time(dt)
+        label_y = AI_HISTORY_BAND_H + 13.0
+        label_lines.append(f'<text x="{x:.1f}" y="{label_y:.1f}" font-size="8.5" font-weight="700" '
+                            f'fill="#6a7178" text-anchor="middle">{label}</text>')
+        if dt.hour == 0 and dt.minute == 0:
+            date_y = AI_HISTORY_BAND_H + 24.0
+            label_lines.append(f'<text x="{x:.1f}" y="{date_y:.1f}" font-size="7.3" font-weight="600" '
+                                f'fill="#9aa1a8" text-anchor="middle">{dt.strftime("%b %-d")}</text>')
         grid_lines.append(f'<line x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{AI_HISTORY_BAND_H}" '
-                           f'stroke="#ffffff" stroke-width="1.1" opacity="0.65"/>')
-        if i < n_ticks:
-            xm = AI_HISTORY_LEFT_PAD + ((i + 0.5) / n_ticks) * plot_w
-            grid_lines.append(f'<line x1="{xm:.1f}" y1="0" x2="{xm:.1f}" y2="{AI_HISTORY_BAND_H}" '
-                               f'stroke="#ffffff" stroke-width="0.9" opacity="0.28"/>')
+                           f'stroke="#ffffff" stroke-width="1.0" opacity="0.6"/>')
+    x_labels_html = "\n  ".join(label_lines)
     grid_html = "\n    ".join(grid_lines)
 
     svg = f"""<svg class="hist-chart-compact" viewBox="0 0 {AI_HISTORY_CHART_W} {AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H}" preserveAspectRatio="none">
