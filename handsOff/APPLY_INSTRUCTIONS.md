@@ -19,7 +19,7 @@ simplest path:
    ```bash
    git status   # review what changed
    git add -A
-   git commit -m "Sync Sky History feature, docs, and resilience fixes from sandbox session"
+   git commit -m "Sync cloud training fix, restart.ps1, firewall docs from sandbox session"
    git push origin main
    ```
 
@@ -51,3 +51,15 @@ summary, what changed and why, the mandatory mockup-first workflow
 rule, the Sky History chart's key constants/functions, and the mockup
 design history worth knowing before touching the chart again. Point a
 fresh Claude conversation at this file first.
+
+## Deploying the cloud training changes (after merging)
+
+Both machines must get their new file, or job start will fail:
+
+| File | Machine | Then |
+|---|---|---|
+| `dome_safety_service.py` | Raspberry Pi | `sudo systemctl restart dome-safety` |
+| `cloud-training-server/train_server.py` (plus `restart.ps1`, `install.ps1`, `README.md`) | Windows PC | `powershell -ExecutionPolicy Bypass -File restart.ps1` |
+
+If the Pi then reports a *connection timed out*, it is the Windows/McAfee
+firewall — see "Troubleshooting" in `cloud-training-server/README.md`.

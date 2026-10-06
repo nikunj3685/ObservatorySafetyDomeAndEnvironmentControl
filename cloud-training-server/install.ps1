@@ -150,6 +150,33 @@ if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContin
     Write-Host "Firewall rule '$ruleName' already exists."
 }
 
+# An allow rule is NOT enough if something else blocks the port. Two
+# things cause that in practice, and both show up on the Pi as a silent
+# "Connection ... timed out" even though ping works:
+#   1. Explicit "python.exe" BLOCK rules, which Windows creates itself
+#      when you click Cancel/Block on its "allow access?" popup the first
+#      time Python listens. Block rules beat allow rules.
+#   2. A third-party firewall/antivirus (McAfee, Norton, ...), which has
+#      its own rules separate from Windows Firewall.
+# Warn about both here rather than silently deleting someone's rules.
+$pyBlocks = @(Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -eq "python.exe" })
+if ($pyBlocks.Count -gt 0) {
+    Write-Host ""
+    Write-Host "WARNING: $($pyBlocks.Count) inbound BLOCK rule(s) named 'python.exe' exist. These override the allow rule above and will" -ForegroundColor Yellow
+    Write-Host "         stop the Pi from reaching this server. Remove them with:" -ForegroundColor Yellow
+    Write-Host '         Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True | Where-Object DisplayName -eq "python.exe" | Remove-NetFirewallRule' -ForegroundColor Yellow
+    Write-Host ""
+}
+$thirdParty = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction SilentlyContinue |
+    Where-Object { $_.displayName -notmatch "Windows" })
+if ($thirdParty.Count -gt 0) {
+    Write-Host ""
+    Write-Host "NOTE: third-party firewall detected ($($thirdParty.displayName -join ', ')). Windows Firewall's allow rule may not be" -ForegroundColor Yellow
+    Write-Host "      enough - also allow inbound TCP $port in that product's own firewall settings." -ForegroundColor Yellow
+    Write-Host ""
+}
+
 # ---------------------------------------------------------------------
 # 5. Autostart - a scheduled task (default) or a true Windows Service
 #    via NSSM (-Service). Only one of these should ever be registered on

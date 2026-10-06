@@ -1,4 +1,4 @@
-# Handoff notes — dome-safety session (ended 2026-10-01)
+# Handoff notes — dome-safety session (last updated 2026-10-06)
 
 This file exists so a **new Claude session/project** can pick up this
 codebase without any memory of the conversation that produced these
@@ -33,18 +33,17 @@ follow it before making any dashboard change.
   environment's outbound proxy (verified with real 403s — not a config
   problem that retrying will fix). Nothing pushed from here ever reaches
   GitHub.
-- Local `main` is **16 commits ahead of `origin/main`**, 0 behind — a
-  clean fast-forward, no conflicts. The 16 commits (oldest to newest):
-  `9dd3241`, `eb70273`, `af1ca43`, `b770fe6`, `f0996a5`, `0857069`,
-  `efa8454`, `e77b3d9`, `2b8195d`, `1782e45`, `d7f8fcc`, `9fc33ed`,
-  `39f08c4`, `44f3af3`, `e404fe5`, `fbf1183`.
-- A git bundle of exactly those 16 commits is included alongside this
-  file (`dome-safety-session-updates.bundle`). On a machine that can
-  push (i.e. not this sandbox), from a clone of the real repo on `main`:
+- The earlier Sky History/resilience/handsOff work (through `3d50fac`)
+  has already been pushed. Work done since then lives in the delivered
+  zip and in `handsOff/dome-safety-session-updates.bundle`, which
+  contains everything after `origin/main` (`3d50fac`): the cloud
+  training fix (`08d8c4e`) plus the later docs/`restart.ps1`/firewall
+  commit(s) — see `git log origin/main..session-updates` after fetching.
+  On a machine that can push, from a clone of the real repo on `main`:
 
   ```bash
-  git bundle verify dome-safety-session-updates.bundle
-  git fetch dome-safety-session-updates.bundle session-updates:session-updates
+  git bundle verify handsOff/dome-safety-session-updates.bundle
+  git fetch handsOff/dome-safety-session-updates.bundle session-updates:session-updates
   git merge session-updates   # fast-forwards cleanly, no conflicts expected
   git push origin main
   ```
@@ -104,11 +103,78 @@ follow it before making any dashboard change.
    demo `sensor_state` so it actually shows the Sky History card instead
    of predating the feature.
 
-Files confirmed **not** touched/needing changes this session (checked,
-not just assumed): `cloud-training-server/` (README + train_server.py),
+## Cloud training reliability fix + firewall incident (2026-10-06)
+
+**Recurring bug:** the Classify page's cloud training card kept showing
+*"Training failed: Interrupted (the service restarted, or the training
+server became unreachable, partway through this job)"*, and after a page
+refresh the live progress text reverted to the last success/fail message.
+Both had one root cause: the watchdog (`_check_cloud_job_health`) guessed
+"heartbeat stale for 90s = thread died", so a slow upload during a network
+blip was marked failed, and the real thread's later result was discarded.
+
+**Fix (`08d8c4e`) — job-id-first, server-authoritative protocol:**
+
+- `train_server.py`: `POST /train` (no body) now only mints a job id
+  (status `created`, 201); the zip goes to the new
+  `POST /train/<job_id>/upload` (404 unknown id, 409 if not `created`,
+  202 on success). `created` jobs never uploaded are pruned after
+  `CREATED_JOB_TTL_SEC` (1h). `/train/status/<id>`, `/train/model/<id>`,
+  `DELETE /model` unchanged. Jobs live in memory — a server restart loses
+  them (shown as `jobs_in_memory` in `/health`).
+- `dome_safety_service.py`: `_start_cloud_training()` builds the zip,
+  mints the job id first (failure text: "Could not start a job on the
+  cloud training server: …"), saves it immediately in
+  `ai_training/cloud_job.json`, then `_cloud_training_worker(…, job_id, …)`
+  uploads to `/train/<job_id>/upload`. `_check_cloud_job_health()` no
+  longer guesses: when the heartbeat is stale it asks
+  `GET /train/status/<job_id>` — unreachable → retry next cycle (never
+  fail on a network blip); 404 → "server no longer recognizes job (it may
+  have restarted)"; `created` → "upload never reached the server";
+  queued/training/done/failed → resume polling with a fresh `attempt_id`.
+  The old "Interrupted (…)" wording no longer exists in the code — if you
+  still see it, it is a stale message persisted in `cloud_job.json` from
+  before the deploy; starting a new job overwrites it.
+- **Deploy order matters (both sides must be updated together):** new
+  `train_server.py` → Windows (then `restart.ps1`); new
+  `dome_safety_service.py` → Pi (`sudo systemctl restart dome-safety`).
+  An old Pi against the new server (or vice-versa) fails at job start.
+- Tests (26 checks, in the session scratchpad, not the repo): two-step
+  route wiring (create/upload/404/409/prune) and the Pi-side protocol
+  (job id before upload, upload URL, every watchdog branch). Gotcha when
+  re-creating them: `AI_TRAINING_DIR` and the derived `CLOUD_*` paths come
+  from the real file's `__file__`, so the test must redirect them to a temp
+  dir or it pollutes the repo and leaks state between runs.
+
+**Also added:** `cloud-training-server/restart.ps1` (stop-if-running then
+start; works for the scheduled-task and `-Service` installs, which are both
+named `CloudTrainingServer`; self-elevates; `/health` self-test), and a
+firewall check in `install.ps1` that warns about `python.exe` block rules
+and third-party firewalls.
+
+**Firewall incident (not a code bug):** after the fix was deployed the Pi
+reported *"Connection to 192.168.2.121 timed out (connect timeout=20)"*
+while `ping` worked and the server was listening on `0.0.0.0:8787`. A
+timeout (vs. "refused") = packets silently dropped. Cause: explicit
+inbound **`python.exe` BLOCK rules** (Windows creates them when you click
+Cancel on its "allow access?" popup; blocks beat the allow rule) and
+McAfee's own firewall. Fix: remove the python.exe block rules
+(`Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True |
+Where-Object DisplayName -eq "python.exe" | Remove-NetFirewallRule` —
+note `-DisplayName` can't be combined with `-Action`/`-Direction` in one
+call) and allow TCP 8787 in McAfee. The full checklist is now in
+`cloud-training-server/README.md` ("Troubleshooting: the Pi can't reach the
+server"). If the Pi↔Windows link ever times out again, start there before
+touching code.
+
+**Unrelated explanation worth remembering:** the dashboard turns UNSAFE
+for a short time right after a service restart on the Pi because
+`time_synced = now_utc.timestamp() > 1700000000` — an unsynced clock fails
+safe to UNSAFE until the Pi's time is valid. That is intended behavior.
+
+Files confirmed **not** touched this session (checked, not just assumed):
 `install.sh`, `requirements.txt`, `dome-safety.service`,
-`docker-compose.clouddetect.yml` — no new dependencies or deployment
-steps were introduced.
+`docker-compose.clouddetect.yml` — no new dependencies.
 
 ## Key constants/functions to know (`dome_safety_service.py`)
 
@@ -172,8 +238,9 @@ to exercise the real `/` route end-to-end (this is also how
 `gen_preview_index.py`-style scripts, not hand-written HTML).
 
 Existing regression tests that should keep passing after any change:
-loop resilience, hang resilience, Cloud Image Model Ignore-status, and
-Sky History time-label tests. (These live in the session's scratchpad in
+loop resilience, hang resilience, Cloud Image Model Ignore-status, Sky
+History time-label tests, and the cloud training job-protocol tests
+(two-step server routes + Pi-side watchdog branches). (These live in the session's scratchpad in
 the conversation that produced this handoff, not in the repo itself —
 if you want them version-controlled going forward, that'd be a good
 first task for a new session: move them into a `tests/` directory in
@@ -181,8 +248,8 @@ the repo.)
 
 ## Things a new session should probably do first
 
-1. Apply `dome-safety-session-updates.bundle` on a machine that can
-   actually push (see "Git state" above) so `origin/main` catches up.
+1. Apply `handsOff/dome-safety-session-updates.bundle` on a machine that
+   can actually push (see "Git state" above) so `origin/main` catches up.
 2. Consider adding the test scripts described above into the repo
    proper (`tests/`) so they're not sitting only in a sandbox scratchpad
    that disappears when a session ends.

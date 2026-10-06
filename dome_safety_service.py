@@ -2118,17 +2118,35 @@ def _start_cloud_training(triggered_by="manual"):
         return False, ("No newly labeled samples to train on - either classify more on the Classify page, "
                         "or every classified sample has already been absorbed into a previous cloud training run.")
 
+    # Mint the job id FIRST, before the upload itself - see train_server.py's
+    # "Two-step job protocol" note. This is what lets _check_cloud_job_health()
+    # ask the server for this job's REAL status later instead of guessing
+    # from a local heartbeat, even during the upload phase (previously the
+    # job id was only assigned once the upload had already fully finished,
+    # so a stalled-but-still-alive upload had nothing to check against and
+    # could only ever be guessed at - see that function's docstring).
+    base = server_url.rstrip("/")
+    try:
+        r = requests.post(f"{base}/train", headers={"X-API-Key": api_key}, timeout=CLOUD_HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        job_id = r.json().get("job_id")
+        if not job_id:
+            return False, "Cloud training server accepted the request but didn't return a job ID."
+    except Exception as e:
+        return False, f"Could not start a job on the cloud training server: {e}"
+
     zip_bytes = zip_buf.getvalue()
     now = time.time()
     attempt_id = uuid.uuid4().hex[:12]
-    _save_cloud_job_state({"status": "uploading", "job_id": None, "error": None,
+    _save_cloud_job_state({"status": "uploading", "job_id": job_id, "error": None,
                             "started_at": now, "finished_at": None, "sample_count": labeled_count,
                             "sample_ids": sample_ids, "triggered_by": triggered_by,
                             "uploaded_bytes": 0, "total_bytes": len(zip_bytes), "last_progress_at": now,
                             "attempt_id": attempt_id})
 
     threading.Thread(target=_cloud_training_worker,
-                      args=(server_url, api_key, zip_bytes, labeled_count, sample_ids, triggered_by, attempt_id),
+                      args=(server_url, api_key, job_id, zip_bytes, labeled_count, sample_ids, triggered_by,
+                            attempt_id),
                       daemon=True).start()
     return True, None
 
@@ -2164,12 +2182,13 @@ def _touch_cloud_job_progress(uploaded_bytes=None, total_bytes=None):
         print(f"[cloud-model] Failed to record job progress: {e}")
 
 
-def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_ids, triggered_by="manual",
+def _cloud_training_worker(server_url, api_key, job_id, zip_bytes, sample_count, sample_ids, triggered_by="manual",
                             attempt_id=None):
-    """Background thread body for one training job: uploads the zip, then
-    hands off to _poll_cloud_job_to_completion() for the rest. Never
-    raises - any exception here is caught and recorded as a failed job
-    instead of silently killing this daemon thread.
+    """Background thread body for one training job: uploads the zip
+    against the job_id _start_cloud_training() already minted via
+    POST /train, then hands off to _poll_cloud_job_to_completion() for
+    the rest. Never raises - any exception here is caught and recorded as
+    a failed job instead of silently killing this daemon thread.
 
     The upload itself is STREAMED (via requests_toolbelt's
     MultipartEncoderMonitor) rather than handed to requests as one opaque
@@ -2196,7 +2215,7 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_
 
     def _fail(error):
         _save_cloud_job_state_if_current(attempt_id,
-                               {"status": "failed", "job_id": None, "error": error,
+                               {"status": "failed", "job_id": job_id, "error": error,
                                 "started_at": started_at, "finished_at": time.time(),
                                 "sample_count": sample_count, "sample_ids": sample_ids,
                                 "triggered_by": triggered_by,
@@ -2220,18 +2239,21 @@ def _cloud_training_worker(server_url, api_key, zip_bytes, sample_count, sample_
 
             encoder = MultipartEncoder(fields={"file": ("training_data.zip", zip_bytes, "application/zip")})
             monitor = MultipartEncoderMonitor(encoder, _on_upload_progress)
-            r = requests.post(f"{base}/train", headers={**headers, "Content-Type": monitor.content_type},
+            r = requests.post(f"{base}/train/{job_id}/upload",
+                               headers={**headers, "Content-Type": monitor.content_type},
                                data=monitor, timeout=CLOUD_UPLOAD_TIMEOUT_SEC)
         except ImportError:
-            r = requests.post(f"{base}/train", headers=headers,
+            r = requests.post(f"{base}/train/{job_id}/upload", headers=headers,
                                files={"file": ("training_data.zip", zip_bytes, "application/zip")},
                                timeout=CLOUD_UPLOAD_TIMEOUT_SEC)
         if r.status_code == 401:
             return _fail("Server rejected the API key - check it under Settings → AI Learning.")
+        if r.status_code == 404:
+            return _fail(f"Training server no longer recognizes job {job_id} (it may have restarted) - "
+                          "start a new training run when ready.")
+        if r.status_code == 409:
+            return _fail(f"Job {job_id} already had an upload submitted - start a new training run.")
         r.raise_for_status()
-        job_id = r.json().get("job_id")
-        if not job_id:
-            return _fail("Server accepted the upload but didn't return a job ID.")
     except Exception as e:
         return _fail(f"Upload failed: {e}")
 
@@ -2365,31 +2387,40 @@ def _check_cloud_job_health():
     pattern as maybe_auto_train()/poll_cloud_model(): if the persisted
     job state says "uploading" or "training" but nothing has touched its
     heartbeat (_touch_cloud_job_progress()) in CLOUD_JOB_STALE_AFTER_SEC,
-    the thread that was supposed to be tracking it is no longer doing so
-    - most commonly the whole service restarted (a fresh process never
-    touches an old job's heartbeat, so it reads as instantly, maximally
-    stale) but could also be a thread that silently died mid-job. Either
-    way, this reconciles the stuck state instead of leaving the Classify
-    page showing "Uploading..."/"Training..." forever - see the earlier
-    conversation that motivated this: a job left stuck after a restart,
-    discovered via the training server's own /health showing no matching
-    job in memory.
+    something MIGHT be wrong - the whole service restarted, or the
+    original tracking thread died - but staleness alone can't actually
+    tell that apart from a perfectly healthy job whose upload just hit a
+    slow or flaky stretch of network (a stuck TCP send can go minutes
+    without moving a byte and still succeed). An earlier version of this
+    function guessed "no heartbeat in 90s = dead" and acted on that guess
+    - which meant a real, still-in-progress job could get killed and
+    reported as "Interrupted" purely because the network blipped, not
+    because anything actually failed. That's exactly the bug this
+    function used to have.
+
+    Fixed by never guessing: every "uploading"/"training" job now has a
+    job_id from the moment it starts (see _start_cloud_training() - the
+    id is minted before the upload even begins), so instead of declaring
+    the job dead, this asks the training server what job_id is ACTUALLY
+    doing via GET /train/status/<job_id> and acts on the real answer:
+      - unreachable right now: genuinely unknown - do nothing and let
+        the next cycle try again (also still bounded by the upload/poll
+        calls' own real timeouts if this never resolves).
+      - 404 (server doesn't recognize this id - most likely IT
+        restarted): confirmed lost, nothing to recover - mark failed.
+      - "created" (the upload itself never reached the server under this
+        id - most likely the PI's own process restarted mid-upload):
+        confirmed lost, nothing to recover - mark failed.
+      - queued/training/done/failed: genuinely still tracked server-side
+        - resume watching it (_poll_cloud_job_to_completion(), the same
+        function the original worker thread would have used) rather than
+        abandoning something that was never actually interrupted.
 
     Deliberately keyed off time-SINCE-LAST-PROGRESS, never time-since-
-    started - a legitimately large upload (hundreds of images) keeps
-    refreshing its own heartbeat and is never touched here no matter how
-    long it takes.
-
-    For a "training" job with a job_id, this doesn't just give up - it
-    resumes watching the job (via _poll_cloud_job_to_completion(), the
-    same function the original worker thread would have used) so a job
-    that's genuinely still running on the server is picked back up
-    rather than abandoned. Only when there's nothing left to recover
-    (an "uploading" job never got far enough to have a job_id at all, or
-    the server itself isn't configured/reachable to ask) does this mark
-    the job failed with a clear explanation. Never raises - a failed
-    reconciliation attempt here must never crash the poll loop; worst
-    case it's simply retried next cycle."""
+    started - a legitimately large upload keeps refreshing its own
+    heartbeat and is never touched here no matter how long it takes.
+    Never raises - a failed reconciliation attempt here must never crash
+    the poll loop; worst case it's simply retried next cycle."""
     job = _load_cloud_job_state()
     status = job.get("status")
     if status not in ("uploading", "training"):
@@ -2400,55 +2431,82 @@ def _check_cloud_job_health():
         return  # still showing signs of life - leave it alone, however long it's been running in total
 
     job_id = job.get("job_id")
-    if status == "training" and job_id:
-        ai_cfg = get_setting("ai_learning")
-        server_url = (ai_cfg.get("cloud_server_url") or "").strip()
-        api_key = (ai_cfg.get("cloud_api_key") or "").strip()
-        if server_url and api_key:
-            # Mint a FRESH attempt_id and write it now, before spawning -
-            # this is what actually invalidates whatever thread was
-            # originally tracking this job: if that old thread is not
-            # really dead, just slow (stuck in a long requests call), it
-            # captured the OLD attempt_id in its closure and will have
-            # its eventual result silently discarded by
-            # _save_cloud_job_state_if_current() once it does wake up,
-            # rather than clobbering whatever the new thread below
-            # writes in the meantime (see that function's docstring -
-            # this is the exact bug a stale "reverts to an old failure
-            # on refresh" report traces back to). Writing this also
-            # touches the heartbeat, so this same stale job can't be
-            # picked up a second time by the next health-check cycle
-            # running before the resumed thread's own first status
-            # check (immediate, see _poll_cloud_job_to_completion()'s
-            # first_check) has had a chance to land.
-            new_attempt_id = uuid.uuid4().hex[:12]
-            _save_cloud_job_state({**job, "attempt_id": new_attempt_id, "last_progress_at": time.time()})
-            _log_event("Settings", f"Cloud training server: resuming job {job_id} after losing track of it "
-                                    f"(likely a service restart) - no progress was lost", severity="info")
-            threading.Thread(target=_poll_cloud_job_to_completion,
-                              args=(server_url, api_key, job_id, job.get("sample_count"),
-                                    job.get("sample_ids") or [], job.get("triggered_by"),
-                                    job.get("started_at") or time.time(), new_attempt_id),
-                              daemon=True).start()
-            return
+    ai_cfg = get_setting("ai_learning")
+    server_url = (ai_cfg.get("cloud_server_url") or "").strip()
+    api_key = (ai_cfg.get("cloud_api_key") or "").strip()
 
-    # "uploading" with no job_id ever assigned (the server has no record
-    # of it at all - there's nothing to recover), or a "training" job
-    # whose server isn't even configured any more - nothing left to
-    # check, so stop the page from waiting on it forever. Also mints a
-    # fresh (unused) attempt_id, purely to invalidate whatever thread was
-    # tracking this job - if it wakes up later (success or failure) after
-    # being given up on here, its write will be discarded as stale rather
-    # than silently overwriting this verdict, or a subsequent new job.
-    _save_cloud_job_state({**job, "status": "failed",
-                            "error": "Interrupted (the service restarted, or the training server became "
-                                     "unreachable, partway through this job) - start a new training run "
-                                     "when ready.",
-                            "finished_at": time.time(),
-                            "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None,
-                            "attempt_id": uuid.uuid4().hex[:12]})
-    _log_event("Settings", "Cloud training server: previous job was interrupted and has been cleared",
-                severity="warn")
+    def _give_up(reason):
+        # Mints a fresh (unused) attempt_id, purely to invalidate whatever
+        # thread was tracking this job - if it wakes up later (success or
+        # failure) after being given up on here, its write will be
+        # discarded as stale (see _save_cloud_job_state_if_current's
+        # docstring) rather than silently overwriting this verdict, or a
+        # subsequent new job.
+        _save_cloud_job_state({**job, "status": "failed", "error": reason, "finished_at": time.time(),
+                                "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None,
+                                "attempt_id": uuid.uuid4().hex[:12]})
+        _log_event("Settings", f"Cloud training server: {reason}", severity="warn")
+
+    if not job_id or not server_url or not api_key:
+        # No id was ever assigned (shouldn't happen for a job started
+        # after this fix, but covers a job already "uploading" from
+        # before an upgrade) or nothing to even ask - nothing left to
+        # check.
+        _give_up("Interrupted before a job id was ever assigned (the service likely restarted while "
+                  "contacting the training server) - start a new training run when ready.")
+        return
+
+    try:
+        r = requests.get(f"{server_url.rstrip('/')}/train/status/{job_id}",
+                          headers={"X-API-Key": api_key}, timeout=CLOUD_HTTP_TIMEOUT_SEC)
+    except Exception as e:
+        # Couldn't even ask - genuinely don't know yet. Don't declare it
+        # dead on one failed check; retried next cycle, and still bounded
+        # by the upload/poll calls' own CLOUD_UPLOAD_TIMEOUT_SEC/
+        # CLOUD_TRAIN_TIMEOUT_SEC if it truly never recovers.
+        print(f"[cloud-model] Health check couldn't reach the training server to ask about job {job_id} "
+              f"(will retry): {e}")
+        return
+
+    if r.status_code == 404:
+        _give_up(f"The training server no longer recognizes job {job_id} (it may have restarted) - "
+                  "start a new training run when ready.")
+        return
+
+    try:
+        r.raise_for_status()
+        server_status = r.json().get("status")
+    except Exception as e:
+        print(f"[cloud-model] Health check got a bad response for job {job_id} (will retry): {e}")
+        return
+
+    if server_status == "created":
+        _give_up(f"The upload never reached the training server (job {job_id}) - start a new training "
+                  "run when ready.")
+        return
+
+    # queued / training / done / failed - genuinely still tracked by the
+    # server, so there's something real to resume watching. Mint a FRESH
+    # attempt_id and write it now, before spawning - this invalidates
+    # whatever thread was originally tracking this job: if that old
+    # thread is not really dead, just slow, it captured the OLD attempt_id
+    # in its closure and will have its eventual result silently discarded
+    # by _save_cloud_job_state_if_current() once it does wake up, rather
+    # than clobbering whatever the new thread below writes in the
+    # meantime. Writing this also touches the heartbeat, so this same job
+    # can't be picked up a second time by next cycle before the resumed
+    # thread's own first status check (immediate, see
+    # _poll_cloud_job_to_completion()'s first_check) has had a chance to land.
+    new_attempt_id = uuid.uuid4().hex[:12]
+    _save_cloud_job_state({**job, "attempt_id": new_attempt_id, "last_progress_at": time.time()})
+    _log_event("Settings", f"Cloud training server: resuming job {job_id} after losing local track of it "
+                            f"(server confirms it is still {server_status}) - no progress was lost",
+                severity="info")
+    threading.Thread(target=_poll_cloud_job_to_completion,
+                      args=(server_url, api_key, job_id, job.get("sample_count"),
+                            job.get("sample_ids") or [], job.get("triggered_by"),
+                            job.get("started_at") or time.time(), new_attempt_id),
+                      daemon=True).start()
 
 
 def _cancel_cloud_job():
