@@ -16,10 +16,11 @@ in the parent folder of this repo, and hasn't been built yet.
 
 | File | Purpose |
 |---|---|
-| `train_server.py` | The server itself - Flask app exposing `/health`, `/train`, `/train/status/<id>`, `/train/model/<id>`, `DELETE /model`. |
+| `train_server.py` | The server itself - Flask app exposing `/health`, `/train`, `/train/<id>/upload`, `/train/status/<id>`, `/train/model/<id>`, `DELETE /model`. |
 | `requirements.txt` | Python dependencies (Flask, TensorFlow, Pillow, waitress). |
 | `install.ps1` | One-shot Windows installer - see below. |
 | `uninstall.ps1` | Reverses everything `install.ps1` set up. |
+| `restart.ps1` | Stops the server if it is running and starts it again (or just starts it if it isn't). Use after replacing `train_server.py`. |
 
 ## Installing
 
@@ -112,6 +113,51 @@ error live:
 .\venv\Scripts\python.exe .\train_server.py
 ```
 
+## Restarting
+
+After replacing `train_server.py` (or any time the server misbehaves), run
+`restart.ps1` - it works for both the scheduled-task and Windows-Service
+installs, stops the server only if it is running, starts it, and waits for
+`/health` to answer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File restart.ps1
+```
+
+Manual equivalents: `Restart-Service CloudTrainingServer` (service install),
+or `Stop-ScheduledTask CloudTrainingServer; Start-ScheduledTask CloudTrainingServer`
+(scheduled task). Jobs are held in memory, so a restart discards any job
+still in progress - the Pi reports that as a clear "server no longer
+recognizes job" failure and you simply start a new run.
+
+## Troubleshooting: the Pi can't reach the server
+
+Symptom on the Classify page: *"Could not start a job on the cloud training
+server ... Connection to <ip> timed out (connect timeout=20)"*, while
+`ping <ip>` from the Pi works and `Invoke-RestMethod http://localhost:8787/health`
+works on the Windows machine itself. A timeout (as opposed to "connection
+refused") means something is silently dropping the packets. From the Pi:
+
+```bash
+curl -m 5 http://<windows-ip>:8787/health
+```
+
+If that times out, check on the Windows machine (Administrator PowerShell):
+
+| Check | Command | Fix |
+|---|---|---|
+| Server listening on all interfaces | `netstat -ano \| findstr :8787` - want `0.0.0.0:8787 LISTENING` | Restart with `restart.ps1` |
+| Allow rule has the right port | `Get-NetFirewallRule -DisplayName "Cloud Training Server" \| Get-NetFirewallPortFilter` | Re-run `install.ps1`, or recreate: `New-NetFirewallRule -DisplayName "Cloud Training Server" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8787 -Profile Any` |
+| **Explicit `python.exe` BLOCK rules** (most common cause - Windows creates these when you click Cancel on its "allow access?" popup; block rules beat allow rules) | `Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True \| Where-Object DisplayName -eq "python.exe"` | Pipe that to `Remove-NetFirewallRule` |
+| **Third-party firewall / antivirus** (McAfee, Norton, ...) | `Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct \| select displayName` | Allow inbound TCP 8787 (or `venv\Scripts\python.exe`) in that product's own firewall |
+| IP changed (e.g. Wi-Fi vs. ethernet) | `ipconfig` | Update the server URL in the Pi's Settings, ideally give the PC a DHCP reservation |
+
+Tip: `Get-NetFirewallProfile` showing the firewall enabled is normal; to test
+whether the firewall is the culprit, temporarily disable it
+(`Set-NetFirewallProfile -Enabled False`), retry the `curl`, and **turn it
+back on** (`-Enabled True`). `install.ps1` now warns about `python.exe`
+block rules and third-party firewalls when it runs.
+
 ## Which copy is actually running?
 
 Only one process can ever actually be bound to a given port, so if you
@@ -171,11 +217,16 @@ internet either way.
 
 - Every route except `/health` requires an `X-API-Key` header matching the
   key in `server_config.json`.
-- `POST /train` takes a multipart upload (field `file`) containing a zip
-  with one subfolder per label (the same layout the Classify page's
-  "Export as .zip" button already produces) - at least 2 labels, 5+
-  images each, or it fails immediately with a message naming which label
-  needs more data.
+- Starting a job is two steps: `POST /train` (no body) mints a job id and
+  returns it immediately, then `POST /train/<job_id>/upload` takes the
+  actual multipart upload (field `file`) containing a zip with one
+  subfolder per label (the same layout the Classify page's "Export as
+  .zip" button already produces) - at least 2 labels, 5+ images each, or
+  it fails immediately with a message naming which label needs more
+  data. Splitting it this way lets the Pi track the job (and ask this
+  server for its real status) from the moment it starts, even while the
+  upload itself is still in flight - see the module docstring at the top
+  of `train_server.py` for the full reasoning.
 - Training freezes a pretrained MobileNetV2 and only trains a small new
   classification head on your labels - realistically a few minutes on a
   plain CPU for a dataset this size, no GPU required.
@@ -189,10 +240,11 @@ internet either way.
 
 ### Incremental (warm-started) training
 
-The first-ever `/train` call trains a brand-new model from scratch, same as
-always. Every `/train` call after that **warm-starts** from that run's
-model instead - fine-tuning only on the newly uploaded images, at a lower
-learning rate and for fewer epochs than a fresh run. In practice this
+The first-ever training run (upload) trains a brand-new model from
+scratch, same as always. Every run after that **warm-starts** from the
+previous one's model instead - fine-tuning only on the newly uploaded
+images, at a lower learning rate and for fewer epochs than a fresh run.
+In practice this
 means the Pi only ever needs to upload images that haven't already been
 absorbed into a previous training run; it doesn't need to keep re-sending
 (or even keep on disk) everything it's ever labeled.

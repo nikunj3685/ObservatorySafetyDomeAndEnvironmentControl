@@ -14,13 +14,20 @@ Endpoints:
     GET    /health                  - no auth; {"ok": true}, used by
                                        install.ps1's self-test and by
                                        the Pi to check reachability
-    POST   /train                   - multipart upload, field "file" =
-                                       the labeled-images zip; returns
-                                       {"job_id": ...} immediately and
-                                       trains in a background thread
-    GET    /train/status/<job_id>   - {"status": "queued|training|done|
-                                       failed", "mode": "fresh|
-                                       incremental", "error": ... }
+    POST   /train                   - no body; mints a job id and
+                                       returns {"job_id": ...} right
+                                       away, status "created" - step 1
+                                       of the two-step job protocol
+                                       below
+    POST   /train/<job_id>/upload   - multipart upload, field "file" =
+                                       the labeled-images zip, against
+                                       a job id from POST /train above;
+                                       returns {"job_id": ...} and
+                                       trains in a background thread -
+                                       step 2
+    GET    /train/status/<job_id>   - {"status": "created|queued|
+                                       training|done|failed", "mode":
+                                       "fresh|incremental", "error": ...}
     GET    /train/model/<job_id>    - once status is "done", downloads
                                        a zip containing model.tflite
                                        and classes.json (the ordered
@@ -35,6 +42,20 @@ Endpoints:
                                        changed enough that the old
                                        model's learning is actively
                                        wrong rather than just stale.
+
+Two-step job protocol (POST /train, then POST /train/<job_id>/upload):
+split into two calls specifically so the Pi can stamp a job id into its
+own persisted state BEFORE the (potentially large, potentially slow)
+upload even starts. Previously the job id was only returned once the
+upload had fully finished, so the Pi had nothing to check this server
+about while an upload was in flight - if its own tracking of that upload
+went stale (a network hiccup, not an actual failure), it had no way to
+tell a merely-slow upload apart from a genuinely dead one and had to
+guess. Now it can just ask this server "what is job <id> actually doing"
+and get a real answer, even mid-upload. A job sitting in "created" for
+more than CREATED_JOB_TTL_SEC without ever receiving its upload is
+assumed abandoned (the Pi died, or was reconfigured, before uploading)
+and is pruned from memory - see _prune_stale_created_jobs().
 
 Every route except /health requires an X-API-Key header matching the
 key install.ps1 generated into server_config.json. There is no user
@@ -165,11 +186,34 @@ def require_api_key(fn):
 # of jobs at a time on a single-process server) ----
 
 jobs_lock = threading.Lock()
-jobs = {}  # job_id -> {"status": ..., "error": ..., "classes": [...]}
+jobs = {}  # job_id -> {"status": ..., "error": ..., "classes": [...], "created_at": ...}
+
+# How long a job can sit in "created" (id minted, upload never arrived)
+# before it's dropped from the jobs dict - the Pi always uploads right
+# after creating one, so this only ever fires if the Pi died, or was
+# reconfigured, before the upload call. Jobs that DID receive an upload
+# are never touched by this - only _cleanup_old_jobs()'s disk-based sweep
+# (JOB_RETENTION_DAYS) governs those, since only an uploaded job has a
+# jobs/<job_id>/ folder on disk for that sweep to find in the first place.
+CREATED_JOB_TTL_SEC = 3600
 
 
 def _job_dir(job_id):
     return os.path.join(JOBS_DIR, job_id)
+
+
+def _prune_stale_created_jobs():
+    """Best-effort drop of never-uploaded job ids past CREATED_JOB_TTL_SEC
+    - called opportunistically whenever a new job is created, rather than
+    on a timer (this server doesn't otherwise run anything periodic)."""
+    cutoff = time.time() - CREATED_JOB_TTL_SEC
+    with jobs_lock:
+        stale = [jid for jid, j in jobs.items()
+                 if j.get("status") == "created" and j.get("created_at", 0) < cutoff]
+        for jid in stale:
+            del jobs[jid]
+    if stale:
+        _log(f"pruned {len(stale)} stale never-uploaded job id(s): {stale}")
 
 
 def _cleanup_old_jobs():
@@ -457,16 +501,49 @@ def health():
 
 @app.route("/train", methods=["POST"])
 @require_api_key
-def start_train():
+def create_train_job():
+    """Step 1 of 2 - see module docstring's "Two-step job protocol". No
+    body required; mints a job id the Pi can start tracking (and polling
+    /train/status/<job_id> for) immediately, before any image data is
+    sent."""
+    _prune_stale_created_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    with jobs_lock:
+        jobs[job_id] = {"status": "created", "error": None, "classes": None, "created_at": time.time()}
+    _log(f"job {job_id}: created (awaiting upload)")
+    return jsonify({"ok": True, "job_id": job_id, "status": "created"}), 201
+
+
+@app.route("/train/<job_id>/upload", methods=["POST"])
+@require_api_key
+def upload_train_job(job_id):
+    """Step 2 of 2 - the actual labeled-images zip, against a job id this
+    server already minted via POST /train. 404 for an id this server
+    doesn't recognize (expired/pruned, or this process restarted and lost
+    its in-memory jobs since the Pi got the id - the Pi should start a new
+    job in that case, not retry this one). 409 if that job already has an
+    upload (double-submit, or a resumed Pi-side thread racing a fresh
+    retry) - never silently retrains or clobbers a result already in
+    flight."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            return jsonify({"ok": False, "error": "unknown job_id - it may have expired, or this server "
+                                                    "restarted since it was created; create a new job"}), 404
+        if job["status"] != "created":
+            return jsonify({"ok": False, "error": f"job {job_id} already has an upload (status: "
+                                                    f"{job['status']})"}), 409
+        job["status"] = "queued"  # claimed immediately, inside the lock, before any slow file I/O below
+
     if "file" not in request.files:
+        with jobs_lock:
+            jobs[job_id].update({"status": "failed", "error": "missing 'file' upload"})
         return jsonify({"ok": False, "error": "missing 'file' upload"}), 400
     zip_bytes = request.files["file"].read()
     if not zip_bytes:
+        with jobs_lock:
+            jobs[job_id].update({"status": "failed", "error": "uploaded file is empty"})
         return jsonify({"ok": False, "error": "uploaded file is empty"}), 400
-
-    job_id = uuid.uuid4().hex[:12]
-    with jobs_lock:
-        jobs[job_id] = {"status": "queued", "error": None, "classes": None}
 
     thread = threading.Thread(target=_train_job, args=(job_id, zip_bytes), daemon=True)
     thread.start()
