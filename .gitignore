@@ -2,6 +2,8 @@
 # never something to version-control.
 dome_config.json
 status_history.json
+safety_history.jsonl
+safety_history.jsonl.tmp
 logs/
 ai_training/
 
@@ -11,3 +13,5 @@ fake_allsky_source.jpg
 # Python bytecode cache.
 __pycache__/
 *.pyc
+dome_events.jsonl
+dome_events.jsonl.tmp

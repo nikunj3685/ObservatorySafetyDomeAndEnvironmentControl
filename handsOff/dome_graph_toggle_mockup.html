@@ -1,0 +1,22 @@
+<!doctype html><meta charset="utf-8"><title>Dome graph toggle mockup</title>
+<style>body{font:14px system-ui;background:#f2f3f6;margin:0;padding:18px;color:#1f2328;max-width:860px}
+.b{background:#fff3cd;border:1px solid #e8d48a;border-radius:8px;padding:8px 12px;margin-bottom:14px}
+.g{background:#fff;border-radius:14px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:14px}
+h3{margin:0 0 6px}.hint{font-size:12px;color:#6b7480;margin:4px 0 10px}label{display:block;margin:6px 0}
+.sub{margin-left:26px;padding-left:12px;border-left:3px solid #bcd9f2}.new{background:#e6f4ea;color:#1e7a3c;font-size:11px;padding:1px 7px;border-radius:9px;margin-left:6px}
+.dis{opacity:.45}button{padding:6px 14px;border-radius:8px;border:0;background:#0f766e;color:#fff}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid #e2e5ea;padding:6px 8px;text-align:left}</style>
+<div class="b"><b>MOCKUP ONLY</b> - no code changed.</div>
+<div class="g"><h3>Dome &amp; Heater</h3>
+<p class="hint">Turn a whole subsystem off if you don't have it at all. Takes effect immediately, no restart needed.</p>
+<label><input type="checkbox" checked id="d" onchange="t()"> Enable Dome control</label>
+<p class="hint">Off: OPEN/CLOSE, schedule, auto-close/open and rain auto-close stop; ASCOM Dome reports Not Connected.</p>
+<div class="sub" id="s"><label><input type="checkbox" checked> Show dome open/close actions in graph <span class="new">NEW</span></label>
+<p class="hint">Adds the Dome lane, &#9650;/&#9660; markers and dashed action lines to the history graph. Off: lane and markers are hidden, but dome events keep being recorded so you can turn it back on and see the past.</p></div>
+<label><input type="checkbox" checked> Enable Heater control</label>
+<p class="hint">Off: dew/freeze AUTO and MANUAL slider stop; MOSFET forced off.</p>
+<button>Save</button></div>
+<div class="g"><h3>Resulting graph</h3><table><tr><th>Enable Dome</th><th>Show in graph</th><th>Dome lane / markers</th></tr>
+<tr><td>On</td><td>On</td><td>Shown</td></tr><tr><td>On</td><td>Off</td><td>Hidden (still recorded)</td></tr>
+<tr><td>Off</td><td>any</td><td>Hidden; graph option greyed out</td></tr></table></div>
+<script>function t(){var o=document.getElementById('d').checked,s=document.getElementById('s');s.classList.toggle('dis',!o);s.querySelectorAll('input').forEach(i=>i.disabled=!o)}</script>

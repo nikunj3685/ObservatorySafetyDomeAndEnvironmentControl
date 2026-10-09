@@ -1,0 +1,39 @@
+<!doctype html><meta charset="utf-8"><title>Settings page mockup</title>
+<style>:root{--teal:#0f766e}*{box-sizing:border-box}body{font:14px system-ui;background:#f2f3f6;margin:0;color:#1f2328}
+.mk{background:#fff3cd;border-bottom:1px solid #e8d48a;padding:8px 16px}
+.top{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);display:flex;align-items:center;gap:6px;padding:0 18px}
+.top b{margin-right:18px}.tab{padding:13px 14px;cursor:pointer;border-bottom:3px solid transparent;color:#475262;font-weight:600}
+.tab.on{color:var(--teal);border-color:var(--teal)}
+.pg{display:none;padding:16px 18px;max-width:1000px}.pg.on{display:block}
+.card{background:#fff;border-radius:14px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:12px}
+.card h2{margin:0 0 8px;font-size:15px}.row{display:flex;gap:12px}.row .card{flex:1}
+.badge{background:#c9e7b7;border-radius:9px;padding:1px 8px;font-size:12px}
+.set{display:flex;gap:16px}.nav{width:210px;background:#fff;border-radius:14px;padding:8px;box-shadow:0 1px 3px rgba(0,0,0,.1);align-self:flex-start}
+.nav a{display:block;padding:8px 10px;border-radius:8px;color:#2c3e50;cursor:pointer}.nav a.on{background:#e3f1ef;color:var(--teal);font-weight:700}
+.main{flex:1}.grp{display:none}.grp.on{display:block}
+.f{display:flex;justify-content:space-between;border-bottom:1px solid #eef0f3;padding:8px 0;color:#556}
+.ph{color:#8a94a0;font-style:italic;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid #e2e5ea;padding:6px 8px;text-align:left}</style>
+<div class="mk"><b>MOCKUP ONLY</b> - no code changed. Click the tabs and the left menu.</div>
+<div class="top"><b>Observatory Safety</b><span class="tab on" data-p="dash">Dashboard</span><span class="tab" data-p="set">&#9881;&#65039; Settings</span></div>
+<div class="pg on" id="dash">
+<div class="card"><h2>&#128737;&#65039; Safety Monitor <span class="badge">SAFE</span></h2>Notices, Force SAFE / UNSAFE, status</div>
+<div class="row"><div class="card"><h2>&#127756; All Sky</h2>Live image</div><div class="card"><h2>&#128682; Dome <span class="badge">Open</span></h2>OPEN / CLOSE, schedule</div></div>
+<div class="row"><div class="card"><h2>&#128293; Dew / Frost Heater</h2>Mode, power, thresholds*</div><div class="card"><h2>&#128200; Safety Checks History</h2>Graph</div></div>
+<div class="ph">Settings card removed from this page - the dashboard is shorter and lives on one screen. *Heater Thresholds stays here unless you say otherwise.</div></div>
+<div class="pg" id="set"><div class="set"><div class="nav" id="nv"></div><div class="main" id="mn"></div></div></div>
+<div class="pg on" style="max-width:1000px"><div class="card"><h2>What changes</h2><table>
+<tr><th>Item</th><th>Proposal</th></tr>
+<tr><td>New page</td><td><code>/settings</code>, reached from a "Settings" tab in the top bar; Dashboard tab returns</td></tr>
+<tr><td>Moved</td><td>Location &amp; Timezone, Safety Checks, Logging, Hardware Pins, ASCOM Device Names, Dome &amp; Heater, All Sky Camera, AI Learning, Service Control</td></tr>
+<tr><td>Layout</td><td>Left menu, one group at a time (no long scroll); each group keeps its own Save button</td></tr>
+<tr><td>Old links</td><td>Redirects like <code>/#safety-checks</code> and "Settings" links in notices go to the matching group</td></tr>
+<tr><td>Behaviour</td><td>Unchanged - same forms, same saved values, no restart</td></tr></table></div></div>
+<script>
+const G=["Location & Timezone","Safety Checks","Logging","Hardware Pins & Addresses","ASCOM Device Names","Dome & Heater","All Sky Camera","AI Learning","Service Control"];
+const nv=document.getElementById('nv'),mn=document.getElementById('mn');
+G.forEach((g,i)=>{const a=document.createElement('a');a.textContent=g;a.onclick=()=>sel(i);nv.appendChild(a);
+const d=document.createElement('div');d.className='grp card';d.innerHTML='<h2>'+g+'</h2><div class="f"><span>Existing fields for this group</span><span>(unchanged)</span></div><div class="f"><span>...</span><span>...</span></div><button style="margin-top:10px;padding:6px 14px;border:0;border-radius:8px;background:#0f766e;color:#fff">Save</button>';mn.appendChild(d)});
+function sel(i){[...nv.children].forEach((a,j)=>a.classList.toggle('on',i==j));[...mn.children].forEach((a,j)=>a.classList.toggle('on',i==j))}sel(1);
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x==t));document.getElementById('dash').classList.toggle('on',t.dataset.p=='dash');document.getElementById('set').classList.toggle('on',t.dataset.p=='set')});
+</script>

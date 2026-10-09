@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><title>Shared header mockup</title>
+<style>body{font:14px system-ui;background:#e9ebef;margin:0;padding:16px;color:#1f2328}.mk{background:#fff3cd;border:1px solid #e8d48a;border-radius:8px;padding:8px 12px;margin-bottom:14px;max-width:900px}
+.win{max-width:900px;margin:0 0 18px;border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.15);background:#f2f4f7}
+.tabs{background:#dfe2e7;padding:6px 8px 0;display:flex;gap:4px;font-size:12px}.tab{background:#f2f4f7;border-radius:8px 8px 0 0;padding:6px 12px;display:flex;align-items:center;gap:6px}
+.fav{width:12px;height:12px;border-radius:3px;background:#2e9e4f;display:inline-block}.fav.bad{background:#c62828}
+.pg{padding:18px 16px 14px}h1{font-size:21px;margin:2px 0}.sub{color:#6a7178;font-size:13px;margin:0 0 14px}
+.nav{display:flex;gap:6px;border-bottom:1px solid #e3e6ea}.nav a{padding:9px 14px;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px}
+.nav .sp{flex:1}.nav .rs{align-self:center;border:1px solid #a71d1d;background:#c62828;color:#fff;border-radius:6px;width:24px;height:24px;font-size:14px;font-weight:700;line-height:1;cursor:pointer;margin-bottom:3px}.nav .rs:hover{background:#a71d1d}
+.nav a.on{color:#2563eb;border-bottom-color:#2563eb}.body{color:#8a94a0;font-style:italic;padding:12px 0 4px}
+.lbl{font-weight:700;font-size:11px;color:#6b7480;margin:0 0 4px}
+table{border-collapse:collapse;font-size:13px;background:#fff;max-width:900px}td,th{border:1px solid #e2e5ea;padding:6px 10px;text-align:left}</style>
+<div class="mk"><b>MOCKUP ONLY</b> - no code changed. Same header on every page; only the highlighted tab and the content below change. Hover/click the restart icon (confirm dialog). Tab strip shows the safety icon (green = SAFE) on every page.</div>
+<script>
+const P=[["Dashboard","Dashboard","Dashboard cards..."],["Settings","Settings","Settings menu + group..."],["Classify (4)","Classify","Classify content (training overview, labeling)..."],["Logs","Logs","Log filters + entries..."]];
+const names=["Dashboard","Settings","Classify (4)","Logs"];
+P.forEach((p,i)=>{const nav=["🏠 Dashboard","⚙ Settings","🏷️ Classify (4)","🗒 Logs"].map((n,j)=>`<a class="${i==j?'on':''}">${n}</a>`).join('')+'<span class="sp"></span><button class="rs" title="Restart service" onclick="if(confirm(\'Restart the dome-safety service now?\'))alert(\'(mockup) restart sent\')">&#8635;</button>';
+document.write(`<p class="lbl">${p[0]} page</p><div class="win"><div class="tabs"><div class="tab"><span class="fav"></span>Observatory Control</div></div><div class="pg"><h1>🔭 Observatory Control</h1><p class="sub">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p><div class="nav">${nav}</div><div class="body">${p[2]}</div></div></div>`)});
+</script>
+<table><tr><th>Change</th><th>Detail</th></tr>
+<tr><td>Header</td><td>One shared header (title, subtitle, tab bar) on Dashboard, Settings, Classify and Logs; replaces the "Back to Observatory Control" line</td></tr>
+<tr><td>Menu order</td><td>Dashboard, Settings, Classify, Logs (Logs last)</td></tr>
+<tr><td>Restart icon</td><td>red &#8635; button at the right end of the menu on every page; red button, hover says "Restart service", click asks "Restart the dome-safety service now?" first - same action as Settings &rarr; Service Control &rarr; Restart Service</td></tr>
+<tr><td>Browser-tab icon</td><td>Green/red safety icon on Classify and Logs too, kept live (checks every 3 s like the dashboard)</td></tr></table>
