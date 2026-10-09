@@ -242,6 +242,11 @@ DEFAULT_SETTINGS = {
         # checks (sensor-based and AI-model-based) sit together; you can
         # enable either, both, or neither.
         "mlx_gate_enabled": True,
+        # Dew risk check (seasonal temperature/humidity/dew-point-margin rules,
+        # see DewRiskEngine). The reading is always evaluated and shown on the
+        # dashboard; this only decides whether a TRIP counts toward SAFE/UNSAFE
+        # (and whether the graph shows its lane). Off by default.
+        "dew_check_enabled": False,
         "ml_cloud_enabled": True,    # simpleCloudDetect's ML classifier - new vs. the ESP32
         # Comma-separated simpleCloudDetect class name(s) (case-insensitive)
         # to treat as "ignore this frame" - e.g. a custom Teachable Machine
@@ -771,6 +776,7 @@ def _log_sensor_snapshot():
         "daynight": "Day" if s["daytime_now"] else "Night",
         "rain": ("Rain" if s["rain_detected"] else "Dry") if rain_fresh else "Unknown",
         "sky_mlx": s["mlx_sky_state"],
+        "dew": s["dew_state"],
         "ml_cloud": s["cloud_class"] if cloud_fresh else "Unknown",
         "overall_safe": s["overall_safe"],
         "environment_temp_c": s["env_temp_c"] if env_fresh else None,
@@ -2986,6 +2992,14 @@ sensor_state = {
     # gate_mlx_cloud/mlx_sky_state above.
     "mlx_ambient_ref_c": None, "mlx_ambient_ref_source": None, "mlx_delta_c": None,
 
+    # Dew risk check (DewRiskEngine): "OK" / "TRIP" / "Unknown" (no fresh
+    # outside temp+humidity), the reason text, the temperature-minus-dew-point
+    # margin, and the pass flags. gate_dew is the raw verdict; dew_pass is
+    # what counts toward SAFE/UNSAFE (always True while the check is excluded).
+    "dew_state": "Unknown", "dew_detail": "no reading yet", "dew_margin_c": None, "dew_rule": "",
+    "gate_dew": True, "dew_pass": True,
+    "dew_prev_state": None, "dew_prev_since": None,
+
     # "Previous status" for each safety-affecting check - what it read
     # before its most recent change, and when that change happened. Both
     # stay None until a check has actually changed at least once since the
@@ -3384,7 +3398,7 @@ def _build_safety_history_record(now=None):
     reading was. Keys: t=timestamp, o=overall SAFE, dn=Day/Night, r=Rain/
     Dry/Unknown, m=MLX Clear/Cloudy/Unknown, c=simpleCloudDetect class,
     cp=its gate passes, a/aa=AI Sky Prediction class/corrected-delta
-    anomaly, i=Cloud Image Model class, ic=its clear score (0..1), d=dome
+    anomaly, i=Cloud Image Model class, dw=Dew risk OK/TRIP/Unknown, ic=its clear score (0..1), d=dome
     state (only while the Dome feature is enabled)."""
     now = time.time() if now is None else now
     snap = _log_sensor_snapshot()
@@ -3398,6 +3412,7 @@ def _build_safety_history_record(now=None):
         "dn": snap["daynight"],
         "r": snap["rain"],
         "m": snap["sky_mlx"],
+        "dw": snap["dew"],
         "c": snap["ml_cloud"],
         "cp": bool(s.get("gate_ml_cloud")),
     }
@@ -3684,6 +3699,36 @@ def recompute_overall_safe():
                                                 f"from {prev} to {sensor_state['mlx_sky_state']}"
                                                 f"{delta_suffix}", "info", "mlx"))
 
+        # Dew risk (seasonal temperature/humidity/dew-point-margin rules, see
+        # DewRiskEngine). Always evaluated so the dashboard can show it; it only
+        # counts toward SAFE/UNSAFE while safety_checks.dew_check_enabled is on.
+        # No fresh outside temperature+humidity -> Unknown, which (when
+        # included) counts as UNSAFE, same fail-safe as the other checks.
+        env_src = sensor_state["env_source"]
+        env_dew_fresh = (sensor_state["env_ok"] and sensor_state["env_temp_c"] is not None
+                         and sensor_state["env_humidity"] is not None
+                         and ((now - sensor_state["bme_last_poll"] <= STALE_AFTER_SEC) if env_src == "BME280"
+                              else (now - sensor_state["dht_last_poll"] <= STALE_AFTER_SEC) if env_src == "DHT11"
+                              else False))
+        if env_dew_fresh:
+            dew_state, dew_margin, dew_rule, dew_detail = _dew_engine.evaluate(
+                sensor_state["env_temp_c"], sensor_state["env_humidity"], now)
+        else:
+            dew_state, dew_margin, dew_rule, dew_detail = "Unknown", None, "", "no fresh outside temperature/humidity reading"
+        gate_dew = (dew_state == "OK")
+        sensor_state["dew_state"], sensor_state["dew_margin_c"] = dew_state, dew_margin
+        sensor_state["dew_rule"], sensor_state["dew_detail"] = dew_rule, dew_detail
+        sensor_state["gate_dew"] = gate_dew
+        dew_pass = gate_dew if checks.get("dew_check_enabled", False) else True
+        sensor_state["dew_pass"] = dew_pass
+        sensor_state["dew_prev_state"], sensor_state["dew_prev_since"] = \
+            _track_status_change("dew", dew_state, now)
+        if checks.get("dew_check_enabled", False):
+            prev = _log_status_change("log_dew", dew_state)
+            if prev is not None:
+                pending_logs.append(("Safety", f"Dew risk changed from {prev} to {dew_state} ({dew_detail})",
+                                      "info" if dew_state == "OK" else "warn", "dew"))
+
         # simpleCloudDetect ML classifier (new vs. the ESP32)
         cloud_fresh = sensor_state["cloud_ok"] and (now - sensor_state["cloud_last_poll"] <= STALE_AFTER_SEC)
         gate_ml_cloud = cloud_fresh and sensor_state["cloud_safe"]
@@ -3888,7 +3933,7 @@ def recompute_overall_safe():
                 pending_logs.append(("Safety", f"{label} is responding again (reconnected)", "info", "never"))
 
         auto_safe = (daynight_pass and rain_pass and mlx_cloud_pass and ml_cloud_pass
-                     and ai_model_pass and cloud_model_pass)
+                     and dew_pass and ai_model_pass and cloud_model_pass)
         sensor_state["raw_safe"] = auto_safe
 
         # Fail-safe immediately on any UNSAFE transition, but require the raw
@@ -4199,6 +4244,93 @@ def dew_point_c(temp_c, rh_pct):
     a, b = 17.62, 243.12
     gamma = (a * temp_c) / (b + temp_c) + math.log(rh_pct / 100.0)
     return (b * gamma) / (a - gamma)
+
+
+class DewRiskEngine:
+    """Seasonal dew-risk rules (ported from ObsEnvController, converted to
+    degrees C). margin = outside temperature - dew point (Magnus, see
+    dew_point_c()). TRIP means condensation/frost on the optics is likely.
+
+      temp >= 20.0 C (summer):        TRIP if RH > 88, or margin <= 2.2 (RH >= 70)
+                                      / <= 1.1 (RH < 70)
+      4.4 C <= temp < 20.0 (spring/fall): RH > 88: TRIP if margin <= 1.7
+                                      RH 70-88: TRIP if margin <= 1.1; RH < 70: never
+      temp < 4.4 C (winter):          RH <= 88: never. RH > 88: only after 15 min
+                                      continuously saturated AND the air is cooling
+                                      faster than 0.3 C/hr AND margin <= 0.8
+    Stateful only for the winter rule (saturation timer + cooling rate over
+    >= 10 minute windows). Pure otherwise; `now` is injectable for tests."""
+    SUMMER_MIN_C = 20.0
+    SPRING_MIN_C = 4.4
+    FLASH_RH = 88.0
+    HUMID_RH = 70.0
+    SUMMER_MARGIN_HUMID_C = 2.2
+    SUMMER_MARGIN_DRY_C = 1.1
+    SPRING_MARGIN_SATURATED_C = 1.7
+    SPRING_MARGIN_HUMID_C = 1.1
+    WINTER_PERSIST_SEC = 15 * 60
+    WINTER_DROP_RATE_C_PER_HR = 0.3
+    WINTER_MARGIN_C = 0.8
+    TREND_WINDOW_SEC = 10 * 60
+
+    def __init__(self):
+        self._saturated_since = None
+        self._prev_temp = None
+        self._prev_time = None
+        self._drop_rate = 0.0
+
+    def _track_trend(self, temp_c, now):
+        if self._prev_temp is None:
+            self._prev_temp, self._prev_time = temp_c, now
+            return
+        elapsed = now - self._prev_time
+        if elapsed >= self.TREND_WINDOW_SEC:
+            self._drop_rate = (self._prev_temp - temp_c) / (elapsed / 3600.0)   # + = cooling
+            self._prev_temp, self._prev_time = temp_c, now
+
+    def evaluate(self, temp_c, rh, now=None):
+        """-> (state "OK"/"TRIP", margin_c, rule, detail)."""
+        now = time.time() if now is None else now
+        margin = temp_c - dew_point_c(temp_c, rh)
+        self._track_trend(temp_c, now)
+        if temp_c >= self.SUMMER_MIN_C:
+            self._saturated_since = None
+            if rh > self.FLASH_RH:
+                return ("TRIP", margin, "summer",
+                        f"summer: humidity {rh:.0f}% is above {self.FLASH_RH:.0f}% (air saturated)")
+            limit = self.SUMMER_MARGIN_HUMID_C if rh >= self.HUMID_RH else self.SUMMER_MARGIN_DRY_C
+            if margin <= limit:
+                return ("TRIP", margin, "summer", f"summer: margin {margin:.1f} °C ≤ {limit:.1f} °C limit, humidity {rh:.0f}%")
+            return ("OK", margin, "summer", f"margin {margin:.1f} °C, humidity {rh:.0f}%, summer rules")
+        if temp_c >= self.SPRING_MIN_C:
+            self._saturated_since = None
+            if rh > self.FLASH_RH:
+                limit = self.SPRING_MARGIN_SATURATED_C
+            elif rh >= self.HUMID_RH:
+                limit = self.SPRING_MARGIN_HUMID_C
+            else:
+                return ("OK", margin, "spring/fall", f"margin {margin:.1f} °C, humidity {rh:.0f}%, spring/fall rules")
+            if margin <= limit:
+                return ("TRIP", margin, "spring/fall", f"spring/fall: margin {margin:.1f} °C ≤ {limit:.1f} °C limit, humidity {rh:.0f}%")
+            return ("OK", margin, "spring/fall", f"margin {margin:.1f} °C, humidity {rh:.0f}%, spring/fall rules")
+        # winter
+        if rh <= self.FLASH_RH:
+            self._saturated_since = None
+            return ("OK", margin, "winter", f"margin {margin:.1f} °C, humidity {rh:.0f}%, winter dry air")
+        if self._saturated_since is None:
+            self._saturated_since = now
+        waited = now - self._saturated_since
+        if waited < self.WINTER_PERSIST_SEC:
+            return ("OK", margin, "winter", f"winter: humidity {rh:.0f}% for {waited / 60:.0f} of "
+                                             f"{self.WINTER_PERSIST_SEC // 60} min (mist filter)")
+        if self._drop_rate <= self.WINTER_DROP_RATE_C_PER_HR:
+            return ("OK", margin, "winter", f"winter: saturated but air is stable ({self._drop_rate:.2f} °C/hr cooling)")
+        if margin <= self.WINTER_MARGIN_C:
+            return ("TRIP", margin, "winter", f"winter: saturated, cooling {self._drop_rate:.2f} °C/hr, margin {margin:.1f} °C ≤ {self.WINTER_MARGIN_C:.1f} °C")
+        return ("OK", margin, "winter", f"winter: saturated, cooling, margin {margin:.1f} °C still above {self.WINTER_MARGIN_C:.1f} °C")
+
+
+_dew_engine = DewRiskEngine()
 
 
 def ramp_power_percent(value, starts_at, full_at):
@@ -5327,6 +5459,7 @@ def livestatus():
             "rain": {"enabled": checks["rain_enabled"], "pass": s["gate_rain"]},
             "mlx_cloud": {"enabled": checks["mlx_gate_enabled"], "pass": s["gate_mlx_cloud"]},
             "ml_cloud": {"enabled": checks["ml_cloud_enabled"], "pass": s["gate_ml_cloud"]},
+            "dew": {"enabled": checks.get("dew_check_enabled", False), "pass": s["gate_dew"], "state": s["dew_state"]},
             "ai_model": {"enabled": checks.get("ai_model_enabled", False), "pass": s["gate_ai_model"],
                          "status": s.get("ai_model_status"), "predicted": s.get("ai_model_predicted")},
             "cloud_model": {"enabled": checks.get("cloud_model_enabled", False), "pass": s["gate_cloud_model"],
@@ -5548,6 +5681,7 @@ def save_checks():
         # counts toward SAFE/UNSAFE, not any sensor's wiring, so they live
         # and are saved here instead.
         s["safety_checks"]["mlx_gate_enabled"] = "mlxGateEnable" in request.args
+        s["safety_checks"]["dew_check_enabled"] = "dewEnable" in request.args
         s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
         s["safety_checks"]["cloud_model_enabled"] = "cloudModelEnable" in request.args
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
@@ -6032,6 +6166,15 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     env_source_name = {"BME280": sensor_names["bme280"], "DHT11": sensor_names["dht11"]}.get(
         s["env_source"], s["env_source"])
 
+    dew_included = checks.get("dew_check_enabled", False)
+    dew_dot = _status_dot(
+        s["dew_pass"], dew_included,
+        f"Dew risk check: not included in the SAFE/UNSAFE decision (currently {s['dew_state']}). "
+        f"Include it under Settings → Safety Checks.",
+        f"Dew risk check: passing — {s['dew_detail']}.",
+        f"Dew risk check: FAILING — {s['dew_detail']}.",
+        neutral_when_disabled=True,
+    )
     mlx_reason_suffix = f" ({s['mlx_sky_reason']})" if s["mlx_sky_state"] == "Unknown" else ""
     mlx_dot = _status_dot(
         s["mlx_cloud_pass"], checks["mlx_gate_enabled"],
@@ -6235,8 +6378,16 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
     # own; (4) the two ambient temperature/humidity readings (Environment,
     # Box) that aren't part of the SAFE/UNSAFE fusion at all.
     group_divider = '<hr class="sep">'
+    dew_state_txt = {"OK": "OK", "TRIP": "TRIP"}.get(s["dew_state"], "Unknown")
+    dew_incl_tag = ('<span class="tag">counts toward safety</span>' if dew_included
+                    else '<span class="tag">not included in safety</span>')
+    dew_row = _field_row(dew_dot, "💦", f"""Dew risk: <b>{dew_state_txt}</b>
+  <span class="muted">({_html_escape(s['dew_detail'])})</span> {dew_incl_tag}""")
+    dew_prev = _prev_status_text(s["dew_prev_state"], s["dew_prev_since"], tz_name)
+    if dew_prev:
+        dew_row += _field_row("", "", dew_prev, "prev-status")
     sky_group = sky_row + ai_model_row + cloud_model_row + ml_row
-    return sky_group + group_divider + rain_row + group_divider + outside_row + box_row
+    return sky_group + group_divider + rain_row + group_divider + dew_row + group_divider + outside_row + box_row
 
 
 def render_heater_info_html(h, heater_enabled=True, mosfet_name="Heater MOSFET"):
@@ -6287,11 +6438,11 @@ def _ai_history_points(samples, model):
 SC_LANE_GAP = 7            # px between lanes in the Safety Checks History card
 SC_TOP_PAD = 4             # px above the first lane
 SC_AI_LANE_H = 96.0        # height of the AI chart lane (three Overcast/Cloudy/Clear bands)
-SC_ROW_H = {"overall": 22.0, "dome": 22.0, "daynight": 18.0, "rain": 18.0, "mlx": 18.0, "mlcloud": 18.0,
+SC_ROW_H = {"overall": 22.0, "dome": 22.0, "daynight": 18.0, "rain": 18.0, "mlx": 18.0, "mlcloud": 18.0, "dew": 18.0,
             "ai": 18.0, "cloudimg": 18.0}   # ai/cloudimg: only in the "lanes" style (the chart style uses SC_AI_LANE_H)
 SC_LABEL_COL_W = 92        # px width of the sticky lane-name column
 SC_LANE_NAMES = {"overall": "Overall", "dome": "Dome", "daynight": "Day / Night", "rain": "Rain",
-                 "mlx": "MLX Cloud", "mlcloud": "ML Cloud", "ai": "AI Sky Pred.", "cloudimg": "AI Cloud Detect"}
+                 "mlx": "MLX Cloud", "mlcloud": "ML Cloud", "dew": "Dew Risk", "ai": "AI Sky Pred.", "cloudimg": "AI Cloud Detect"}
 # The exact pastel green/amber/red of the original Sky History bands, reused
 # for every lane so the whole card reads as one chart; grey = no usable
 # reading. blue/grey2/move are the Dome lane's Open / Closed / moving.
@@ -6348,6 +6499,11 @@ def _sc_cell(key, rec, safe_labels, detail=False):
     if key == "mlx":
         m = rec.get("m", "Unknown")
         return (m, {"Clear": "ok", "Cloudy": "warn"}.get(m, "unk"))
+    if key == "dew":
+        dw = rec.get("dw")
+        if dw is None:
+            return ("No data", "unk")
+        return (dw, {"OK": "ok", "TRIP": "bad"}.get(dw, "unk"))
     if key == "mlcloud":
         c = rec.get("c", "Unknown")
         if c == "Unknown":
@@ -6404,6 +6560,7 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
         "rain": bool(checks.get("rain_enabled")),
         "mlx": bool(checks.get("mlx_gate_enabled")),
         "mlcloud": bool(checks.get("ml_cloud_enabled")),
+        "dew": bool(checks.get("dew_check_enabled")),
         "ai": bool(checks.get("ai_model_enabled")),
         "cloudimg": bool(checks.get("cloud_model_enabled")),
     }
@@ -6456,8 +6613,8 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
                       'from now on, so check back in a few minutes.</p>')
 
     ai_chart_on = (en["ai"] or en["cloudimg"]) and not lanes_style
-    lane_keys = ["overall"] + [k for k in (("dome", "daynight", "rain", "mlx", "mlcloud", "ai", "cloudimg") if lanes_style
-                                           else ("dome", "daynight", "rain", "mlx", "mlcloud")) if en[k]]
+    lane_keys = ["overall"] + [k for k in (("dome", "daynight", "rain", "mlx", "mlcloud", "dew", "ai", "cloudimg") if lanes_style
+                                           else ("dome", "daynight", "rain", "mlx", "mlcloud", "dew")) if en[k]]
     lanes = {}
     y = float(SC_TOP_PAD)
     for k in lane_keys:
@@ -7568,6 +7725,11 @@ a{{color:var(--accent-safety);}}
       inside the enclosure and reads warmer box air, not true outside air. If the selected sensor is
       unavailable, this check reports Unknown rather than silently substituting a different one. Enable/disable
       the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <label><input type="checkbox" name="dewEnable" {"checked" if checks.get('dew_check_enabled') else ""}> Dew risk check counts toward SAFE/UNSAFE</label>
+      <p class="hint">Off (default): the dew reading and its seasonal rules are still evaluated and shown on the dashboard,
+      but never affect SAFE/UNSAFE. On: a dew trip makes the monitor UNSAFE, and a Dew Risk lane appears in the Safety Checks
+      History graph. Uses the outside temperature and humidity already read for the heater (no extra sensor); if
+      either reading is missing the check is Unknown, which counts as UNSAFE while it's included.</p>
       <label><input type="checkbox" name="mlcloud" {"checked" if checks['ml_cloud_enabled'] else ""}> Simple Cloud Detect ML check</label>
       <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
       <input type="text" name="mlcloudignore" value="{checks['ml_cloud_ignore_classes']}" placeholder="e.g. Glare, Fogged Lens">

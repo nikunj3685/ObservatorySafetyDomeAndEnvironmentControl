@@ -67,3 +67,6 @@ Both machines must get their new file, or job start will fail:
 
 If the Pi then reports a *connection timed out*, it is the Windows/McAfee
 firewall — see "Troubleshooting" in `cloud-training-server/README.md`.
+
+
+- Dew Risk check: replace dome_safety_service.py; no config migration needed (new setting defaults off).

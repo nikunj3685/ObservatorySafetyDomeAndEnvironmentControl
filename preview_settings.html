@@ -179,10 +179,18 @@ input[type=number],input[type=time]{font-size:14px;padding:5px 7px;border-radius
 input[type=checkbox]{vertical-align:middle;margin-right:6px;}
 input[type=range]{width:100%;accent-color:var(--accent-heater);}
 a{color:var(--accent-safety);}
-.topnav{display:flex;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
+
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.topnav{display:flex;align-items:center;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
 .topnav a{padding:9px 14px;text-decoration:none;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px;}
-.topnav a:hover{color:var(--accent-safety);}
-.topnav a.on{color:var(--accent-safety);border-bottom-color:var(--accent-safety);}
+.topnav a:hover{color:#2563eb;}
+.topnav a.on{color:#2563eb;border-bottom-color:#2563eb;}
+.topnav .nav-sp{flex:1;}
+.nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
+.nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
+.nav-restart:hover{background:#a71d1d;}
+
 /* closable notices */
 .banner{position:relative;padding-right:38px;}
 .banner .banner-x{position:absolute;top:6px;right:8px;width:24px;height:24px;border:0;border-radius:50%;background:transparent;color:inherit;font-size:18px;line-height:22px;cursor:pointer;padding:0;opacity:.75;}
@@ -206,7 +214,7 @@ a{color:var(--accent-safety);}
 
 <h1>🔭 Observatory Control</h1>
 <p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p>
-<nav class="topnav"><a href="/" class="">🏠 Dashboard</a><a href="/settings" class="on">⚙ Settings</a><a href="/logs">🗒 Logs</a><a href="/ai-classify">🏷️ Classify (<span id="classifyCount">0</span>)</a></nav>
+<nav class="topnav"><a href="/">🏠 Dashboard</a><a href="/settings" class="on">⚙ Settings</a><a href="/ai-classify">🏷️ Classify (<span id="classifyCount">0</span>)</a><a href="/logs">🗒 Logs</a><span class="nav-sp"></span><span class="nav-restart-msg" id="hdrRestartMsg"></span><button type="button" class="nav-restart" title="Restart service" aria-label="Restart service" onclick="hdrRestart()">&#8635;</button></nav>
 <div class="notice-restore" id="noticeRestore" hidden><span id="noticeRestoreN"></span> dismissed &mdash; <a href="#" id="noticeRestoreAll">Show all</a></div>
 
 <div class="grid">
@@ -265,6 +273,11 @@ a{color:var(--accent-safety);}
       inside the enclosure and reads warmer box air, not true outside air. If the selected sensor is
       unavailable, this check reports Unknown rather than silently substituting a different one. Enable/disable
       the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
+      <label><input type="checkbox" name="dewEnable" > Dew risk check counts toward SAFE/UNSAFE</label>
+      <p class="hint">Off (default): the dew reading and its seasonal rules are still evaluated and shown on the dashboard,
+      but never affect SAFE/UNSAFE. On: a dew trip makes the monitor UNSAFE, and a Dew Risk lane appears in the Safety Checks
+      History graph. Uses the outside temperature and humidity already read for the heater (no extra sensor); if
+      either reading is missing the check is Unknown, which counts as UNSAFE while it's included.</p>
       <label><input type="checkbox" name="mlcloud" checked> Simple Cloud Detect ML check</label>
       <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
       <input type="text" name="mlcloudignore" value="" placeholder="e.g. Glare, Fogged Lens">
@@ -620,6 +633,21 @@ a{color:var(--accent-safety);}
 </div>
 
 <script>
+
+function hdrRestart(){
+  if(!confirm('Restart the dome-safety service now?')) return;
+  var m=document.getElementById('hdrRestartMsg'); if(m) m.textContent='Restarting...';
+  fetch('/restart-service').catch(function(){});
+  var down=false, tries=0;
+  var t=setInterval(function(){
+    tries++;
+    fetch('/fragments',{cache:'no-store'}).then(function(r){
+      if(r.ok && down){ clearInterval(t); location.reload(); }
+      else if(tries>45){ clearInterval(t); if(m) m.textContent='No response yet - reload the page in a moment.'; }
+    }).catch(function(){ down=true; if(m) m.textContent='Restarting - waiting for the service...'; });
+  },2000);
+}
+
 function doServiceAction(url){
   var el=document.getElementById('serviceStatus');
   if(el) el.textContent='Working...';

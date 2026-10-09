@@ -456,3 +456,7 @@ in direction, awaiting "code it").
    one group at a time. Same forms/handlers. The 16 existing `/#group`
    redirects and the "Settings" links in notices must map to the right group.
    Open: Heater Thresholds currently lives in the Heater card - leave it there?
+
+
+## Built 2026-10-09: Dew Risk check
+`DewRiskEngine` (seasonal rules ported from ObsEnvController, all °C; fixed limits). Setting `safety_checks.dew_check_enabled` (default off = shown, not counted). Dashboard row in its own divided section between Rain and Environment; graph lane `dw` only when included; gates API key `dew`; Logs entry only when included. Open question: make limits editable settings?

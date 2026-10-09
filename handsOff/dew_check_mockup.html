@@ -1,0 +1,40 @@
+<!doctype html><meta charset="utf-8"><title>Dew check mockup</title>
+<style>:root{--ok:#2e9e4f}body{font:14px system-ui;background:#f2f4f7;margin:0;padding:16px;color:#1f2328;max-width:900px}
+.mk{background:#fff3cd;border:1px solid #e8d48a;border-radius:8px;padding:8px 12px;margin-bottom:14px}
+.c{background:#fff;border-radius:14px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:14px}
+.t{font-weight:700;font-size:11px;color:#6b7480;margin:0 0 8px;letter-spacing:.4px}h3{margin:0 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:.4px}
+.r{display:flex;align-items:center;gap:10px;margin:8px 0}.d{width:14px;height:14px;border-radius:50%;background:var(--ok);flex:none}.d.g{background:#8a94a0}.d.b{background:#c62828}
+.tag{font-size:11px;border:1px solid #d3d8de;border-radius:6px;padding:0 6px;color:#6b7480}.mut{color:#6b7480;font-size:12px}
+.hint{font-size:12px;color:#6b7480;margin:2px 0 10px 24px}select,input[type=text]{font-size:13px}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid #e2e5ea;padding:6px 8px;text-align:left}
+.lane{display:flex;gap:8px;align-items:center;margin:4px 0}.lane b{width:92px;font-size:10.5px}.bar{flex:1;height:14px;border-radius:2px;display:flex;font-size:8px;font-weight:700;line-height:14px;text-align:center}
+.bar i{font-style:normal;border:1px solid rgba(0,0,0,.1)}.ok{background:#c9e7b7}.bad{background:#e6bcc3}</style>
+<div class="mk"><b>MOCKUP ONLY</b> - no code changed. Sample values.</div>
+
+<div class="c"><div class="t">1 &middot; SAFETY MONITOR CARD - new "Dew risk" row (beside the Sky / MLX row)</div>
+<div class="r"><span class="d"></span>&#127756; Sky: <b>-24.1 &deg;C</b> &nbsp;&Delta; <b>19.8 &deg;C</b> (Clear) <span class="tag">MLX90614</span></div>
+<div class="r"><span class="d g"></span>&#128167; Dew risk: <b>OK</b> <span class="mut">margin 4.6 &deg;C, humidity 71%, spring/fall rules</span> <span class="tag">not included in safety</span></div>
+<div class="mut" style="margin-left:24px">&uarr; default: shown for information only (grey dot), never changes SAFE/UNSAFE &nbsp;&middot;&nbsp; when included the dot is green/red like the other checks:</div>
+<div class="r"><span class="d b"></span>&#128167; Dew risk: <b>TRIP</b> <span class="mut">summer: margin 1.4 &deg;C &le; 2.2 &deg;C limit, humidity 74%</span> <span class="tag" style="color:#2e9e4f;border-color:#2e9e4f">counts toward safety</span></div>
+<div class="mut" style="margin-left:24px">Previously <b>OK</b> at 2026-10-09 06:01 AM (same "Previously ..." line as the other checks)</div></div>
+
+<div class="c"><div class="t">2 &middot; SETTINGS &rarr; SAFETY CHECKS - new option (same style as the MLX Sky gate)</div>
+<label><input type="checkbox"> Dew risk check counts toward SAFE/UNSAFE</label>
+<div class="hint">Off (default): the dew reading and its rules are still evaluated and shown on the dashboard, but never affect SAFE/UNSAFE. On: a dew trip makes the monitor UNSAFE. Uses the outside temperature and humidity (BME280/DHT) already read for the heater; if either reading is missing the check is Unknown and, when included, counts as UNSAFE (fail-safe) like the other checks.</div>
+<div class="hint" style="margin-top:-4px"><i>Hardware Pins unchanged - no extra sensor needed.</i></div></div>
+
+<div class="c"><div class="t">3 &middot; GRAPH - Dew lane (only while the check is included, like MLX Cloud)</div>
+<div class="lane"><b>Dew Risk</b><div class="bar"><i class="ok" style="flex:5">OK</i><i class="bad" style="flex:1">TRIP</i><i class="ok" style="flex:6">OK</i></div></div>
+<div class="mut">Hover row: "Dew Risk  OK / TRIP / Unknown". Not shown while excluded.</div></div>
+
+<div class="c"><div class="t">4 &middot; RULES (ported from ObsEnvController; all values in &deg;C; margin = temperature - dew point, Magnus-Tetens dew point as we already use; limits are the other project's &deg;F values converted)</div>
+<table><tr><th>Outside temp</th><th>Humidity</th><th>TRIP when</th></tr>
+<tr><td>Summer &ge; 20.0 &deg;C</td><td>&gt; 88%</td><td>always (flash dew)</td></tr>
+<tr><td></td><td>&ge; 70%</td><td>margin &le; 2.2 &deg;C</td></tr>
+<tr><td></td><td>&lt; 70%</td><td>margin &le; 1.1 &deg;C</td></tr>
+<tr><td>Spring/Fall 4.4 to 20.0 &deg;C</td><td>&gt; 88%</td><td>margin &le; 1.7 &deg;C</td></tr>
+<tr><td></td><td>70-88%</td><td>margin &le; 1.1 &deg;C</td></tr>
+<tr><td></td><td>&lt; 70%</td><td>never</td></tr>
+<tr><td>Winter &lt; 4.4 &deg;C</td><td>&le; 88%</td><td>never</td></tr>
+<tr><td></td><td>&gt; 88%</td><td>only after 15 min continuously saturated AND temperature falling &gt; 0.3 &deg;C/hr AND margin &le; 0.8 &deg;C</td></tr></table>
+<p class="mut">Open question: these are the other project's numbers. Keep them fixed, or expose the margins/humidity limits as editable settings?</p></div>
