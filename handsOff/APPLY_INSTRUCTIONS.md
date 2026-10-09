@@ -52,6 +52,10 @@ rule, the Sky History chart's key constants/functions, and the mockup
 design history worth knowing before touching the chart again. Point a
 fresh Claude conversation at this file first.
 
+## Deploying the Safety Checks History card (after merging)
+
+Only `dome_safety_service.py` changes on the Pi - `sudo systemctl restart dome-safety`. The chart starts recording to `safety_history.jsonl` (and dome open/close actions to `dome_events.jsonl`) immediately and fills in over the following hours (nothing to configure; both files are git-ignored). The same restart brings: the shared header/tab bar (Logs last) with a red restart button and the safety tab icon on every page, the Dome lane, the "AI graph style" choice (Settings -> Safety Checks: line chart [default] or block lanes) + "Show dome open/close actions in graph" option (Settings -> Dome & Heater), current-status pills, closable notices, and the new `/settings` page (old `/#group` bookmarks no longer land on a group - use `/settings#group`).
+
 ## Deploying the cloud training changes (after merging)
 
 Both machines must get their new file, or job start will fail:

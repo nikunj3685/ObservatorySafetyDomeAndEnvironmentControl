@@ -62,7 +62,9 @@ import traceback
 import urllib.parse
 import uuid
 import zipfile
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from html import escape as _html_escape
 from zoneinfo import ZoneInfo, available_timezones
 
 import requests
@@ -271,6 +273,11 @@ DEFAULT_SETTINGS = {
         # downloaded yet, tflite-runtime not installed, or no fresh camera
         # frame to predict from).
         "cloud_model_enabled": False,
+        # How AI Sky Pred. / AI Cloud Detect are drawn in the Safety Checks
+        # History graph: "chart" = one tall line chart with both traces over the
+        # Overcast/Cloudy/Clear bands, "lanes" = two Clear/Cloudy/Overcast block
+        # lanes like the other checks. Display only.
+        "ai_graph_style": "chart",
     },
     "location": {
         "latitude_deg": 0.0,
@@ -337,6 +344,10 @@ DEFAULT_SETTINGS = {
     "features": {
         "dome_enabled": True,
         "heater_enabled": True,
+        # Show the dome's state and open/close actions as a lane in the
+        # Safety Checks History graph. Cosmetic only - events keep being
+        # recorded while it is off, so turning it back on shows the past.
+        "dome_graph_enabled": True,
     },
     # Optional All Sky camera section, shown beside the Safety Monitor card.
     # Off by default - there's no sensible default image location, so it
@@ -3256,6 +3267,244 @@ def _save_status_history():
 _status_history = _load_status_history()
 
 
+# ==========================================================================
+# SAFETY CHECKS HISTORY - the data behind the "Safety Checks History" card
+# ==========================================================================
+# One small JSON record per SAFETY_HISTORY_RECORD_INTERVAL_SEC, appended to
+# safety_history.jsonl next to this script and mirrored in an in-memory
+# deque (so the dashboard's periodic refresh never re-reads the file). Each
+# record is the full picture of one moment: the overall SAFE/UNSAFE verdict
+# plus every check's own value - day/night, rain, MLX90614 sky state,
+# simpleCloudDetect class, and both AI predictions. Unlike the AI Sky
+# Prediction trace (which is rebuilt from AI Learning's capture samples, see
+# _ai_history_points()), none of this is derivable after the fact - the
+# overall verdict and the Cloud Image Model's prediction were never stored
+# per sample - so history for those lanes starts from the first record
+# written after this feature shipped and fills in from there. Retention is
+# just past the card's own 48h window; older records are pruned on startup
+# and on the same schedule as the log cleanup.
+SAFETY_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety_history.jsonl")
+SAFETY_HISTORY_RECORD_INTERVAL_SEC = 60
+SAFETY_HISTORY_RETENTION_SEC = (AI_HISTORY_WINDOW_HOURS + 2) * 3600
+SAFETY_HISTORY_GAP_SEC = 5 * 60   # no record for longer than this = the service wasn't running -> a visible gap, not a stretched bar
+
+_safety_history = deque()
+_safety_history_lock = threading.Lock()
+
+
+def _load_safety_history():
+    """Best-effort load of safety_history.jsonl into the in-memory deque,
+    dropping anything past retention and any corrupt/partial line (a power
+    cut mid-write) rather than failing. If anything was dropped the file is
+    rewritten (atomically) so it never grows without bound. Never raises."""
+    cutoff = time.time() - SAFETY_HISTORY_RETENTION_SEC
+    kept = []
+    dropped = False
+    try:
+        if os.path.exists(SAFETY_HISTORY_PATH):
+            with open(SAFETY_HISTORY_PATH, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        t = float(rec["t"])
+                    except Exception:
+                        dropped = True
+                        continue
+                    if t < cutoff:
+                        dropped = True
+                        continue
+                    kept.append(rec)
+    except Exception:
+        return
+    kept.sort(key=lambda r: r["t"])
+    with _safety_history_lock:
+        _safety_history.clear()
+        _safety_history.extend(kept)
+    if dropped:
+        _rewrite_safety_history_file()
+
+
+def _rewrite_safety_history_file():
+    """Atomically rewrite safety_history.jsonl from the in-memory deque
+    (also used to prune). Best-effort - a failure just leaves the old file,
+    which the next prune retries."""
+    try:
+        with _safety_history_lock:
+            lines = [json.dumps(r, separators=(",", ":")) for r in _safety_history]
+        tmp = SAFETY_HISTORY_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, SAFETY_HISTORY_PATH)
+    except Exception:
+        pass
+
+
+def _prune_safety_history():
+    """Drop in-memory records past retention, then rewrite the file."""
+    cutoff = time.time() - SAFETY_HISTORY_RETENTION_SEC
+    with _safety_history_lock:
+        while _safety_history and _safety_history[0]["t"] < cutoff:
+            _safety_history.popleft()
+    _rewrite_safety_history_file()
+    with _dome_events_lock:
+        while _dome_events and _dome_events[0]["t"] < cutoff:
+            _dome_events.popleft()
+    _rewrite_dome_events_file()
+
+
+def _cloud_model_clear_score(s, safe_labels):
+    """0..1 'how clear does the image model think it is', for plotting its
+    prediction on the same Overcast/Cloudy/Clear bands as the sensor model.
+    The model only reports its top class + that class's confidence, so a
+    safe-label prediction scores its confidence and any other prediction
+    scores 1 - confidence (high-confidence 'not clear' lands deep in the
+    Overcast band, an unsure call lands in the middle Cloudy band). None
+    when there is no usable prediction this moment."""
+    if s.get("cloud_model_status") != "active" or s.get("cloud_model_predicted") is None:
+        return None
+    conf = s.get("cloud_model_confidence")
+    try:
+        conf = max(0.0, min(1.0, float(conf)))
+    except (TypeError, ValueError):
+        conf = None
+    is_safe = str(s["cloud_model_predicted"]).strip().lower() in safe_labels
+    if conf is None:
+        return 1.0 if is_safe else 0.0
+    return conf if is_safe else 1.0 - conf
+
+
+def _build_safety_history_record(now=None):
+    """One history record from the live sensor_state (see the block comment
+    above for the field meanings). Reuses _log_sensor_snapshot() for the
+    freshness-aware day/night/rain/MLX/ML-cloud labels so this card can
+    never disagree with the dashboard or the log entries about what a
+    reading was. Keys: t=timestamp, o=overall SAFE, dn=Day/Night, r=Rain/
+    Dry/Unknown, m=MLX Clear/Cloudy/Unknown, c=simpleCloudDetect class,
+    cp=its gate passes, a/aa=AI Sky Prediction class/corrected-delta
+    anomaly, i=Cloud Image Model class, ic=its clear score (0..1), d=dome
+    state (only while the Dome feature is enabled)."""
+    now = time.time() if now is None else now
+    snap = _log_sensor_snapshot()
+    with sensor_lock:
+        s = dict(sensor_state)
+    ai_cfg = get_setting("ai_learning")
+    safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
+    rec = {
+        "t": round(now, 1),
+        "o": bool(snap["overall_safe"]),
+        "dn": snap["daynight"],
+        "r": snap["rain"],
+        "m": snap["sky_mlx"],
+        "c": snap["ml_cloud"],
+        "cp": bool(s.get("gate_ml_cloud")),
+    }
+    if s.get("ai_model_status") == "active" and s.get("ai_model_predicted") is not None:
+        rec["a"] = s["ai_model_predicted"]
+        if s.get("ai_model_anomaly_c") is not None:
+            rec["aa"] = round(float(s["ai_model_anomaly_c"]), 2)
+    if s.get("cloud_model_status") == "active" and s.get("cloud_model_predicted") is not None:
+        rec["i"] = s["cloud_model_predicted"]
+        score = _cloud_model_clear_score(s, safe_labels)
+        if score is not None:
+            rec["ic"] = round(score, 3)
+    if dome_feature_enabled():
+        try:
+            rec["d"] = dome.snapshot()["state"]
+        except Exception:
+            pass
+    return rec
+
+
+def _record_safety_history():
+    """Append one record (memory + file). Never raises - a failed write
+    just loses that one data point."""
+    try:
+        rec = _build_safety_history_record()
+        with _safety_history_lock:
+            _safety_history.append(rec)
+        with open(SAFETY_HISTORY_PATH, "a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception:
+        print(f"[safety-history] could not record a history point:\n{traceback.format_exc()}")
+
+
+_load_safety_history()
+
+# Dome open/close actions for the graph's Dome lane: one line per command
+# actually issued (action open|close + the trigger string DomeController
+# was given - Manual, ASCOM, Schedule, Safety auto-close, ...). Kept apart
+# from safety_history.jsonl because they are events, not per-minute
+# samples. Same retention as the history; recorded whether or not the
+# graph option is on, so enabling it later shows what already happened.
+DOME_EVENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dome_events.jsonl")
+_dome_events = deque()
+_dome_events_lock = threading.Lock()
+
+
+def _load_dome_events():
+    cutoff = time.time() - SAFETY_HISTORY_RETENTION_SEC
+    kept = []
+    dropped = False
+    try:
+        if os.path.exists(DOME_EVENTS_PATH):
+            with open(DOME_EVENTS_PATH, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                        t = float(ev["t"])
+                        if ev["a"] not in ("open", "close"):
+                            raise ValueError
+                    except Exception:
+                        dropped = True
+                        continue
+                    if t < cutoff:
+                        dropped = True
+                        continue
+                    kept.append(ev)
+    except Exception:
+        return
+    kept.sort(key=lambda e: e["t"])
+    with _dome_events_lock:
+        _dome_events.clear()
+        _dome_events.extend(kept)
+    if dropped:
+        _rewrite_dome_events_file()
+
+
+def _rewrite_dome_events_file():
+    try:
+        with _dome_events_lock:
+            lines = [json.dumps(e, separators=(",", ":")) for e in _dome_events]
+        tmp = DOME_EVENTS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, DOME_EVENTS_PATH)
+    except Exception:
+        pass
+
+
+def _record_dome_event(action, trigger):
+    """Called by DomeController when an OPEN/CLOSE is actually commanded.
+    Never raises - the graph must never be able to stop the dome."""
+    try:
+        ev = {"t": round(time.time(), 1), "a": action, "g": str(trigger)}
+        with _dome_events_lock:
+            _dome_events.append(ev)
+        with open(DOME_EVENTS_PATH, "a") as f:
+            f.write(json.dumps(ev, separators=(",", ":")) + "\n")
+    except Exception:
+        print(f"[safety-history] could not record a dome event:\n{traceback.format_exc()}")
+
+
+_load_dome_events()
+
+
 def _track_status_change(key, current_value, now):
     """Records `current_value` under `key`; if it differs from the value
     last recorded under this key, that OLD value + the current timestamp
@@ -3856,6 +4105,7 @@ def sensor_poll_loop():
     last_ai_capture = 0.0
     last_autotrain_check = 0.0
     last_cloud_job_health_check = 0.0
+    last_safety_history_record = 0.0
     cycle_num = 0
     while True:
         cycle_num += 1
@@ -3878,6 +4128,11 @@ def sensor_poll_loop():
                 last_cloud_model_predict = now
 
             _run_bounded("recompute_overall_safe", recompute_overall_safe, 8.0)
+
+            if now - last_safety_history_record >= SAFETY_HISTORY_RECORD_INTERVAL_SEC:
+                _run_bounded("_record_safety_history", _record_safety_history, 3.0)
+                last_safety_history_record = now
+
             print(f"[sensor-poll][diag] cycle {cycle_num} complete in {time.time() - cycle_start:.2f}s "
                   f"(in-flight: {[k for k, v in _poll_step_in_flight.items() if v]})")
 
@@ -3888,6 +4143,7 @@ def sensor_poll_loop():
             if now - last_log_cleanup >= LOG_CLEANUP_INTERVAL_SEC:
                 _run_bounded("_log_cleanup", _log_cleanup, 5.0)
                 _run_bounded("_ai_training_cleanup", _ai_training_cleanup, 5.0)
+                _run_bounded("_prune_safety_history", _prune_safety_history, 5.0)
                 last_log_cleanup = now
 
             ai_cfg = get_setting("ai_learning")
@@ -4272,6 +4528,7 @@ class DomeController:
             self.move_start_time = time.time()
             self.state = STATE_OPENING
         _log_event("Dome", f"Dome OPEN commanded ({trigger})")
+        _record_dome_event("open", trigger)
         self._trigger_relay()
 
     def request_close(self, trigger="Manual"):
@@ -4287,6 +4544,7 @@ class DomeController:
             self.move_start_time = time.time()
             self.state = STATE_CLOSING
         _log_event("Dome", f"Dome CLOSE commanded ({trigger})")
+        _record_dome_event("close", trigger)
         self._trigger_relay()
 
     def snapshot(self):
@@ -5172,7 +5430,7 @@ def tz_options_html(current_tz):
 def config_page():
     # Settings now live inline on the "/" status page - keep this as a
     # harmless redirect for anyone with the old link/bookmark saved.
-    return "", 302, {"Location": "/#settings"}
+    return "", 302, {"Location": "/settings"}
 
 
 @app.route("/save-location", methods=["GET"])
@@ -5186,7 +5444,7 @@ def save_location():
         # here so this form can't silently reset them.
     update_settings(patch)
     _log_event("Settings", "Location & Timezone settings saved")
-    return "", 302, {"Location": "/#settings"}
+    return "", 302, {"Location": "/settings#location-timezone"}
 
 
 @app.route("/save-pins", methods=["GET"])
@@ -5242,7 +5500,7 @@ def save_pins():
                 s["sensor_names"][field] = request.args[arg].strip()
     update_settings(patch)
     _log_event("Settings", "Hardware Pins & Addresses settings saved")
-    return "", 302, {"Location": "/#settings"}
+    return "", 302, {"Location": "/settings#hardware-pins"}
 
 
 def _delayed_system_command(cmd, delay_sec=1.0):
@@ -5293,6 +5551,8 @@ def save_checks():
         s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
         s["safety_checks"]["cloud_model_enabled"] = "cloudModelEnable" in request.args
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
+        if request.args.get("aiGraphStyle") in ("chart", "lanes"):
+            s["safety_checks"]["ai_graph_style"] = request.args["aiGraphStyle"]
         if "mlcloudignore" in request.args:
             s["safety_checks"]["ml_cloud_ignore_classes"] = request.args["mlcloudignore"].strip()
         if "thresh" in request.args:
@@ -5306,7 +5566,7 @@ def save_checks():
             s["safety_safe_delay"]["delay_minutes"] = float(request.args["safedelaymin"])
     update_settings(patch)
     _log_event("Settings", "Safety Checks settings saved")
-    return "", 302, {"Location": "/#safety-checks"}
+    return "", 302, {"Location": "/settings#safety-checks"}
 
 
 @app.route("/save-heater", methods=["GET"])
@@ -5328,13 +5588,14 @@ def save_features():
     def patch(s):
         s["features"]["dome_enabled"] = "domeEnable" in request.args
         s["features"]["heater_enabled"] = "heaterEnable" in request.args
+        s["features"]["dome_graph_enabled"] = "domeGraph" in request.args
         if "openIgnoreSec" in request.args:
             s["dome_timing"]["open_ignore_sensor_sec"] = max(0.0, float(request.args["openIgnoreSec"]))
         if "moveAssumeSec" in request.args:
             s["dome_timing"]["move_assume_sec"] = max(0.0, float(request.args["moveAssumeSec"]))
     update_settings(patch)
     _log_event("Settings", "Dome & Heater Features settings saved")
-    return "", 302, {"Location": "/#dome-heater-features"}
+    return "", 302, {"Location": "/settings#dome-heater-features"}
 
 
 @app.route("/save-logging", methods=["GET"])
@@ -5367,7 +5628,7 @@ def save_logging():
             s["logging"]["image_on_cloud_model_change"] = "imgCloudModel" in request.args
     update_settings(patch)
     _log_event("Settings", "Logging settings saved")
-    return "", 302, {"Location": "/#logging-settings"}
+    return "", 302, {"Location": "/settings#logging-settings"}
 
 
 @app.route("/clear-log-images", methods=["GET"])
@@ -5403,7 +5664,7 @@ def save_device_names():
                 s["device_names"][field] = request.args[arg].strip()
     update_settings(patch)
     _log_event("Settings", "Device Names settings saved")
-    return "", 302, {"Location": "/#device-names"}
+    return "", 302, {"Location": "/settings#device-names"}
 
 
 def allsky_is_url(location):
@@ -5423,7 +5684,7 @@ def save_allsky():
         s["allsky"]["extra_data_skip_own_overlay"] = "skipOwnOverlay" in request.args
     update_settings(patch)
     _log_event("Settings", "All Sky Camera settings saved")
-    return "", 302, {"Location": "/#allsky-settings"}
+    return "", 302, {"Location": "/settings#allsky-settings"}
 
 
 @app.route("/save-ai-learning", methods=["GET"])
@@ -5468,7 +5729,7 @@ def save_ai_learning():
                 pass
     update_settings(patch)
     _log_event("Settings", "AI Learning settings saved")
-    return "", 302, {"Location": "/#ai-learning-settings"}
+    return "", 302, {"Location": "/settings#ai-learning-settings"}
 
 
 @app.route("/allsky-image", methods=["GET"])
@@ -5981,7 +6242,7 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
 def render_heater_info_html(h, heater_enabled=True, mosfet_name="Heater MOSFET"):
     if not heater_enabled:
         return ("<p class='field muted'>🚫 Heater control is disabled under "
-                "<a href='#dome-heater-features'>Settings</a> &mdash; not driving the output, "
+                "<a href='/settings#dome-heater-features'>Settings</a> &mdash; not driving the output, "
                 "and not computing dew/freeze power.</p>")
     no_reading_yet = h["sensor_missing"] or h["dew_point_c"] is None
     mosfet_note = (f"<p class='field muted'>{mosfet_name} disabled under Hardware Pins &mdash; showing the "
@@ -6023,182 +6284,467 @@ def _ai_history_points(samples, model):
     return points
 
 
-def render_sky_history_html(samples, s, tz_name="UTC"):
-    """The Sky History card: a scrollable 48-hour trace of the corrected-
-    delta AI Sky Prediction (see _train_ai_sky_model()/_predict_ai_sky_
-    class()), reusing the AI Learning training index as its data source
-    (see AI_HISTORY_WINDOW_HOURS's comment above) rather than a new
-    logging mechanism. Always returns a complete `<div class="card
-    history-compact" id="history">...</div>` - falls back to a plain
-    explanatory message inside that same card frame (same fail-soft
-    philosophy as the AI Model row itself) whenever there's no trained
-    model yet or fewer than 2 real readings in the window, rather than
-    omitting the card entirely, so it's never a surprise where this went.
-    Called from both web_index() (initial page load) and web_fragments()
-    (periodic refresh), same pattern as render_env_readings_html() -
-    `samples` is the caller's already-loaded AI training index samples
-    list, so this never triggers a second redundant disk read per
-    request."""
-    model = _load_ai_sky_model()
-    points = _ai_history_points(samples, model)
+SC_LANE_GAP = 7            # px between lanes in the Safety Checks History card
+SC_TOP_PAD = 4             # px above the first lane
+SC_AI_LANE_H = 96.0        # height of the AI chart lane (three Overcast/Cloudy/Clear bands)
+SC_ROW_H = {"overall": 22.0, "dome": 22.0, "daynight": 18.0, "rain": 18.0, "mlx": 18.0, "mlcloud": 18.0,
+            "ai": 18.0, "cloudimg": 18.0}   # ai/cloudimg: only in the "lanes" style (the chart style uses SC_AI_LANE_H)
+SC_LABEL_COL_W = 92        # px width of the sticky lane-name column
+SC_LANE_NAMES = {"overall": "Overall", "dome": "Dome", "daynight": "Day / Night", "rain": "Rain",
+                 "mlx": "MLX Cloud", "mlcloud": "ML Cloud", "ai": "AI Sky Pred.", "cloudimg": "AI Cloud Detect"}
+# The exact pastel green/amber/red of the original Sky History bands, reused
+# for every lane so the whole card reads as one chart; grey = no usable
+# reading. blue/grey2/move are the Dome lane's Open / Closed / moving.
+SC_COLOURS = {"ok": "#c9e7b7", "warn": "#f4e5c2", "bad": "#e6bcc3", "unk": "#d5d9de",
+              "blue": "#bcd9f2", "grey": "#e4e7eb", "move": "#d9cff0"}
+SC_FAMILY_CLS = {"Clear": "ok", "Cloudy": "warn", "Overcast": "bad"}
+SC_DOME_CELLS = {"OPEN": ("Open", "blue"), "CLOSED": ("Closed", "grey"),
+                 "OPENING": ("Opening", "move"), "CLOSING": ("Closing", "move")}
 
-    def _card(body_html):
+
+def _sc_safe_labels():
+    ai_cfg = get_setting("ai_learning")
+    return {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
+
+
+def _sc_family(label, safe_labels):
+    """Fold any predicted class into the graph's three zones using the same
+    AI_MODEL_FAMILY_MAP the AI Sky model uses (Partly/Mostly Cloudy ->
+    Cloudy; Overcast/Rain/Snow/Freezing Rain -> Overcast). A custom label
+    that is not in the map counts as Clear if it is one of the configured
+    SAFE labels, otherwise Overcast."""
+    low = str(label).strip().lower()
+    fam = AI_MODEL_FAMILY_MAP.get(low)
+    if fam:
+        return fam
+    return "Clear" if low in safe_labels else "Overcast"
+
+
+def _sc_dome_enabled_in_graph():
+    try:
+        return bool(dome_feature_enabled() and get_setting("features").get("dome_graph_enabled", True))
+    except Exception:
+        return False
+
+
+def _sc_cell(key, rec, safe_labels, detail=False):
+    """(text, colour-class) for one lane at one history record - the single
+    source of truth for both the coloured bars and the hover readout, so
+    the two can never disagree. colour-class is one of SC_COLOURS' keys.
+    detail=True (hover only) shows the model's exact class next to its
+    zone, e.g. 'Cloudy (Partly Cloudy)'."""
+    if key == "overall":
+        return ("SAFE", "ok") if rec.get("o") else ("UNSAFE", "bad")
+    if key == "dome":
+        d = rec.get("d")
+        if d is None:
+            return ("No data", "unk")
+        return SC_DOME_CELLS.get(str(d).upper(), ("Unknown", "unk"))
+    if key == "daynight":
+        return (rec.get("dn", "Unknown"), "ok" if rec.get("dn") == "Night" else "bad")
+    if key == "rain":
+        r = rec.get("r", "Unknown")
+        return (r, {"Dry": "ok", "Rain": "bad"}.get(r, "unk"))
+    if key == "mlx":
+        m = rec.get("m", "Unknown")
+        return (m, {"Clear": "ok", "Cloudy": "warn"}.get(m, "unk"))
+    if key == "mlcloud":
+        c = rec.get("c", "Unknown")
+        if c == "Unknown":
+            return ("Unknown", "unk")
+        return (c, "ok" if rec.get("cp") else "bad")
+    if key in ("ai", "cloudimg"):
+        raw = rec.get("a" if key == "ai" else "i")
+        if raw is None:
+            return ("No data", "unk")
+        fam = _sc_family(raw, safe_labels)
+        text = f"{fam} ({raw})" if (detail and str(raw).strip().lower() != fam.lower()) else fam
+        return (text, SC_FAMILY_CLS[fam])
+    return ("", "unk")
+
+
+def _sc_thin(points, min_gap_sec):
+    """Keep a point only if it is at least min_gap_sec after the previous
+    kept one - 1/min history over 48h would otherwise put thousands of
+    points in each polyline for no visible gain."""
+    out = []
+    last = None
+    for ts, v in points:
+        if last is None or ts - last >= min_gap_sec:
+            out.append((ts, v))
+            last = ts
+    return out
+
+
+def render_sky_history_html(samples, s, tz_name="UTC"):
+    """The Safety Checks History card (still called render_sky_history_html
+    and still `id="history"` - the old Sky History card grew into this):
+    a scrollable 48-hour chart that lines every safety check up on one
+    shared time axis, one coloured lane each - Overall SAFE/UNSAFE, Dome
+    (state + open/close markers), Day/Night, Rain, MLX Cloud, ML Cloud,
+    then one tall chart with the AI Sky Prediction (solid line) and AI Cloud
+    Detect (dashed blue line) over the same Overcast/Cloudy/Clear bands.
+    The blank strip left of the red Now line shows every lane's
+    current value as a coloured pill. A lane is shown ONLY while its own
+    switch under Settings -> Safety Checks is on (Dome: Settings -> Dome &
+    Heater -> 'Show dome open/close actions in graph', and Dome control
+    must be enabled); Overall is always shown.
+    Data: the per-minute safety_history.jsonl records (see
+    _build_safety_history_record()), the dome_events.jsonl open/close
+    actions, and - for the AI Sky Pred. lane only - AI Learning's capture
+    samples for the hours before recording began (see
+    _ai_history_points()). `samples` is the caller's already-loaded AI
+    training index samples list, so this never triggers a second redundant
+    disk read per request. Always returns a complete
+    `<div class="card history-compact" id="history">...</div>`."""
+    checks = get_setting("safety_checks")
+    en = {
+        "dome": _sc_dome_enabled_in_graph(),
+        "daynight": bool(checks.get("daynight_enabled")),
+        "rain": bool(checks.get("rain_enabled")),
+        "mlx": bool(checks.get("mlx_gate_enabled")),
+        "mlcloud": bool(checks.get("ml_cloud_enabled")),
+        "ai": bool(checks.get("ai_model_enabled")),
+        "cloudimg": bool(checks.get("cloud_model_enabled")),
+    }
+    lanes_style = checks.get("ai_graph_style", "chart") == "lanes"
+    safe_labels = _sc_safe_labels()
+    now = time.time()
+    window_sec = AI_HISTORY_WINDOW_HOURS * 3600.0
+    window_start = now - window_sec
+
+    def _card(body_html, pill=""):
         return f"""<div class="card history-compact" id="history">
-  <h2><span class="title">📈 Sky History</span></h2>
+  <h2><span class="title">📈 Safety Checks History {pill}</span></h2>
   {body_html}
 </div>"""
 
-    if not points or len(points) < 2:
-        reason = ("Train a model on the <a href=\"/ai-classify\">Classify page</a> first."
-                   if not model or model.get("threshold_clear_c") is None else
-                   "Not enough readings logged in the last 48 hours yet - check back once a "
-                   "few more AI Learning captures have come in.")
-        return _card(f'<p class="hint">No AI Sky Prediction history to show yet. {reason}</p>')
+    with _safety_history_lock:
+        recs = [r for r in _safety_history if r["t"] >= window_start]
+    with _dome_events_lock:
+        dome_evs = [e for e in _dome_events if e["t"] >= window_start] if en["dome"] else []
 
-    threshold_clear_c = model.get("threshold_clear_c", AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C)
-    threshold_overcast_c = model.get("threshold_overcast_c", AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C)
+    first_a_t = next((r["t"] for r in recs if r.get("a") is not None), None)
+    ai_pre = []   # lanes style: [(ts, zone)] from AI Learning samples for hours before recording began
+    ai_points, cloud_points = [], []
+    if lanes_style:
+        if en["ai"]:
+            model = _load_ai_sky_model()
+            thr_clear = (model or {}).get("threshold_clear_c", AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C)
+            thr_over = (model or {}).get("threshold_overcast_c", AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C)
+            for ts, a in sorted(_ai_history_points(samples, model), key=lambda p: p[0]):
+                if (first_a_t is not None and ts >= first_a_t) or ts < window_start:
+                    continue
+                ai_pre.append((ts, "Clear" if a >= thr_clear else ("Cloudy" if a >= thr_over else "Overcast")))
+    else:
+        # AI Sky Prediction trace: AI Learning samples for the hours before
+        # recording began, then the denser recorded anomalies from there on.
+        ai_points = []
+        model = None
+        if en["ai"]:
+            model = _load_ai_sky_model()
+            sample_points = _ai_history_points(samples, model)
+            rec_points = [(r["t"], r["aa"]) for r in recs if r.get("aa") is not None]
+            first_rec_t = rec_points[0][0] if rec_points else None
+            ai_points = ([p for p in sample_points if first_rec_t is None or p[0] < first_rec_t]
+                          + rec_points)
+            ai_points.sort(key=lambda p: p[0])
+        cloud_points = [(r["t"], r["ic"]) for r in recs if r.get("ic") is not None] if en["cloudimg"] else []
 
-    # How far past each threshold counts as "fully saturated" (pinned to the
-    # outer edge of its band) - scaled from this window's own deepest
-    # reading on that side so the trace uses the full height of its band,
-    # falling back to a fixed default whenever this window doesn't have a
-    # real reading that far past the threshold yet (e.g. everything so far
-    # has been borderline).
-    overcast_vals = [a for _, a in points if a < threshold_overcast_c]
-    clear_vals = [a for _, a in points if a >= threshold_clear_c]
-    oc_deep = max(1.0, threshold_overcast_c - min(overcast_vals)) if overcast_vals else AI_HISTORY_DEFAULT_SATURATION_C
-    cl_deep = max(1.0, max(clear_vals) - threshold_clear_c) if clear_vals else AI_HISTORY_DEFAULT_SATURATION_C
+    if not recs and ((lanes_style and not ai_pre) or (not lanes_style and len(ai_points) < 2 and not cloud_points)):
+        return _card('<p class="hint">No safety history to show yet - it records one point a minute '
+                      'from now on, so check back in a few minutes.</p>')
 
-    band = AI_HISTORY_BAND_H / 3.0  # 3 equal bands: Overcast (top) / Cloudy (middle) / Clear (bottom)
-
-    def y_for_anomaly(a):
-        if a >= threshold_clear_c:
-            frac = max(0.0, min(1.0, (a - threshold_clear_c) / cl_deep))
-            return 2 * band + frac * band
-        elif a >= threshold_overcast_c:
-            frac = (a - threshold_overcast_c) / (threshold_clear_c - threshold_overcast_c)
-            return band + frac * band
-        else:
-            frac = max(0.0, min(1.0, (threshold_overcast_c - a) / oc_deep))
-            return band * (1 - frac)
-
-    now = time.time()
-    window_sec = AI_HISTORY_WINDOW_HOURS * 3600.0
+    ai_chart_on = (en["ai"] or en["cloudimg"]) and not lanes_style
+    lane_keys = ["overall"] + [k for k in (("dome", "daynight", "rain", "mlx", "mlcloud", "ai", "cloudimg") if lanes_style
+                                           else ("dome", "daynight", "rain", "mlx", "mlcloud")) if en[k]]
+    lanes = {}
+    y = float(SC_TOP_PAD)
+    for k in lane_keys:
+        lanes[k] = (y, SC_ROW_H[k])
+        y += SC_ROW_H[k] + SC_LANE_GAP
+    if ai_chart_on:
+        lanes["ai"] = (y, SC_AI_LANE_H)
+        y += SC_AI_LANE_H + SC_LANE_GAP
+    body_h = y - SC_LANE_GAP            # bottom of the last lane
+    total_h = body_h + AI_HISTORY_AXIS_H
     plot_w = AI_HISTORY_CHART_W - AI_HISTORY_LEFT_PAD
 
     def x_for_ts(ts):
         return AI_HISTORY_LEFT_PAD + (now - ts) / window_sec * plot_w
 
-    # Break into a new <polyline> whenever two consecutive readings are
-    # further apart than AI_HISTORY_GAP_SEC, instead of drawing a straight
-    # (and misleading) line through a real gap in the data - AI Learning
-    # being off for a while, a power cut, etc.
-    segments = [[]]
-    prev_ts = None
-    for ts, anomaly in points:
-        if prev_ts is not None and (ts - prev_ts) > AI_HISTORY_GAP_SEC:
-            segments.append([])
-        segments[-1].append(f"{x_for_ts(ts):.2f},{y_for_anomaly(anomaly):.2f}")
-        prev_ts = ts
-    polylines = "\n  ".join(
-        f'<polyline fill="none" stroke="#2c3e50" stroke-width="1.4" stroke-linejoin="round" '
-        f'stroke-linecap="round" opacity="0.9" points="{" ".join(seg)}"/>'
-        for seg in segments if len(seg) >= 2)
-
-    # "Now" marker - the LIVE prediction (same value the AI Sky Prediction
-    # row above shows this cycle), not the last historical capture, so the
-    # dot never lags behind what the rest of the page is currently saying.
-    now_anomaly = s.get("ai_model_anomaly_c")
-    now_predicted = s.get("ai_model_predicted") if s.get("ai_model_status") == "active" else None
-    if now_anomaly is not None and now_predicted is not None:
-        now_y = y_for_anomaly(now_anomaly)
-        now_label_y = max(9.0, now_y - 4.0)
-        now_marker = f"""<circle cx="{AI_HISTORY_LEFT_PAD}" cy="{now_y:.2f}" r="4" fill="#c62828" stroke="#ffffff" stroke-width="1.2"><animate attributeName="r" values="4;6.5;4" dur="1.8s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;0.4;1" dur="1.8s" repeatCount="indefinite"/></circle>
-  <text x="20" y="10" font-size="8" font-weight="700" fill="#c62828" text-anchor="start">Now</text>
-  <text x="{AI_HISTORY_LEFT_PAD + 5.5:.1f}" y="{now_label_y:.2f}" font-size="7.8" font-weight="700" fill="#2c3e50" text-anchor="start">AI Sky Prediction: {now_predicted}</text>"""
-    else:
-        now_marker = ""
-
-    # Hourly x-axis clock-time labels across the 48h window, CLOCK-ALIGNED
-    # (every tick lands exactly on the hour - :00 - rather than being offset
-    # by "now"'s own minutes/seconds the way a simple "now minus k hours"
-    # walk would be), so a 12:00AM tick is a real, recurring label rather
-    # than a rare coincidence - with the calendar date on a second line
-    # right below any such 12:00AM tick, so a 48h trace that crosses
-    # midnight stays unambiguous about which day each half belongs to.
-    # Positioned with the SAME x_for_ts() used for the trace/the "Now" dot
-    # above, not a separate "oldest reading at the left edge" formula - the
-    # old 9-tick scheme actually ran in the OPPOSITE direction from the
-    # trace/"Now" dot (which sit with "Now" at the LEFT edge), so the old
-    # labels/gridlines never actually lined up with where the data really
-    # was. Compact format (_format_axis_time(), e.g. "3:00AM") instead of
-    # _format_ampm()'s "03:00 A.M." so a dense run of hourly labels stays
-    # short enough to fit without crowding.
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
+
+    def _span_label(t0, t1):
+        d0 = datetime.fromtimestamp(t0, tz)
+        d1 = datetime.fromtimestamp(t1, tz)
+        return f"{d0.strftime('%b %-d')} {_format_axis_time(d0)} - {_format_axis_time(d1)}"
+
+    # ---- hour ticks / gridlines (same clock-aligned scheme as before) ----
     now_dt = datetime.fromtimestamp(now, tz)
-    window_start_dt = datetime.fromtimestamp(now - window_sec, tz)
+    window_start_dt = datetime.fromtimestamp(window_start, tz)
     first_tick = window_start_dt.replace(minute=0, second=0, microsecond=0)
     if first_tick < window_start_dt:
         first_tick += timedelta(hours=1)
-    ticks = []
+    grid_parts, label_parts = [], []
     t = first_tick
     while t <= now_dt:
-        ticks.append(t)
+        x = x_for_ts(t.timestamp())
+        major = (t.hour == 0 and t.minute == 0)
+        grid_parts.append(f'<line x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{body_h:.1f}" '
+                           f'stroke="{"#aeb6c0" if major else "#e1e5ea"}" stroke-width="{1.4 if major else 1}"/>')
+        label_parts.append(f'<text x="{x:.1f}" y="{body_h + 13.0:.1f}" font-size="8.5" font-weight="700" '
+                            f'fill="#6a7178" text-anchor="middle">{_format_axis_time(t)}</text>')
+        if major:
+            label_parts.append(f'<text x="{x:.1f}" y="{body_h + 24.0:.1f}" font-size="7.3" font-weight="600" '
+                                f'fill="#9aa1a8" text-anchor="middle">{t.strftime("%b %-d")}</text>')
         t += timedelta(hours=1)
 
-    label_lines = []
-    grid_lines = []
-    for dt in ticks:
-        x = x_for_ts(dt.timestamp())
-        label = _format_axis_time(dt)
-        label_y = AI_HISTORY_BAND_H + 13.0
-        label_lines.append(f'<text x="{x:.1f}" y="{label_y:.1f}" font-size="8.5" font-weight="700" '
-                            f'fill="#6a7178" text-anchor="middle">{label}</text>')
-        if dt.hour == 0 and dt.minute == 0:
-            date_y = AI_HISTORY_BAND_H + 24.0
-            label_lines.append(f'<text x="{x:.1f}" y="{date_y:.1f}" font-size="7.3" font-weight="600" '
-                                f'fill="#9aa1a8" text-anchor="middle">{dt.strftime("%b %-d")}</text>')
-        grid_lines.append(f'<line x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{AI_HISTORY_BAND_H}" '
-                           f'stroke="#ffffff" stroke-width="1.0" opacity="0.6"/>')
-    x_labels_html = "\n  ".join(label_lines)
-    grid_html = "\n    ".join(grid_lines)
+    svg = [f'<svg class="hist-chart-compact" viewBox="0 0 {AI_HISTORY_CHART_W} {total_h:.1f}" '
+           f'width="{AI_HISTORY_CHART_W}" height="{total_h:.1f}">']
+    for k, (ly, lh) in lanes.items():
+        svg.append(f'<rect x="0" y="{ly:.1f}" width="{AI_HISTORY_CHART_W}" height="{lh:.1f}" fill="#f6f7f9"/>')
+    svg.extend(grid_parts)
 
-    svg = f"""<svg class="hist-chart-compact" viewBox="0 0 {AI_HISTORY_CHART_W} {AI_HISTORY_BAND_H + AI_HISTORY_AXIS_H}" preserveAspectRatio="none">
-  <rect x="0" y="0" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#e6bcc3"/>
-  <rect x="0" y="{band:.2f}" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#f4e5c2"/>
-  <rect x="0" y="{2*band:.2f}" width="{AI_HISTORY_CHART_W}" height="{band:.2f}" fill="#c9e7b7"/>
-  <line x1="0" y1="{band:.2f}" x2="{AI_HISTORY_CHART_W}" y2="{band:.2f}" stroke="#ffffff" stroke-width="1.6" opacity="0.9"/>
-  <line x1="0" y1="{2*band:.2f}" x2="{AI_HISTORY_CHART_W}" y2="{2*band:.2f}" stroke="#ffffff" stroke-width="1.6" opacity="0.9"/>
-  <g>
-    {grid_html}
-  </g>
-  {x_labels_html}
-  {polylines}
-  <line x1="{AI_HISTORY_LEFT_PAD}" y1="0" x2="{AI_HISTORY_LEFT_PAD}" y2="{AI_HISTORY_BAND_H}" stroke="#c62828" stroke-width="1.2" stroke-dasharray="3,2.2"/>
-  {now_marker}
-  <line x1="0" y1="{AI_HISTORY_BAND_H}" x2="{AI_HISTORY_CHART_W}" y2="{AI_HISTORY_BAND_H}" stroke="#d7dbe0" stroke-width="1"/>
-</svg>"""
+    # ---- coloured lanes: merge consecutive identical records into bars ----
+    def _record_spans():
+        """[(rec, start_ts, end_ts)] - each record covers until the next
+        one, or SAFETY_HISTORY_RECORD_INTERVAL_SEC past itself across a
+        gap (the service wasn't running), so a gap shows as blank rather
+        than as a bar stretched over time nobody was recording."""
+        spans = []
+        for idx, r in enumerate(recs):
+            nxt = recs[idx + 1]["t"] if idx + 1 < len(recs) else now
+            end = nxt if (nxt - r["t"]) <= SAFETY_HISTORY_GAP_SEC else r["t"] + SAFETY_HISTORY_RECORD_INTERVAL_SEC
+            spans.append((r, max(r["t"], window_start), min(end, now)))
+        return spans
+    spans = _record_spans()
 
-    body = f"""<div class="hist-wrap-c">
-    <div class="hist-zone-axis-c">
-      <span class="zlabel" style="top:21px;color:#8a3236;">Overcast</span>
-      <span class="zlabel" style="top:77px;color:#8a6a00;">Cloudy</span>
-      <span class="zlabel" style="top:133px;color:#1a7f37;">Clear</span>
-    </div>
-    <div class="hist-scroll-c" id="hist-scroll-slot">
-{svg}
-    </div>
-    <div class="hist-zone-sub-c">
-      <span class="sublabel" style="top:2px;color:#555;font-size:7.5px;">deep</span>
-      <span class="sublabel" style="top:{band-5:.1f}px;color:#8a3236;font-size:7.5px;">{threshold_overcast_c:.1f}&deg;C</span>
-      <span class="sublabel" style="top:{2*band-5:.1f}px;color:#8a6a00;font-size:7.5px;">{threshold_clear_c:.1f}&deg;C</span>
-      <span class="sublabel" style="top:158px;color:#555;font-size:7.5px;">deep clear</span>
+    def _lane_segments(k):
+        """[[text, cls, t0, t1]] for lane k, consecutive equal cells merged."""
+        raw = []   # (text, cls, t0, t1)
+        if k == "ai":
+            for idx, (ts, zone) in enumerate(ai_pre):
+                nxt = ai_pre[idx + 1][0] if idx + 1 < len(ai_pre) else (first_a_t or now)
+                end = nxt if (nxt - ts) <= AI_HISTORY_GAP_SEC else ts + SAFETY_HISTORY_GAP_SEC
+                raw.append((zone, SC_FAMILY_CLS[zone], ts, min(end, now)))
+        for r, t0, t1 in spans:
+            if k == "ai" and r.get("a") is None and (first_a_t is None or t0 < first_a_t):
+                continue     # the AI Learning samples above already cover these hours
+            text, cls = _sc_cell(k, r, safe_labels)
+            raw.append((text, cls, t0, t1))
+        merged = []
+        for text, cls, t0, t1 in raw:
+            if merged and merged[-1][0] == text and merged[-1][1] == cls and abs(merged[-1][3] - t0) < 1.0:
+                merged[-1][3] = t1
+            else:
+                merged.append([text, cls, t0, t1])
+        return merged
+
+    for k in lane_keys:
+        ly, lh = lanes[k]
+        for text, cls, t0, t1 in _lane_segments(k):
+            x_new, x_old = x_for_ts(t1), x_for_ts(t0)       # newer = further left
+            if x_old - x_new < 0.5:
+                continue
+            svg.append(f'<rect x="{x_new:.1f}" y="{ly + 2:.1f}" width="{x_old - x_new:.1f}" height="{lh - 4:.1f}" '
+                       f'rx="2" fill="{SC_COLOURS[cls]}" stroke="rgba(0,0,0,.10)" stroke-width="0.6">'
+                       f'<title>{_html_escape(SC_LANE_NAMES[k])}: {_html_escape(text)}\n{_span_label(t0, t1)}</title></rect>')
+            if x_old - x_new > 52:
+                svg.append(f'<text x="{(x_new + x_old) / 2:.1f}" y="{ly + lh / 2 + 3:.1f}" font-size="8" '
+                           f'font-weight="700" fill="#2c3e50" text-anchor="middle">{_html_escape(text)}</text>')
+
+    now_markers = []
+    if ai_chart_on:
+        ay, ah = lanes["ai"]
+        band = ah / 3.0
+        for i, col in enumerate(("#e6bcc3", "#f4e5c2", "#c9e7b7")):
+            svg.append(f'<rect x="0" y="{ay + i * band:.1f}" width="{AI_HISTORY_CHART_W}" height="{band:.1f}" fill="{col}"/>')
+        for i in (1, 2):
+            svg.append(f'<line x1="0" y1="{ay + i * band:.1f}" x2="{AI_HISTORY_CHART_W}" y2="{ay + i * band:.1f}" '
+                       f'stroke="#ffffff" stroke-width="1.4"/>')
+        # The bands just painted over the full-height gridlines drawn above,
+        # so redraw them across this lane only.
+        svg.extend(g.replace(f'y2="{body_h:.1f}"', f'y2="{ay + ah:.1f}"').replace('y1="0"', f'y1="{ay:.1f}"')
+                   for g in grid_parts)
+        for i, lab in enumerate(("Overcast", "Cloudy", "Clear")):
+            svg.append(f'<text x="{AI_HISTORY_CHART_W - 6}" y="{ay + i * band + 11:.1f}" font-size="7" '
+                       f'font-weight="700" fill="#5a4a4a" opacity="0.55" text-anchor="end">{lab}</text>')
+
+        label_y = ay + 12.0
+        if en["ai"]:
+            threshold_clear_c = (model or {}).get("threshold_clear_c", AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C)
+            threshold_overcast_c = (model or {}).get("threshold_overcast_c", AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C)
+            overcast_vals = [a for _, a in ai_points if a < threshold_overcast_c]
+            clear_vals = [a for _, a in ai_points if a >= threshold_clear_c]
+            oc_deep = max(1.0, threshold_overcast_c - min(overcast_vals)) if overcast_vals else AI_HISTORY_DEFAULT_SATURATION_C
+            cl_deep = max(1.0, max(clear_vals) - threshold_clear_c) if clear_vals else AI_HISTORY_DEFAULT_SATURATION_C
+
+            def y_for_anomaly(a):
+                if a >= threshold_clear_c:
+                    return ay + 2 * band + max(0.0, min(1.0, (a - threshold_clear_c) / cl_deep)) * band
+                if a >= threshold_overcast_c:
+                    return ay + band + (a - threshold_overcast_c) / (threshold_clear_c - threshold_overcast_c) * band
+                return ay + band * (1 - max(0.0, min(1.0, (threshold_overcast_c - a) / oc_deep)))
+
+            if len(ai_points) >= 2:
+                segs = [[]]
+                prev = None
+                for ts, a in _sc_thin(ai_points, 150):
+                    if prev is not None and (ts - prev) > AI_HISTORY_GAP_SEC:
+                        segs.append([])
+                    segs[-1].append(f"{x_for_ts(ts):.2f},{y_for_anomaly(a):.2f}")
+                    prev = ts
+                for seg in segs:
+                    if len(seg) >= 2:
+                        svg.append(f'<polyline fill="none" stroke="#2c3e50" stroke-width="1.5" stroke-linejoin="round" '
+                                   f'stroke-linecap="round" opacity="0.92" points="{" ".join(seg)}"/>')
+            else:
+                svg.append(f'<text x="{AI_HISTORY_LEFT_PAD + 80}" y="{ay + ah - 8:.1f}" font-size="8" font-weight="700" '
+                           f'fill="#6a7178">AI Sky Prediction: no trained model / not enough readings yet</text>')
+            now_a = s.get("ai_model_anomaly_c")
+            now_pred = s.get("ai_model_predicted") if s.get("ai_model_status") == "active" else None
+            if now_a is not None and now_pred is not None:
+                now_markers.append(f'<circle cx="{AI_HISTORY_LEFT_PAD}" cy="{y_for_anomaly(now_a):.2f}" r="4" fill="#c62828" '
+                                   f'stroke="#ffffff" stroke-width="1.2"><animate attributeName="r" values="4;6.5;4" dur="1.8s" '
+                                   f'repeatCount="indefinite"/><animate attributeName="opacity" values="1;0.4;1" dur="1.8s" '
+                                   f'repeatCount="indefinite"/></circle>')
+                now_markers.append(f'<text x="{AI_HISTORY_LEFT_PAD + 6}" y="{label_y:.1f}" font-size="7.8" font-weight="700" '
+                                   f'fill="#2c3e50">AI Sky Prediction: {_html_escape(str(now_pred))}</text>')
+                label_y += 10.0
+        if en["cloudimg"]:
+            def y_for_score(sc):
+                return ay + max(0.03, min(0.97, sc)) * ah       # score 0..1 maps linearly across the 3 bands
+            if len(cloud_points) >= 2:
+                segs = [[]]
+                dots = []
+                prev = None
+                last_dot = None
+                for ts, sc in _sc_thin(cloud_points, 150):
+                    if prev is not None and (ts - prev) > SAFETY_HISTORY_GAP_SEC:
+                        segs.append([])
+                    segs[-1].append(f"{x_for_ts(ts):.2f},{y_for_score(sc):.2f}")
+                    if last_dot is None or ts - last_dot >= 900:
+                        dots.append(f'<circle cx="{x_for_ts(ts):.1f}" cy="{y_for_score(sc):.1f}" r="1.9" fill="#1d6fb8"/>')
+                        last_dot = ts
+                    prev = ts
+                for seg in segs:
+                    if len(seg) >= 2:
+                        svg.append(f'<polyline fill="none" stroke="#1d6fb8" stroke-width="1.5" stroke-dasharray="4,2.4" '
+                                   f'stroke-linejoin="round" points="{" ".join(seg)}"/>')
+                svg.extend(dots)
+            else:
+                svg.append(f'<text x="{AI_HISTORY_LEFT_PAD + 80}" y="{ay + ah - 20:.1f}" font-size="8" font-weight="700" '
+                           f'fill="#1d6fb8">AI Cloud Detect: no predictions recorded yet</text>')
+            now_c = _cloud_model_clear_score(s, safe_labels)
+            if now_c is not None:
+                now_markers.append(f'<circle cx="{AI_HISTORY_LEFT_PAD}" cy="{y_for_score(now_c):.2f}" r="3.4" fill="#1d6fb8" '
+                                   f'stroke="#ffffff" stroke-width="1.2"/>')
+                now_markers.append(f'<text x="{AI_HISTORY_LEFT_PAD + 6}" y="{label_y:.1f}" font-size="7.8" font-weight="700" '
+                                   f'fill="#1d6fb8">AI Cloud Detect: {_html_escape(str(s.get("cloud_model_predicted")))}</text>')
+
+
+    # ---- current-status pills in the blank strip left of the Now line ----
+    latest = recs[-1] if (recs and now - recs[-1]["t"] <= SAFETY_HISTORY_GAP_SEC) else None
+    pill_w = AI_HISTORY_LEFT_PAD - 8.0
+    pill_items = []   # (lane label, text, cls, y, h)
+    ai_label_items = []   # chart style: (label, y, h, is_and) for the sticky label column
+    for k in lane_keys:
+        ly, lh = lanes[k]
+        if k == "overall":
+            text, cls = ("SAFE", "ok") if s.get("overall_safe") else ("UNSAFE", "bad")
+        elif latest is not None:
+            text, cls = _sc_cell(k, latest, safe_labels)
+        else:
+            text, cls = ("No data", "unk")
+        pill_items.append((SC_LANE_NAMES[k], text, cls, ly, lh))
+    if ai_chart_on:
+        ay, ah = lanes["ai"]
+        subs = [k for k in ("ai", "cloudimg") if en[k]]
+        slot = 18.0
+        gap = 14.0 if len(subs) == 2 else 0.0     # room for the "and" between the two labels
+        top = ay + (ah - slot * len(subs) - gap * (len(subs) - 1)) / 2
+        for n, k in enumerate(subs):
+            text, cls = _sc_cell(k, latest, safe_labels) if latest is not None else ("No data", "unk")
+            pill_items.append((SC_LANE_NAMES[k], text, cls, top + n * (slot + gap), slot))
+            ai_label_items.append((SC_LANE_NAMES[k], top + n * (slot + gap), slot, False))
+            if n == 0 and len(subs) == 2:
+                ai_label_items.append(("and", top + slot + 1.0, gap - 2.0, True))
+    for lane_label, text, cls, ly, lh in pill_items:
+        svg.append(f'<rect x="3" y="{ly + 2:.1f}" width="{pill_w:.1f}" height="{lh - 4:.1f}" rx="3" '
+                   f'fill="{SC_COLOURS[cls]}" stroke="rgba(0,0,0,.18)" stroke-width="0.7">'
+                   f'<title>{_html_escape(lane_label)} now: {_html_escape(text)}</title></rect>')
+        svg.append(f'<text x="{3 + pill_w / 2:.1f}" y="{ly + lh / 2 + 3:.1f}" font-size="8.5" font-weight="800" '
+                   f'fill="#2c3e50" text-anchor="middle">{_html_escape(text)}</text>')
+
+    # ---- dome open/close actions: a dashed line through every lane + a marker on the Dome lane ----
+    if en["dome"]:
+        dy, dh = lanes["dome"]
+        for ev in dome_evs:
+            x = x_for_ts(ev["t"])
+            is_open = ev["a"] == "open"
+            when = datetime.fromtimestamp(ev["t"], tz)
+            svg.append(f'<line x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{body_h:.1f}" stroke="#2b5d8a" '
+                       f'stroke-width="0.8" stroke-dasharray="2,3" opacity="0.45"/>')
+            cy = dy + dh / 2
+            tri = (f"{x:.1f},{cy - 6:.1f} {x - 5:.1f},{cy + 4:.1f} {x + 5:.1f},{cy + 4:.1f}" if is_open
+                   else f"{x:.1f},{cy + 6:.1f} {x - 5:.1f},{cy - 4:.1f} {x + 5:.1f},{cy - 4:.1f}")
+            svg.append(f'<polygon points="{tri}" fill="{"#2b5d8a" if is_open else "#4a5260"}" stroke="#fff" stroke-width="1">'
+                       f'<title>Dome {"OPEN" if is_open else "CLOSE"} - {_html_escape(ev.get("g", ""))}\n'
+                       f'{when.strftime("%b %-d")} {_format_axis_time(when)}</title></polygon>')
+
+    svg.extend(label_parts)
+    svg.extend(now_markers)
+    svg.append(f'<line x1="{AI_HISTORY_LEFT_PAD}" y1="0" x2="{AI_HISTORY_LEFT_PAD}" y2="{body_h:.1f}" stroke="#c62828" '
+               f'stroke-width="1.2" stroke-dasharray="3,2.2"/>')
+    svg.append(f'<line x1="0" y1="{body_h:.1f}" x2="{AI_HISTORY_CHART_W}" y2="{body_h:.1f}" stroke="#d7dbe0" stroke-width="1"/>')
+    svg.append(f'<line class="sc-xhair" x1="-10" y1="0" x2="-10" y2="{body_h:.1f}" stroke="#2c3e50" stroke-width="1" opacity="0.7"/>')
+    svg.append('</svg>')
+
+    # ---- hover readout data: one row per 5-minute step back from now ----
+    hover_lane_keys = lane_keys + ([] if lanes_style else (["ai"] if en["ai"] else []) + (["cloudimg"] if en["cloudimg"] else []))
+    hover_names = [SC_LANE_NAMES[k] for k in hover_lane_keys]
+    rows = []
+    ri = len(recs) - 1
+    for step in range(int(window_sec // 300) + 1):
+        target = now - step * 300
+        while ri > 0 and recs[ri]["t"] > target:
+            ri -= 1
+        row = None
+        if recs and abs(recs[ri]["t"] - target) <= SAFETY_HISTORY_GAP_SEC:
+            r = recs[ri]
+            row = [list(_sc_cell(k, r, safe_labels, detail=True)) for k in hover_lane_keys]
+        d = datetime.fromtimestamp(target, tz)
+        rows.append([f"{d.strftime('%b %-d')} {_format_axis_time(d)}", row])
+    hover_json = _html_escape(json.dumps({"lanes": hover_names, "rows": rows}, separators=(",", ":")), quote=True)
+
+    # ---- sticky lane-name column ----
+    names_html = []
+    for k, (ly, lh) in lanes.items():
+        if k == "ai" and not lanes_style:
+            # chart style: one label per trace, level with its current-value pill, "and" between
+            for lab, ty, th, is_and in ai_label_items:
+                names_html.append(f'<div class="sc-lane-label{" sc-lane-and" if is_and else ""}" '
+                                  f'style="top:{ty:.1f}px;height:{th:.1f}px">{lab}</div>')
+            continue
+        names_html.append(f'<div class="sc-lane-label" style="top:{ly:.1f}px;height:{lh:.1f}px">{SC_LANE_NAMES[k]}</div>')
+
+    overall_pill = ('<span class="sc-pill sc-pill-safe">Overall: SAFE now</span>' if s.get("overall_safe")
+                    else '<span class="sc-pill sc-pill-unsafe">Overall: UNSAFE now</span>')
+    # +16px of headroom below the axis labels: the chart is its natural pixel
+    # height inside an overflow-x scroller, and a classic (non-overlay)
+    # horizontal scrollbar would otherwise eat into it and clip the date line.
+    body = f"""<div class="hist-wrap-c" style="height:{total_h + 16:.0f}px;flex:none;">
+    <div class="hist-zone-axis-c" style="flex:0 0 {SC_LABEL_COL_W}px;">{''.join(names_html)}</div>
+    <div class="hist-scroll-c" id="hist-scroll-slot" data-sc-now="{now:.0f}" data-sc-left="{AI_HISTORY_LEFT_PAD}"
+         data-sc-pxh="{plot_w / AI_HISTORY_WINDOW_HOURS}" data-sc-w="{AI_HISTORY_CHART_W}" data-sc-hover="{hover_json}">
+{''.join(svg)}
     </div>
   </div>"""
-    return _card(body)
+    return _card(body, overall_pill)
 
 
 def clouddetect_link_for(req):
@@ -6322,14 +6868,14 @@ def web_fragments():
 
 @app.route("/sky-history", methods=["GET"])
 def web_sky_history():
-    """The Sky History card's own refresh endpoint, polled far less often
-    than /fragments (see the JS below) - its underlying data only changes
-    at most as often as AI Learning's own capture interval (15 minutes by
-    default), so rebuilding its SVG (a few hundred points, formatted as
-    text) on every 3-second /fragments poll forever would be pure waste on
-    a Raspberry Pi for no visible benefit. The "Now" marker is only as
-    fresh as this endpoint's own refresh cadence as a result - a
-    deliberate trade-off, not an oversight."""
+    """The Safety Checks History card's own refresh endpoint (the card grew
+    out of the original Sky History), polled far less often than /fragments
+    (see the JS below) - its underlying data is only recorded once a minute
+    (SAFETY_HISTORY_RECORD_INTERVAL_SEC), so rebuilding its SVG (a few
+    thousand elements, formatted as text) on every 3-second /fragments poll
+    forever would be pure waste on a Raspberry Pi for no visible benefit.
+    The "Now" marker is only as fresh as this endpoint's own refresh
+    cadence as a result - a deliberate trade-off, not an oversight."""
     loc = get_setting("location")
     with sensor_lock:
         s = dict(sensor_state)
@@ -6337,8 +6883,91 @@ def web_sky_history():
     return jsonify({"ok": True, "html": render_sky_history_html(idx["samples"], s, loc["tz_name"])})
 
 
+# ---- Shared page header (title, subtitle, tab bar, restart button) -------
+# One header for every page - Dashboard, Settings, Classify, Logs - so
+# moving between them never shifts anything; only the highlighted tab and
+# the content below change. Also carries the safety tab icon + its live
+# update for the pages that did not already have it (Logs, Classify).
+PAGE_HEADER_CSS = """
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.topnav{display:flex;align-items:center;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
+.topnav a{padding:9px 14px;text-decoration:none;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px;}
+.topnav a:hover{color:#2563eb;}
+.topnav a.on{color:#2563eb;border-bottom-color:#2563eb;}
+.topnav .nav-sp{flex:1;}
+.nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
+.nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
+.nav-restart:hover{background:#a71d1d;}
+"""
+
+PAGE_HEADER_JS = """
+function hdrRestart(){
+  if(!confirm('Restart the dome-safety service now?')) return;
+  var m=document.getElementById('hdrRestartMsg'); if(m) m.textContent='Restarting...';
+  fetch('/restart-service').catch(function(){});
+  var down=false, tries=0;
+  var t=setInterval(function(){
+    tries++;
+    fetch('/fragments',{cache:'no-store'}).then(function(r){
+      if(r.ok && down){ clearInterval(t); location.reload(); }
+      else if(tries>45){ clearInterval(t); if(m) m.textContent='No response yet - reload the page in a moment.'; }
+    }).catch(function(){ down=true; if(m) m.textContent='Restarting - waiting for the service...'; });
+  },2000);
+}
+"""
+
+
+def _overall_safe_now():
+    try:
+        with sensor_lock:
+            return bool(sensor_state.get("overall_safe"))
+    except Exception:
+        return False
+
+
+def _unlabeled_sample_count():
+    try:
+        return sum(1 for smp in _load_ai_training_index()["samples"] if smp.get("label") is None)
+    except Exception:
+        return 0
+
+
+def _page_header_html(active, unlabeled_count):
+    """Title + subtitle + tab bar (Dashboard, Settings, Classify, Logs) and
+    the small red restart-service button at the right end of the bar."""
+    def tab(key, href, label):
+        return f'<a href="{href}"{" class=\"on\"" if key == active else ""}>{label}</a>'
+    return ('<h1>🔭 Observatory Control</h1>\n'
+            '<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p>\n'
+            '<nav class="topnav">'
+            + tab("dash", "/", "🏠 Dashboard")
+            + tab("settings", "/settings", "⚙ Settings")
+            + tab("classify", "/ai-classify", f'🏷️ Classify (<span id="classifyCount">{unlabeled_count}</span>)')
+            + tab("logs", "/logs", "🗒 Logs")
+            + '<span class="nav-sp"></span><span class="nav-restart-msg" id="hdrRestartMsg"></span>'
+              '<button type="button" class="nav-restart" title="Restart service" aria-label="Restart service" '
+              'onclick="hdrRestart()">&#8635;</button></nav>')
+
+
+def _page_favicon_link(is_safe):
+    return f'<link rel="icon" id="safetyFavicon" href="{_safety_favicon_href(is_safe)}">'
+
+
+def _page_favicon_js(is_safe):
+    """Keeps the tab icon in sync on pages without the dashboard's own poll()."""
+    return ("<script>(function(){var S=" + json.dumps(_safety_favicon_href(True)) + ",U="
+            + json.dumps(_safety_favicon_href(False)) + ",cur=" + ("true" if is_safe else "false") + ";"
+            "function tick(){fetch('/fragments',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){"
+            "if(typeof d.overall_safe==='boolean' && d.overall_safe!==cur){cur=d.overall_safe;"
+            "var el=document.getElementById('safetyFavicon');if(el)el.href=cur?S:U;}}).catch(function(){});}"
+            "setInterval(tick,3000);})();</script>")
+
+
 @app.route("/", methods=["GET"])
+@app.route("/settings", methods=["GET"])
 def web_index():
+    view = "settings" if request.path == "/settings" else "dash"
     sched = get_setting("schedule")
     auto_close = get_setting("safety_auto_close")
     auto_open = get_setting("safety_auto_open")
@@ -6355,6 +6984,7 @@ def web_index():
     logging_cfg = get_setting("logging")
     features = get_setting("features")
     dome_enabled = features["dome_enabled"]
+    dome_graph_enabled = features.get("dome_graph_enabled", True)
     heater_enabled = features["heater_enabled"]
     allsky = get_setting("allsky")
     allsky_enabled = allsky["enabled"]
@@ -6480,7 +7110,7 @@ def web_index():
             "<div class='banner banner-warn top-banner'>📍 <b>Location not set</b> — "
             "latitude/longitude are still at the 0&deg;,0&deg; placeholder, so the Day/Night "
             "sun-elevation gate is computing nonsense for your actual site. "
-            "<a href='#settings'>Set your real coordinates in Settings</a>.</div>"
+            "<a href='/settings#location-timezone'>Set your real coordinates in Settings</a>.</div>"
         )
 
     disabled = []
@@ -6522,12 +7152,12 @@ def web_index():
         "<div class='banner banner-warn'>🚫 <b>Dome control is disabled</b> — OPEN/CLOSE, the schedule, "
         "safety auto-close/open, rain auto-close, and the ASCOM Dome device are all inactive, and the reed "
         "switch isn't being read. Re-enable it under "
-        "<a href='#dome-heater-features'>Settings → Dome &amp; Heater</a>.</div>"
+        "<a href='/settings#dome-heater-features'>Settings → Dome &amp; Heater</a>.</div>"
         if not dome_enabled else ""
     )
     heater_disabled_banner_html = (
         "<div class='banner banner-warn'>🚫 <b>Heater control is disabled</b> — the AUTO/MANUAL power output "
-        "is forced off. Re-enable it under <a href='#dome-heater-features'>Settings → Dome &amp; Heater</a>.</div>"
+        "is forced off. Re-enable it under <a href='/settings#dome-heater-features'>Settings → Dome &amp; Heater</a>.</div>"
         if not heater_enabled else ""
     )
     heater_mode_badge_text = "DISABLED" if not heater_enabled else ("MANUAL" if manual_heater else "AUTO")
@@ -6541,6 +7171,17 @@ def web_index():
     favicon_safe_href = _safety_favicon_href(True)
     favicon_unsafe_href = _safety_favicon_href(False)
     tz_options = tz_options_html(loc["tz_name"])
+
+    SETTINGS_GROUPS = [
+        ("location-timezone", "Location & Timezone"), ("safety-checks", "Safety Checks"),
+        ("logging-settings", "Logging"), ("hardware-pins", "Hardware Pins & Addresses"),
+        ("device-names", "ASCOM Device Names"), ("dome-heater-features", "Dome & Heater"),
+        ("allsky-settings", "All Sky Camera"), ("ai-learning-settings", "AI Learning"),
+        ("service-control", "Service Control"),
+    ]
+    settings_nav_html = ('<nav class="settings-nav" id="settingsNav">'
+                         + "".join(f'<a href="#{gid}" data-g="{gid}">{_html_escape(label)}</a>' for gid, label in SETTINGS_GROUPS)
+                         + '</nav>')
 
     html = f"""<!DOCTYPE html><html><head><title>Observatory Control</title>
 <link rel="icon" id="safetyFavicon" href="{favicon_href}">
@@ -6579,8 +7220,9 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .allsky-img-wrap{{width:100%;border-radius:10px;overflow:hidden;background:#14161a;min-height:140px;
   flex:none;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;}}
 .allsky-img-wrap img{{width:100%;height:100%;object-fit:cover;display:block;}}
-/* All Sky + Sky History sit together in their own vertical flex column
-   (not plain grid items) so Sky History can grow to fill exactly whatever
+/* All Sky + the Safety Checks History card (the old Sky History) sit
+   together in their own vertical flex column (not plain grid items) so
+   the history card can grow to fill exactly whatever
    height All Sky's own (now fixed 1:1) aspect ratio leaves free, matching
    the Safety Monitor card's height alongside it - see .card.history-compact
    below. Only used when All Sky is enabled; with it off, Sky History (if it
@@ -6595,7 +7237,19 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .hist-zone-axis-c{{flex:0 0 48px;position:relative;background:#fafbfc;border-right:1px solid #e3e6ea;}}
 .hist-zone-axis-c .zlabel{{position:absolute;left:4px;right:2px;font-size:9px;font-weight:700;line-height:1.05;}}
 .hist-scroll-c{{flex:1 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;}}
-.hist-chart-compact{{display:block;width:{AI_HISTORY_CHART_W}px;height:100%;}}
+.hist-chart-compact{{display:block;width:{AI_HISTORY_CHART_W}px;}}
+.sc-lane-and{{font-weight:400;color:#6b7480;font-size:10px;}}
+.sc-lane-label{{position:absolute;left:6px;right:4px;display:flex;align-items:center;font-size:10.5px;
+  font-weight:700;color:#2c3e50;line-height:1.05;}}
+.sc-pill{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;margin-left:8px;
+  vertical-align:middle;}}
+.sc-pill-safe{{background:var(--safe-bg);color:var(--safe);}}
+.sc-pill-unsafe{{background:var(--unsafe-bg);color:var(--unsafe);}}
+#scTip{{position:fixed;pointer-events:none;background:#1f2328;color:#fff;font-size:11px;border-radius:8px;
+  padding:8px 10px;display:none;z-index:50;min-width:170px;box-shadow:0 4px 14px rgba(0,0,0,.25);}}
+#scTip b{{display:block;margin-bottom:4px;font-size:11.5px;}}
+#scTip div{{display:flex;justify-content:space-between;gap:14px;line-height:1.5;}}
+#scTip .blue{{color:#8ec5f5;}}#scTip .grey{{color:#c9cfd6;}}#scTip .move{{color:#c8b6f0;}}#scTip .ok{{color:#7ee2a0;}}#scTip .warn{{color:#ffd166;}}#scTip .bad{{color:#ff9a96;}}#scTip .unk{{color:#b4bcc6;}}
 .hist-zone-sub-c{{flex:0 0 56px;position:relative;background:#fafbfc;border-left:1px solid #e3e6ea;}}
 .hist-zone-sub-c .sublabel{{position:absolute;left:4px;right:2px;font-size:6.4px;font-weight:600;
   opacity:0.85;line-height:1.0;}}
@@ -6626,6 +7280,8 @@ h1{{font-size:21px;margin:2px 0 2px;}}
    card) - here as a top rule on every section but the first, so it reads
    as a divider between consecutive sections rather than framing each one. */
 .settings-group + .settings-group{{border-top:1px solid #eee;margin-top:16px;padding-top:16px;}}
+.sub-opt{{margin-left:26px;padding-left:12px;border-left:3px solid #bcd9f2;}}
+.sub-opt.sub-off{{opacity:.5;}}
 .settings-group h3{{font-size:13.5px;margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}}
 .card h2{{margin:0 0 14px;font-size:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}}
 .card h2 .title{{display:flex;align-items:center;gap:8px;}}
@@ -6708,12 +7364,33 @@ input[type=number],input[type=time]{{font-size:14px;padding:5px 7px;border-radiu
 input[type=checkbox]{{vertical-align:middle;margin-right:6px;}}
 input[type=range]{{width:100%;accent-color:var(--accent-heater);}}
 a{{color:var(--accent-safety);}}
-</style></head><body>
+{PAGE_HEADER_CSS}
+/* closable notices */
+.banner{{position:relative;padding-right:38px;}}
+.banner .banner-x{{position:absolute;top:6px;right:8px;width:24px;height:24px;border:0;border-radius:50%;background:transparent;color:inherit;font-size:18px;line-height:22px;cursor:pointer;padding:0;opacity:.75;}}
+.banner .banner-x:hover{{background:rgba(0,0,0,.09);opacity:1;}}
+.banner.banner-dismissed{{display:none;}}
+.notice-restore{{font-size:12px;color:var(--muted);margin:0 2px 10px;}}
+.notice-restore a{{cursor:pointer;}}
+/* Settings page: left menu, one group at a time */
+.settings-shell{{display:flex;gap:18px;align-items:flex-start;}}
+.settings-nav{{flex:0 0 210px;display:flex;flex-direction:column;gap:2px;background:#f6f7f9;border-radius:12px;padding:8px;position:sticky;top:8px;}}
+.settings-nav a{{display:block;padding:8px 10px;border-radius:8px;color:#2c3e50;text-decoration:none;font-size:13.5px;}}
+.settings-nav a:hover{{background:#eceff2;}}
+.settings-nav a.on{{background:#dcefec;color:#0f766e;font-weight:700;}}
+.view-settings .grid{{display:block;max-width:1100px;}}
+.view-settings .settings-columns{{display:block;flex:1;min-width:0;}}
+.view-settings .settings-col{{display:block;}}
+.view-settings .settings-group{{display:none;border-top:0!important;margin-top:0!important;padding-top:0!important;}}
+.view-settings .settings-group.sg-on{{display:block;}}
+@media (max-width:760px){{.settings-shell{{flex-direction:column;}}.settings-nav{{flex:none;width:100%;flex-direction:row;flex-wrap:wrap;position:static;}}}}
+</style></head><body class="view-{view}">
 
-<h1>🔭 Observatory Control</h1>
-<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112 &nbsp;&middot;&nbsp; <a href="#settings">⚙ Settings</a> &nbsp;&middot;&nbsp; <a href="/logs">🗒 Logs</a> &nbsp;&middot;&nbsp; <a href="/ai-classify">🏷️ Classify (<span id="classifyCount">{ai_unlabeled_count}</span>)</a></p>
-{location_banner_html}
+{_page_header_html("dash" if view == "dash" else "settings", ai_unlabeled_count)}
+<div class="notice-restore" id="noticeRestore" hidden><span id="noticeRestoreN"></span> dismissed &mdash; <a href="#" id="noticeRestoreAll">Show all</a></div>
+{location_banner_html if view == "dash" else ""}
 <div class="grid">
+<!--DASH-START-->
 <div class="card safety{'' if allsky_enabled else ' full-width'}">
   <h2><span class="title">🛡️ Safety Monitor <span id="safeState" class="badge {safe_badge_class}">{'SAFE' if s['overall_safe'] else 'UNSAFE'}</span></span></h2>
   <p class="hold-countdown" id="safeHoldCountdown" {'' if s['safe_hold_active'] else 'hidden'}>⏳ Conditions clear — reporting SAFE in <b id="safeHoldTime">{_fmt_mmss(s['safe_hold_remaining_sec'])}</b></p>
@@ -6729,7 +7406,7 @@ a{{color:var(--accent-safety);}}
   <hr class="sep">
   <div id="envReadings">{env_html}</div>
   <p class="hint">Enable/disable individual checks and the SAFE-report hold delay under
-  <a href="#safety-checks">Settings → Safety Checks</a>.</p>
+  <a href="/settings#safety-checks">Settings → Safety Checks</a>.</p>
 </div>
 
 {"" if not allsky_enabled else f'''<div class="right-col">
@@ -6752,10 +7429,10 @@ a{{color:var(--accent-safety);}}
   <h2><span class="title">🚪 Dome <span id="domeState" class="badge {dome_badge_class}">{dome_state}</span></span></h2>
   {dome_disabled_banner_html}
   {f"<div class='banner banner-warn'>⚠️ <b>No position feedback</b> - the {sensor_names['reed']} is disabled under "
-   "<a href='#hardware-pins'>Hardware Pins</a>, so OPEN/CLOSED here just reflects the last command sent, not a "
+   "<a href='/settings#hardware-pins'>Hardware Pins</a>, so OPEN/CLOSED here just reflects the last command sent, not a "
    "confirmed reading.</div>" if dome_enabled and not REED_INSTALLED else ""}
   {f"<div class='banner banner-warn'>⚠️ <b>Bench-test mode</b> - the {sensor_names['relay']} is disabled under "
-   "<a href='#hardware-pins'>Hardware Pins</a>, so OPEN/CLOSE run through the state machine but no physical "
+   "<a href='/settings#hardware-pins'>Hardware Pins</a>, so OPEN/CLOSE run through the state machine but no physical "
    "relay pulse is sent.</div>" if dome_enabled and not RELAY_INSTALLED else ""}
   <div class="btn-row">
     <button class="btn btn-dome" {"disabled" if not dome_enabled else ""} onclick="fetch('/open').then(()=>poll())">OPEN</button>
@@ -6765,7 +7442,7 @@ a{{color:var(--accent-safety);}}
   <form action="/save" method="get">
    <fieldset {"disabled" if not dome_enabled else ""}>
     {"<p class='hint hint-warn'>Greyed out because Dome control itself is disabled above — re-enable it "
-     "under <a href='#dome-heater-features'>Settings → Dome &amp; Heater</a> to edit this section.</p>"
+     "under <a href='/settings#dome-heater-features'>Settings → Dome &amp; Heater</a> to edit this section.</p>"
      if not dome_enabled else ""}
     <div class="setting-row">
       <label><input type="checkbox" name="openEnable" {"checked" if sched['open_enabled'] else ""}> Enable automatic OPEN</label>
@@ -6779,7 +7456,7 @@ a{{color:var(--accent-safety);}}
     back off after it fires once; re-check it to arm that occurrence again.</p>
     <p class="hint">Dome movement timing (how long to ignore the reed switch after OPEN, and how long
     before assuming a move finished) now lives under
-    <a href="#dome-heater-features">Settings → Dome &amp; Heater</a>.</p>
+    <a href="/settings#dome-heater-features">Settings → Dome &amp; Heater</a>.</p>
     <hr class="sep">
     <div class="setting-row">
       <label><input type="checkbox" name="autoCloseEnable" {"checked" if auto_close['enabled'] else ""}> Auto-close roof if UNSAFE for this many seconds:</label>
@@ -6798,7 +7475,7 @@ a{{color:var(--accent-safety);}}
       <input type="number" name="rainAutoCloseSeconds" value="{rain_auto_close['sustained_rain_seconds']}" class="narrow-number" {"" if checks['rain_enabled'] else "disabled"}>
     </div>
     {"<p class='hint hint-warn'>Greyed out because the RG-9 rain sensor is disabled under "
-     "<a href='#hardware-pins'>Hardware Pins</a> — enable it there first, since it means the RG-9 isn't "
+     "<a href='/settings#hardware-pins'>Hardware Pins</a> — enable it there first, since it means the RG-9 isn't "
      "wired/trusted yet.</p>" if not checks['rain_enabled'] else
      "<p class='hint'>A standing guard, separate from the sustained-UNSAFE auto-close above — this one reacts "
      "the moment rain is detected. 0 seconds = close instantly, no wait.</p>"}
@@ -6825,7 +7502,7 @@ a{{color:var(--accent-safety);}}
     <form action="/save-heater" method="get">
      <fieldset {"disabled" if not heater_enabled else ""}>
       {"<p class='hint hint-warn'>Greyed out because Heater control itself is disabled above — re-enable "
-       "it under <a href='#dome-heater-features'>Settings → Dome &amp; Heater</a> to edit this section.</p>"
+       "it under <a href='/settings#dome-heater-features'>Settings → Dome &amp; Heater</a> to edit this section.</p>"
        if not heater_enabled else ""}
       <label>Freezing threshold (deg C)</label><input type="text" name="freezec" value="{heater_cfg['freeze_threshold_c']}">
       <label>Dew-risk spread (deg C)</label><input type="text" name="dewspreadc" value="{heater_cfg['dew_spread_threshold_c']}">
@@ -6836,13 +7513,17 @@ a{{color:var(--accent-safety);}}
   </div>
 </div>
 
+<!--DASH-END-->
+<!--SETTINGS-START-->
 <div class="card settings" id="settings">
   <h2><span class="title">⚙️ Settings</span></h2>
 
+  <div class="settings-shell">
+  {settings_nav_html}
   <div class="settings-columns">
   <div class="settings-col">
 
-  <div class="settings-group" id="location-timezone">
+  <div class="settings-group sg-on" id="location-timezone">
     <h3>Location &amp; Timezone</h3>
     <form action="/save-location" method="get">
       <label>Latitude (deg, north +)</label><input type="text" name="lat" value="{loc['latitude_deg']}">
@@ -6905,6 +7586,13 @@ a{{color:var(--accent-safety);}}
       installed on this Pi, or there's no current All Sky frame to classify. Train it via the cloud training
       server and set which predicted labels count as SAFE on the <a href="#ai-learning-settings">AI
       Learning</a> settings below (shares the same SAFE-labels list as the AI Model check above).</p>
+      <label>AI graph style (Safety Checks History)</label>
+      <select name="aiGraphStyle">
+        <option value="chart" {"selected" if checks.get('ai_graph_style', 'chart') != 'lanes' else ""}>Line chart - AI Sky Pred. and AI Cloud Detect over the Overcast / Cloudy / Clear bands</option>
+        <option value="lanes" {"selected" if checks.get('ai_graph_style', 'chart') == 'lanes' else ""}>Block lanes - one Clear / Cloudy / Overcast lane each, like the other checks</option>
+      </select>
+      <p class="hint">Display only - changes how the two AI checks are drawn in the Safety Checks History graph, never
+      the SAFE/UNSAFE decision.</p>
       <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
       <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
       <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
@@ -7080,6 +7768,12 @@ a{{color:var(--accent-safety);}}
       <p class="hint">Off: OPEN/CLOSE, the schedule, safety auto-close/open, and rain auto-close all stop
       issuing commands; the reed switch is no longer read; and the ASCOM Dome device reports Not Connected
       to any client that tries to use it — the same as if the ASCOM dome service itself were stopped.</p>
+      <div class="sub-opt{" sub-off" if not dome_enabled else ""}">
+      <label><input type="checkbox" name="domeGraph" {"checked" if dome_graph_enabled else ""}> Show dome open/close actions in graph</label>
+      <p class="hint">Adds the Dome lane, the &#9650;/&#9660; open/close markers and a dashed line through every lane at
+      each action to the Safety Checks History graph. Off: the lane and markers are hidden, but dome actions keep
+      being recorded, so turning it back on shows what already happened. Has no effect while Dome control is off.</p>
+      </div>
       <label><input type="checkbox" name="heaterEnable" {"checked" if heater_enabled else ""}> Enable Heater control</label>
       <p class="hint">Off: the dew/freeze AUTO calculation and the MANUAL slider both stop, and the MOSFET
       output is forced off.</p>
@@ -7229,10 +7923,13 @@ a{{color:var(--accent-safety);}}
 
   </div>
   </div>
+  </div>
 </div>
+<!--SETTINGS-END-->
 </div>
 
 <script>
+{PAGE_HEADER_JS}
 function doServiceAction(url){{
   var el=document.getElementById('serviceStatus');
   if(el) el.textContent='Working...';
@@ -7297,12 +7994,16 @@ function poll(){{
   fetch('/fragments').then(r=>r.json()).then(d=>{{
     var domeBadgeMap={{OPEN:'badge-open',CLOSED:'badge-closed',OPENING:'badge-moving',CLOSING:'badge-moving',UNKNOWN:'badge-fault',DISABLED:'badge-disabled'}};
     var domeEl=document.getElementById('domeState');
-    domeEl.textContent=d.dome_state;
-    domeEl.className='badge '+(domeBadgeMap[d.dome_state]||'badge-fault');
+    if(domeEl){{
+      domeEl.textContent=d.dome_state;
+      domeEl.className='badge '+(domeBadgeMap[d.dome_state]||'badge-fault');
+    }}
 
     var safeEl=document.getElementById('safeState');
-    safeEl.textContent=d.overall_safe?'SAFE':'UNSAFE';
-    safeEl.className='badge '+(d.overall_safe?'badge-safe':'badge-unsafe');
+    if(safeEl){{
+      safeEl.textContent=d.overall_safe?'SAFE':'UNSAFE';
+      safeEl.className='badge '+(d.overall_safe?'badge-safe':'badge-unsafe');
+    }}
     updateFavicon(d.overall_safe);
 
     var holdEl=document.getElementById('safeHoldCountdown');
@@ -7394,13 +8095,143 @@ function refreshSkyHistory(){{
   fetch('/sky-history').then(function(r){{ return r.json(); }}).then(function(d){{
     if (d.ok){{
       var hb = document.getElementById('historyBlock');
-      if (hb) hb.innerHTML = d.html;
+      if (hb){{
+        // Keep the chart scrolled where the user left it - the card is
+        // rebuilt from scratch every minute, which would otherwise snap it
+        // back to "Now" in the middle of reading older history.
+        var oldScroll = hb.querySelector('.hist-scroll-c');
+        var keep = oldScroll ? oldScroll.scrollLeft : 0;
+        hb.innerHTML = d.html;
+        var newScroll = hb.querySelector('.hist-scroll-c');
+        if (newScroll && keep) newScroll.scrollLeft = keep;
+      }}
     }}
   }}).catch(function(){{}});
 }}
 setInterval(refreshSkyHistory, 60000);
+
+// Closable notices: every .banner gets an X. Dismissals are remembered in
+// this browser, keyed by the notice's text, so a notice comes back if its
+// wording changes (e.g. a different check gets disabled). Purely cosmetic -
+// nothing here touches any check or the SAFE/UNSAFE result. The banners in
+// #warningBanner are re-rendered by poll() every few seconds, hence the
+// MutationObserver rather than a one-off pass.
+(function(){{
+  var KEY='dismissedNotices';
+  function load(){{ try {{ return JSON.parse(localStorage.getItem(KEY)||'[]'); }} catch(e) {{ return []; }} }}
+  function save(a){{ try {{ localStorage.setItem(KEY, JSON.stringify(a.slice(-200))); }} catch(e) {{}} }}
+  function keyOf(b){{ return (b.textContent||'').replace(/\\s+/g,' ').trim().slice(0,300); }}
+  function updateRestore(){{
+    var n=document.querySelectorAll('.banner.banner-dismissed').length;
+    var bar=document.getElementById('noticeRestore'), lab=document.getElementById('noticeRestoreN');
+    if(!bar) return;
+    bar.hidden=(n===0);
+    if(lab) lab.textContent=n+(n===1?' notice':' notices');
+  }}
+  function apply(){{
+    var dismissed=load(), changed=false;
+    document.querySelectorAll('.banner:not([data-nk])').forEach(function(b){{
+      var k=keyOf(b);
+      b.setAttribute('data-nk', k);
+      var x=document.createElement('button');
+      x.type='button'; x.className='banner-x'; x.title='Dismiss'; x.setAttribute('aria-label','Dismiss notice'); x.innerHTML='&times;';
+      b.appendChild(x);
+      if(dismissed.indexOf(k)>=0) b.classList.add('banner-dismissed');
+      changed=true;
+    }});
+    if(changed) updateRestore();
+  }}
+  document.addEventListener('click', function(e){{
+    var x=e.target.closest ? e.target.closest('.banner-x') : null;
+    if(x){{
+      var b=x.closest('.banner'), k=b.getAttribute('data-nk'), d=load();
+      if(d.indexOf(k)<0) d.push(k);
+      save(d); b.classList.add('banner-dismissed'); updateRestore(); return;
+    }}
+    if(e.target && e.target.id==='noticeRestoreAll'){{
+      e.preventDefault(); save([]);
+      document.querySelectorAll('.banner.banner-dismissed').forEach(function(b){{ b.classList.remove('banner-dismissed'); }});
+      updateRestore();
+    }}
+  }});
+  apply();
+  new MutationObserver(apply).observe(document.body,{{childList:true,subtree:true}});
+}})();
+
+// Settings page: the left menu shows one settings group at a time, picked
+// by the URL hash (so /settings#safety-checks - used by every "Settings"
+// link and save redirect - opens straight to that group).
+(function(){{
+  var groups=document.querySelectorAll('.settings-group');
+  if(!groups.length || !document.body.classList.contains('view-settings')) return;
+  function show(){{
+    var id=(location.hash||'').slice(1), found=false;
+    groups.forEach(function(g){{ if(g.id===id) found=true; }});
+    if(!found) id=groups[0].id;
+    groups.forEach(function(g){{ g.classList.toggle('sg-on', g.id===id); }});
+    document.querySelectorAll('#settingsNav a').forEach(function(a){{ a.classList.toggle('on', a.getAttribute('data-g')===id); }});
+  }}
+  window.addEventListener('hashchange', show);
+  show();
+}})();
+
+// Safety Checks History hover readout - delegated on document because the
+// card's HTML is replaced wholesale by refreshSkyHistory() above.
+(function(){{
+  var tip = null;
+  function getTip(){{
+    if (!tip){{ tip = document.createElement('div'); tip.id = 'scTip'; document.body.appendChild(tip); }}
+    return tip;
+  }}
+  function hide(sc){{
+    if (tip) tip.style.display = 'none';
+    var xh = sc && sc.querySelector('.sc-xhair');
+    if (xh){{ xh.setAttribute('x1', -10); xh.setAttribute('x2', -10); }}
+  }}
+  function esc(t){{ return String(t).replace(/[&<>"]/g, function(c){{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]; }}); }}
+  var lastSc = null;
+  document.addEventListener('mousemove', function(e){{
+    var sc = (e.target && e.target.closest) ? e.target.closest('.hist-scroll-c[data-sc-hover]') : null;
+    if (!sc){{ hide(lastSc); lastSc = null; return; }}
+    lastSc = sc;
+    if (!sc._scData){{ try {{ sc._scData = JSON.parse(sc.getAttribute('data-sc-hover')); }} catch(err) {{ return; }} }}
+    var svg = sc.querySelector('svg'); if (!svg) return;
+    var r = svg.getBoundingClientRect();
+    var vbW = parseFloat(sc.getAttribute('data-sc-w')), left = parseFloat(sc.getAttribute('data-sc-left'));
+    var pxh = parseFloat(sc.getAttribute('data-sc-pxh'));
+    var x = (e.clientX - r.left) * (vbW / r.width);
+    var xh = sc.querySelector('.sc-xhair');
+    if (x < left){{ hide(sc); return; }}
+    var i = Math.round((x - left) / pxh * 12);   // rows are 5 minutes apart
+    var rows = sc._scData.rows;
+    if (i >= rows.length) i = rows.length - 1;
+    var row = rows[i], lanes = sc._scData.lanes;
+    if (xh){{ xh.setAttribute('x1', x); xh.setAttribute('x2', x); }}
+    var html = '<b>' + esc(row[0]) + '</b>';
+    if (!row[1]) html += '<div><span>No data recorded</span></div>';
+    else for (var k = 0; k < lanes.length; k++)
+      html += '<div><span>' + esc(lanes[k]) + '</span><span class="' + row[1][k][1] + '">' + esc(row[1][k][0]) + '</span></div>';
+    var t = getTip(); t.innerHTML = html; t.style.display = 'block';
+    t.style.left = Math.min(window.innerWidth - 210, e.clientX + 14) + 'px';
+    t.style.top = (e.clientY + 14) + 'px';
+  }});
+}})();
 </script>
 </body></html>"""
+    # One template serves both pages: the dashboard cards and the Settings
+    # card are fenced by marker comments and the other page's block is cut.
+    if view == "settings":
+        a = html.index("<!--DASH-START-->")
+        b = html.index("<!--DASH-END-->")
+        html = html[:a] + html[b:]
+        # links to other groups stay in-page on the Settings page (no reload, no lost edits)
+        html = html.replace('href="/settings#', 'href="#').replace("href='/settings#", "href='#")
+    else:
+        a = html.index("<!--SETTINGS-START-->")
+        b = html.index("<!--SETTINGS-END-->")
+        html = html[:a] + html[b:]
+    for marker in ("<!--DASH-START-->", "<!--DASH-END-->", "<!--SETTINGS-START-->", "<!--SETTINGS-END-->"):
+        html = html.replace(marker, "")
     return html
 
 
@@ -7491,7 +8322,10 @@ def web_logs():
 
     logging_cfg = get_setting("logging")
 
+    _safe_now = _overall_safe_now()
+    _unl_count = _unlabeled_sample_count()
     html = f"""<!DOCTYPE html><html><head><title>Observatory Logs</title>
+{_page_favicon_link(_safe_now)}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{{
@@ -7500,10 +8334,8 @@ def web_logs():
 }}
 *{{box-sizing:border-box;}}
 body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
-      max-width:900px;margin:0 auto;padding:18px 16px 48px;}}
-h1{{font-size:21px;margin:2px 0 2px;}}
-.subtitle{{color:var(--muted);font-size:13px;margin:0 0 18px;}}
-.subtitle a{{color:var(--accent);text-decoration:none;}}
+      max-width:1040px;margin:0 auto;padding:18px 16px 48px;}}
+{PAGE_HEADER_CSS}
 .card{{background:var(--card-bg);border-radius:14px;padding:16px 18px;margin:0 0 16px;
        box-shadow:0 1px 4px rgba(0,0,0,.08);}}
 .filters{{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;}}
@@ -7527,8 +8359,7 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 a{{color:var(--accent);}}
 </style></head><body>
 
-<h1>🗒 Observatory Logs</h1>
-<p class="subtitle"><a href="/">&larr; Back to Observatory Control</a></p>
+{_page_header_html("logs", _unl_count)}
 
 <div class="card">
   <form class="filters" action="/logs" method="get">
@@ -7539,7 +8370,7 @@ a{{color:var(--accent);}}
   </form>
   <p class="hint">Log text rotates to a new file every week; old weeks stay pickable above until they age out.
   All Sky snapshot images and old weekly files are cleaned up automatically after the day counts set under
-  <a href="/#logging-settings">Settings &rarr; Logging</a> (currently {logging_cfg['image_retention_days']} days
+  <a href="/settings#logging-settings">Settings &rarr; Logging</a> (currently {logging_cfg['image_retention_days']} days
   for images, {logging_cfg['log_retention_days']} days for log files).</p>
 </div>
 
@@ -7547,6 +8378,8 @@ a{{color:var(--accent);}}
 {entries_html}
 </div>
 
+<script>{PAGE_HEADER_JS}</script>
+{_page_favicon_js(_safe_now)}
 </body></html>"""
     return html
 
@@ -8459,7 +9292,7 @@ def ai_classify_page():
 
     cards_html = ("".join(_render_ai_classify_card(s, tz, label_classes) for s in page_samples) if page_samples else
                   "<p class='hint'>Nothing to classify right now — samples build up over time once AI "
-                  "Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
+                  "Learning capture is enabled under <a href='/settings#ai-learning-settings'>Settings</a>.</p>")
 
     # One-by-one view: same filtered/sorted list as the grid, but indexed to
     # a single position instead of paged - clamped so a stale idx (e.g. from
@@ -8468,7 +9301,7 @@ def ai_classify_page():
     sidx = max(0, min(sidx, total_filtered - 1)) if total_filtered else 0
     if total_filtered == 0:
         single_card_html = ("<p class='hint'>Nothing to classify right now — samples build up over time once "
-                             "AI Learning capture is enabled under <a href='/#ai-learning-settings'>Settings</a>.</p>")
+                             "AI Learning capture is enabled under <a href='/settings#ai-learning-settings'>Settings</a>.</p>")
     else:
         single_card_html = _render_ai_classify_single_card(filtered[sidx], tz, sidx, total_filtered, label_classes)
     prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx - 1}">&larr; Prev</a>'
@@ -8481,7 +9314,7 @@ def ai_classify_page():
         f'<button type="button" class="btn ai-label-btn" onclick="{label_fn}(\'{c}\')">{c}</button>'
         for c in label_classes) or (
         "<p class='hint'>No labels are configured — add some under "
-        "<a href='/#ai-learning-settings'>Settings &rarr; AI Learning</a>.</p>")
+        "<a href='/settings#ai-learning-settings'>Settings &rarr; AI Learning</a>.</p>")
 
     show_options = "".join(
         f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
@@ -8658,11 +9491,11 @@ def ai_classify_page():
     # forget you still need to flip the switch under Settings to use it.
     usage_note = (
         "Its live prediction is <b>actively used in the SAFE/UNSAFE decision</b> "
-        "(see <a href='/#ai-learning-settings'>Settings</a> to change the SAFE labels or turn this off)."
+        "(see <a href='/settings#ai-learning-settings'>Settings</a> to change the SAFE labels or turn this off)."
         if ai_model_wanted else
         "Its live prediction shows on the <a href='/'>dashboard</a>'s Safety Monitor card for comparison "
         "only — it does not yet affect the SAFE/UNSAFE decision "
-        "(<a href='/#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
+        "(<a href='/settings#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
     )
     if ai_model:
         try:
@@ -8693,11 +9526,11 @@ def ai_classify_page():
     cloud_job = _load_cloud_job_state()
     cloud_usage_note = (
         "Its live prediction is <b>actively used in the SAFE/UNSAFE decision</b> "
-        "(see <a href='/#ai-learning-settings'>Settings</a> to change the SAFE labels or turn this off)."
+        "(see <a href='/settings#ai-learning-settings'>Settings</a> to change the SAFE labels or turn this off)."
         if cloud_model_wanted else
         "Its live prediction shows on the <a href='/'>dashboard</a>'s Safety Monitor card for comparison "
         "only — it does not yet affect the SAFE/UNSAFE decision "
-        "(<a href='/#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
+        "(<a href='/settings#ai-learning-settings'>turn that on under Settings</a> once you trust it)."
     )
     # How many labeled samples aren't yet absorbed into a successful cloud
     # training run - needed above (folded into cloud_model_status_html, so
@@ -8758,7 +9591,9 @@ def ai_classify_page():
         f'cancelCloudJob()">Cancel job</button>'
     )
 
+    _safe_now = _overall_safe_now()
     html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
+{_page_favicon_link(_safe_now)}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{{
@@ -8767,9 +9602,8 @@ def ai_classify_page():
 }}
 *{{box-sizing:border-box;}}
 body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
-      max-width:1100px;margin:0 auto;padding:18px 16px 48px;}}
-h1{{font-size:21px;margin:2px 0 2px;}}
-.subtitle{{color:var(--muted);font-size:13px;margin:0 0 18px;}}
+      max-width:1040px;margin:0 auto;padding:18px 16px 48px;}}
+{PAGE_HEADER_CSS}
 .subtitle a{{color:var(--accent);text-decoration:none;}}
 .card{{background:var(--card-bg);border-radius:14px;padding:16px 18px;margin:0 0 16px;
        box-shadow:0 1px 4px rgba(0,0,0,.08);}}
@@ -8818,9 +9652,7 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 a{{color:var(--accent);}}
 </style></head><body>
 
-<h1>🏷️ AI Learning — Classify</h1>
-<p class="subtitle"><a href="/">&larr; Back to Observatory Control</a> &nbsp;&middot;&nbsp;
-<a href="/logs">🗒 Logs</a></p>
+{_page_header_html("classify", unlabeled_count)}
 
 <div class="card">
   <p class="card-title">📊 Training data overview</p>
@@ -8850,7 +9682,7 @@ a{{color:var(--accent);}}
   <p class="hint">Classified so far, per label: {cloud_eligibility_html}</p>
   {"" if cloud_server_configured else
    '<p class="hint">Set a cloud training server URL and API key under '
-   '<a href="/#ai-learning-settings">Settings → AI Learning</a> first '
+   '<a href="/settings#ai-learning-settings">Settings → AI Learning</a> first '
    '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
   {cloud_train_button_html}
   {cloud_reset_button_html}
@@ -8861,7 +9693,7 @@ a{{color:var(--accent);}}
   {cloud_cancel_button_html}
   <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
   <p class="hint">{"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
-  <a href="/#ai-learning-settings">Settings → AI Learning</a> to change it.</p>
+  <a href="/settings#ai-learning-settings">Settings → AI Learning</a> to change it.</p>
   <p id="resizedImagesStatus" class="hint"></p>
 </div>
 
@@ -9320,6 +10152,8 @@ function resetCloudModel() {{
 }}
 {"startCloudStatusPolling();" if cloud_job.get("status") in ("uploading", "training") else ""}
 </script>
+<script>{PAGE_HEADER_JS}</script>
+{_page_favicon_js(_safe_now)}
 </body></html>"""
     return html
 

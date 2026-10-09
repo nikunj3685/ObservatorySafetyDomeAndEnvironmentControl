@@ -1,0 +1,26 @@
+<!doctype html><meta charset="utf-8"><title>Closable notices mockup</title>
+<style>:root{--warn:#8a5a00;--warn-bg:#fff3dc}body{font:14px system-ui;background:#f2f3f6;margin:0;padding:18px;color:#1f2328;max-width:700px}
+.mk{background:#fff3cd;border:1px solid #e8d48a;border-radius:8px;padding:8px 12px;margin-bottom:14px}
+.card{background:#fff;border-radius:14px;padding:16px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:14px}
+h3{margin:0 0 10px}.banner{position:relative;border-radius:9px;padding:10px 38px 10px 14px;font-size:13.5px;margin:4px 0 12px;background:var(--warn-bg);color:var(--warn);border:1px solid #f0d38a}
+.banner .x{position:absolute;top:6px;right:8px;width:22px;height:22px;border:0;border-radius:50%;background:transparent;color:var(--warn);font-size:17px;line-height:20px;cursor:pointer}
+.banner .x:hover{background:rgba(0,0,0,.09)}
+.restore{font-size:12px;color:#6b7480;margin:2px 2px 8px}.restore a{color:#0f766e;cursor:pointer;text-decoration:underline}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid #e2e5ea;padding:6px 8px;text-align:left}</style>
+<div class="mk"><b>MOCKUP ONLY</b> - no code changed. Click the X on any notice.</div>
+<div class="card"><h3>Dome</h3>
+<div class="banner" data-id="a">&#9888;&#65039; <b>REDUCED SAFETY CHECKS:</b> MLX Cloud, ML Cloud disabled - see <a href="#">Settings</a><button class="x" title="Dismiss" aria-label="Dismiss">&times;</button></div>
+<div class="banner" data-id="b">&#128683; <b>Dome control is disabled</b> - OPEN/CLOSE, the schedule and auto-close are off.<button class="x" title="Dismiss" aria-label="Dismiss">&times;</button></div>
+<div class="banner" data-id="c">&#128205; <b>Location not set</b> - Day/Night needs it. <a href="#">Settings</a><button class="x" title="Dismiss" aria-label="Dismiss">&times;</button></div>
+<div class="banner" data-id="d">&#129302; <b>AI Model gate is enabled but not trained yet</b> - falling back to the other checks.<button class="x" title="Dismiss" aria-label="Dismiss">&times;</button></div>
+<div class="restore" id="r" hidden><span id="n"></span> dismissed - <a id="rs">Show all</a></div></div>
+<div class="card"><h3>Proposed behaviour</h3><table>
+<tr><td>Which notices</td><td>All banners/messages: reduced checks, dome/heater disabled, location, AI/Cloud gate, no position feedback, bench-test, save confirmations</td></tr>
+<tr><td>Close control</td><td>X at top-right of each notice</td></tr>
+<tr><td>Remembered</td><td>Per browser, keyed by notice text; reappears if the text changes (e.g. a different check gets disabled)</td></tr>
+<tr><td>Restore</td><td>"N dismissed - Show all" link appears</td></tr>
+<tr><td>Safety</td><td>Closing only hides the notice; it never changes any check or the SAFE/UNSAFE result</td></tr></table></div>
+<script>const bs=[...document.querySelectorAll('.banner')],r=document.getElementById('r'),n=document.getElementById('n');
+function upd(){const k=bs.filter(b=>b.hidden).length;r.hidden=!k;n.textContent=k+(k==1?' notice':' notices')}
+bs.forEach(b=>b.querySelector('.x').onclick=()=>{b.hidden=true;upd()});
+document.getElementById('rs').onclick=()=>{bs.forEach(b=>b.hidden=false);upd()}</script>
