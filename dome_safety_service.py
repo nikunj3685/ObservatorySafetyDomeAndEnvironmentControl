@@ -48,6 +48,7 @@ dome_config.json next to this script - edit by hand or through the web
 page at http://<pi-ip>:11112/ and http://<pi-ip>:11112/config.
 """
 
+import hashlib
 import io
 import json
 import math
@@ -601,6 +602,12 @@ AI_TRAINING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_t
 AI_TRAINING_IMAGES_DIR = os.path.join(AI_TRAINING_DIR, "images")
 AI_TRAINING_INDEX_PATH = os.path.join(AI_TRAINING_DIR, "index.json")
 AI_CLASSIFY_PAGE_SIZE = 24  # how many sample cards the /ai-classify page shows at once
+# Classify page "Import images": All Sky frames uploaded by hand (e.g. from
+# another camera's archive) instead of captured live. They carry NO sensor
+# snapshot, so they only ever train AI Cloud Detect (the image model) -
+# never the sensor-based AI Sky Prediction (see _sensor_training_label()).
+AI_IMPORT_MAX_BYTES = 10 * 1024 * 1024
+AI_IMPORT_SOURCE = "imported"
 
 # AI Learning Phase 3 - the sky-condition model trained from classified
 # samples (see _train_ai_sky_model() below).
@@ -1262,7 +1269,10 @@ def _ai_training_cleanup():
     keep = []
     changed = False
     for sample in idx["samples"]:
-        if sample.get("label") is None and sample.get("ts", 0) < cutoff:
+        # unclassified_at: a sample sent back via "Unclassify" restarts its
+        # retention clock then, so an old frame isn't purged the moment it
+        # becomes unlabeled again.
+        if sample.get("label") is None and max(sample.get("ts", 0), sample.get("unclassified_at", 0)) < cutoff:
             changed = True
             try:
                 os.remove(os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"]))
@@ -1315,6 +1325,12 @@ def _save_ai_sky_model(model):
         print(f"[ai-learning] Failed to save trained model: {e}")
 
 
+def _is_imported_sample(sample):
+    """True for an image-only sample added via the Classify page's "Import
+    images" popup (see AI_IMPORT_SOURCE) rather than captured live."""
+    return sample.get("source") == AI_IMPORT_SOURCE
+
+
 def _sensor_training_label(sample):
     """The label this sample should train the sensor-based AI model
     under, or None if it should be excluded from that training entirely.
@@ -1328,6 +1344,8 @@ def _sensor_training_label(sample):
     training if its separate `sensor_label` field has been set (on the
     Classify page, after reviewing the photo) - and never under "Ignore"
     itself, so that label can never become one of this model's classes."""
+    if _is_imported_sample(sample):
+        return None  # image-only import: no sensor readings to train from
     label = sample.get("label")
     if not label:
         return None
@@ -1365,7 +1383,7 @@ def _fit_mlx_delta_correction(by_class):
         if cls.strip().lower() not in safe_labels:
             continue
         for sample in samples:
-            sensors = sample.get("sensors", {})
+            sensors = sample.get("sensors") or {}
             amb = sensors.get("mlx_ambient_ref_c")
             delta = sensors.get("mlx_delta_c")
             if amb is not None and delta is not None:
@@ -1390,7 +1408,7 @@ def _mlx_delta_anomaly(sample, slope, intercept):
     raw delta, and (unlike raw delta alongside raw sky/ambient) a genuinely
     distinct signal for the classifier rather than a restatement of numbers
     it already has. None if either underlying reading is missing."""
-    sensors = sample.get("sensors", {})
+    sensors = sample.get("sensors") or {}
     amb = sensors.get("mlx_ambient_ref_c")
     delta = sensors.get("mlx_delta_c")
     if amb is None or delta is None:
@@ -8618,7 +8636,18 @@ def _ai_samples_matching_filter(idx, filt):
     if filt and filt.startswith("label:"):
         wanted = filt[len("label:"):]
         return [s for s in samples if s.get("label") == wanted]
+    if filt == "source:imported":
+        return [s for s in samples if _is_imported_sample(s)]
+    if filt == "source:captured":
+        return [s for s in samples if not _is_imported_sample(s)]
     return []
+
+
+def _ai_bulk_filter_ok(filt):
+    """Whether `filt` is a filter value the "Select ALL" bulk actions accept
+    (same set _ai_samples_matching_filter() understands)."""
+    return (filt in ("unclassified", "all", "source:imported", "source:captured")
+            or (filt or "").startswith("label:"))
 
 
 @app.route("/ai-classify-save", methods=["GET"])
@@ -8641,7 +8670,7 @@ def ai_classify_save():
     label = request.args.get("label", "").strip()
     all_filter = request.args.get("all")
     idx = _load_ai_training_index()
-    if all_filter in ("unclassified", "all") or (all_filter or "").startswith("label:"):
+    if _ai_bulk_filter_ok(all_filter):
         ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
@@ -8663,6 +8692,142 @@ def ai_classify_save():
     unlabeled_count = sum(1 for s in idx["samples"] if s.get("label") is None)
     return jsonify({"ok": True, "matched": matched, "unlabeled_count": unlabeled_count,
                      "total_count": len(idx["samples"])})
+
+
+def _ai_sample_has_image(sample):
+    """True if this sample's image file still exists on disk (it may have
+    been deleted after cloud training, or by "Delete classified full-size
+    images" / "Delete resized images")."""
+    name = sample.get("image")
+    return bool(name) and os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, name))
+
+
+def _unclassify_ai_samples(ids, dry_run=False):
+    """Sends the given LABELED samples back to unclassified - the Classify
+    page's "Unclassify selected" / single-view "Unclassify" action. Clears
+    the label plus everything derived from it (labeled_at, the Ignore-only
+    sensor_label, and cloud_trained_at, so a re-labeled image counts as new
+    for AI Cloud Detect's next training run instead of being treated as
+    already absorbed under its old label). Sensor readings and the image
+    are kept. A sample whose image is gone is SKIPPED: unlabeled, it could
+    never be looked at and labeled again (delete it instead if its label is
+    wrong). Already-unlabeled ids are ignored. dry_run=True only counts.
+    Returns (unclassified, skipped_no_image)."""
+    id_set = set(ids)
+    idx = _load_ai_training_index()
+    now = time.time()
+    done = skipped = 0
+    for sample in idx["samples"]:
+        if sample["id"] not in id_set or not sample.get("label"):
+            continue
+        if not _ai_sample_has_image(sample):
+            skipped += 1
+            continue
+        done += 1
+        if dry_run:
+            continue
+        sample["label"] = None
+        sample["unclassified_at"] = now
+        for key in ("labeled_at", "sensor_label", "sensor_labeled_at", "cloud_trained_at"):
+            sample.pop(key, None)
+    if done and not dry_run:
+        _save_ai_training_index(idx)
+    return done, skipped
+
+
+@app.route("/ai-classify-unclassify", methods=["GET"])
+def ai_classify_unclassify():
+    """JSON. `ids=a,b,c` or `all=<filter>` (same as /ai-classify-save);
+    `dry=1` returns the counts without changing anything (the page's
+    confirm popup uses it to say how many would be skipped)."""
+    all_filter = request.args.get("all")
+    idx = _load_ai_training_index()
+    if _ai_bulk_filter_ok(all_filter):
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
+    else:
+        ids = [i for i in request.args.get("ids", "").split(",") if i]
+    if not ids:
+        return jsonify({"ok": False, "error": "missing ids"}), 400
+    dry = request.args.get("dry") == "1"
+    done, skipped = _unclassify_ai_samples(ids, dry_run=dry)
+    if done and not dry:
+        _log_event("Settings", f"AI Learning: unclassified {done} sample(s) from the classify page")
+    idx = _load_ai_training_index()
+    return jsonify({"ok": True, "dry": dry, "unclassified": done, "skipped_no_image": skipped,
+                     "unlabeled_count": sum(1 for s in idx["samples"] if s.get("label") is None),
+                     "total_count": len(idx["samples"])})
+
+
+def _import_ai_training_image(data, filename, label=None):
+    """Adds one uploaded All Sky image as an image-only training sample
+    (source=AI_IMPORT_SOURCE, empty sensor snapshot - see
+    _sensor_training_label(), which keeps it out of AI Sky Prediction).
+    JPEGs are stored byte-for-byte; anything else Pillow can read (PNG...)
+    is converted to JPEG, since the export zip and image routes assume
+    .jpg. `ts` is the import time, so unlabeled-retention counts from
+    then. Returns ("imported"|"duplicate"|"rejected", message)."""
+    if not data:
+        return "rejected", "empty file"
+    if len(data) > AI_IMPORT_MAX_BYTES:
+        return "rejected", f"larger than {AI_IMPORT_MAX_BYTES // (1024 * 1024)} MB"
+    digest = hashlib.sha1(data).hexdigest()
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format
+            img.load()
+            if fmt != "JPEG":
+                out = io.BytesIO()
+                img.convert("RGB").save(out, "JPEG", quality=92)
+                data = out.getvalue()
+    except Exception:
+        return "rejected", "not a readable image"
+    with _ai_import_lock:
+        idx = _load_ai_training_index()
+        if any(s.get("import_sha1") == digest for s in idx["samples"]):
+            return "duplicate", "already imported"
+        os.makedirs(AI_TRAINING_IMAGES_DIR, exist_ok=True)
+        now = time.time()
+        sample_id = f"imp_{time.strftime('%Y%m%d_%H%M%S', time.localtime(now))}_{uuid.uuid4().hex[:8]}"
+        fname = f"{sample_id}.jpg"
+        with open(os.path.join(AI_TRAINING_IMAGES_DIR, fname), "wb") as f:
+            f.write(data)
+        sample = {"id": sample_id, "ts": now, "image": fname, "label": label, "sensors": {},
+                  "source": AI_IMPORT_SOURCE, "import_name": os.path.basename(filename or "")[:120],
+                  "import_sha1": digest}
+        if label:
+            sample["labeled_at"] = now
+        idx["samples"].append(sample)
+        _save_ai_training_index(idx)
+    return "imported", sample_id
+
+
+_ai_import_lock = threading.Lock()
+
+
+@app.route("/ai-classify-import", methods=["POST"])
+def ai_classify_import():
+    """Classify page "Import images" popup - multipart `files` (the page
+    sends one per request so it can show progress) plus an optional
+    `label` (blank = classify later). JSON with per-outcome counts."""
+    label = (request.form.get("label") or "").strip() or None
+    if label is not None:
+        label_classes = [c.strip() for c in get_setting("ai_learning").get("label_classes", "").split(",") if c.strip()]
+        if label not in label_classes:
+            return jsonify({"ok": False, "error": f"unknown label: {label}"}), 400
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"ok": False, "error": "no files uploaded"}), 400
+    counts = {"imported": 0, "duplicate": 0, "rejected": 0}
+    errors = []
+    for f in files:
+        outcome, msg = _import_ai_training_image(f.read(), f.filename, label)
+        counts[outcome] += 1
+        if outcome == "rejected":
+            errors.append(f"{f.filename}: {msg}")
+    if counts["imported"]:
+        _log_event("Settings", f"AI Learning: imported {counts['imported']} image(s) on the classify page"
+                               + (f" as {label}" if label else ""))
+    return jsonify({"ok": True, **counts, "errors": errors})
 
 
 @app.route("/ai-classify-set-sensor-label", methods=["GET"])
@@ -8937,7 +9102,7 @@ def ai_classify_delete():
     the existing /ai-classify-delete-classified (which only ever touches
     LABELED samples) - this one respects whichever filter is showing."""
     all_filter = request.args.get("all")
-    if all_filter in ("unclassified", "all") or (all_filter or "").startswith("label:"):
+    if _ai_bulk_filter_ok(all_filter):
         idx = _load_ai_training_index()
         ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
     else:
@@ -9294,6 +9459,15 @@ def _ai_classify_chips_html(sensors):
     return "".join(f'<span class="ai-chip">{c}</span>' for c in chips)
 
 
+def _ai_classify_card_chips_html(sample):
+    """A card's chip row: the sensor chips for a captured sample, or an
+    "Image only - imported" marker for an imported one (no sensors)."""
+    if _is_imported_sample(sample):
+        return ('<span class="ai-chip ai-chip-imported">&#128247; Image only &middot; imported</span>'
+                '<span class="ai-chip">No sensor data</span>')
+    return _ai_classify_chips_html(sample.get("sensors") or {})
+
+
 def _ai_sensor_label_row_html(sample, label_classes):
     """The Classify page's secondary "sensor training label" control,
     rendered only under a sample whose main label is "Ignore" (see
@@ -9307,8 +9481,8 @@ def _ai_sensor_label_row_html(sample, label_classes):
     Same button set as the main label row, minus "Ignore" itself -
     setting it to Ignore would just mean "leave unset", which is already
     the default. Returns "" for any sample not labeled Ignore."""
-    if (sample.get("label") or "").strip().lower() != "ignore":
-        return ""
+    if (sample.get("label") or "").strip().lower() != "ignore" or _is_imported_sample(sample):
+        return ""  # an import has no sensor readings to give a sensor label to
     sid = sample["id"]
     current = sample.get("sensor_label")
     options = [c for c in label_classes if c.strip().lower() != "ignore"]
@@ -9337,7 +9511,7 @@ def _render_ai_classify_card(sample, tz, label_classes):
     ts = sample.get("ts", 0)
     time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
                 if ts else "Unknown time")
-    chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
+    chips_html = _ai_classify_card_chips_html(sample)
     sensor_row_html = _ai_sensor_label_row_html(sample, label_classes)
 
     # A sample's image is deliberately deleted once it's been absorbed into
@@ -9382,7 +9556,7 @@ def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
     ts = sample.get("ts", 0)
     time_str = (_format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M:%S %p"))
                 if ts else "Unknown time")
-    chips_html = _ai_classify_chips_html(sample.get("sensors") or {})
+    chips_html = _ai_classify_card_chips_html(sample)
     sensor_row_html = _ai_sensor_label_row_html(sample, label_classes)
     # See _render_ai_classify_card()'s comment above - same reasoning here.
     if sample.get("image"):
@@ -9399,7 +9573,10 @@ def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
   <div class="ai-card-time">{time_str}</div>
   <div class="ai-card-chips">{chips_html}</div>
   {sensor_row_html}
-  <button type="button" class="btn ai-delete-btn" onclick="deleteSingle()">🗑 Delete this image</button>
+  <div class="ai-single-actions">
+    {'<button type="button" class="btn ai-unclassify-btn" onclick="unclassifySingle()">↩ Unclassify</button>' if label else ''}
+    <button type="button" class="btn ai-delete-btn" onclick="deleteSingle()">🗑 Delete this image</button>
+  </div>
 </div>"""
 
 
@@ -9408,7 +9585,8 @@ def ai_classify_page():
     ai_cfg = get_setting("ai_learning")
     label_classes = [c.strip() for c in ai_cfg.get("label_classes", "").split(",") if c.strip()]
     show = request.args.get("show", "unclassified")
-    if show not in ("unclassified", "all") and not (show.startswith("label:") and show[len("label:"):] in label_classes):
+    if show not in ("unclassified", "all", "source:imported", "source:captured") and not (
+            show.startswith("label:") and show[len("label:"):] in label_classes):
         show = "unclassified"
     view = request.args.get("view", "grid")
     if view not in ("grid", "single"):
@@ -9426,6 +9604,9 @@ def ai_classify_page():
     all_samples = idx["samples"]
     total_count = len(all_samples)
     unlabeled_count = sum(1 for s in all_samples if s.get("label") is None)
+    imported_count = sum(1 for s in all_samples if _is_imported_sample(s))
+    source_split_html = (f" ({total_count - imported_count} captured &middot; {imported_count} imported)"
+                         if imported_count else "")
     # Same plain directory stat shown under Settings -> AI Learning, also
     # surfaced here since this is where you'd actually act on it
     # (compress/delete/download) rather than just read about it.
@@ -9481,6 +9662,9 @@ def ai_classify_page():
     show_options = "".join(
         f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
         for v, t in [("unclassified", "Unclassified only"), ("all", "All samples")])
+    show_options += "<optgroup label='By source'>" + "".join(
+        f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
+        for v, t in [("source:captured", "Captured only"), ("source:imported", "Imported only")]) + "</optgroup>"
     if label_classes:
         show_options += "<optgroup label='By label'>" + "".join(
             f"<option value='label:{c}'{' selected' if show == f'label:{c}' else ''}>{c}</option>"
@@ -9505,14 +9689,22 @@ def ai_classify_page():
     grid_controls_html = ('<button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>'
                            f'{select_all_matching_html}'
                            '<button type="button" class="btn" onclick="selectAll(false)">Clear selection</button>'
-                           '<button type="button" class="btn ai-delete-btn" onclick="deleteSelected()">Delete selected</button>'
+                           + ('<span class="btn ai-nav-btn-disabled" title="Nothing here is classified">↩ Unclassify selected</span>'
+                              if show == "unclassified" else
+                              '<button type="button" class="btn ai-unclassify-btn" onclick="unclassifySelected()">↩ Unclassify selected</button>')
+                           + '<button type="button" class="btn ai-delete-btn" onclick="deleteSelected()">Delete selected</button>'
                            if view == "grid" else "")
+    import_button_html = '<button type="button" class="btn ai-upload-btn" onclick="openImport()">⇧ Import images</button>'
+    import_label_options_html = '<option value="">Classify later (unclassified)</option>' + "".join(
+        f'<option value="{_html_escape(c)}">{_html_escape(c)}</option>' for c in label_classes)
+
 
     instructions_html = (
         'Pick a label from the row below, then click one or more images to select them ("Select all '
         'shown" picks just this page; <b>Select ALL</b> spans every page matching the current filter), '
-        'then click the label — it applies to every image you\'ve selected at once, '
-        'or use <b>Delete selected</b> to remove them instead. Sorted oldest-first so a run of '
+        'then click the label — it applies to every image you\'ve selected at once. '
+        '<b>Unclassify selected</b> sends already-labeled images back to unclassified, '
+        'and <b>Delete selected</b> removes them. Sorted oldest-first so a run of '
         'near-identical overnight frames sits together and can be classified in one go.'
         if view == "grid" else
         'Viewing one image at a time — clicking a label classifies it and automatically moves on to the '
@@ -9584,6 +9776,7 @@ def ai_classify_page():
     ignore_unassigned_count = sum(
         1 for sample in all_samples
         if (sample.get("label") or "").strip().lower() == "ignore" and _sensor_training_label(sample) is None
+        and not _is_imported_sample(sample)
     )
     eligibility_html = "".join(
         f'<span class="ai-chip">{c}: {effective_counts.get(c, 0)}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</span>'
@@ -9811,6 +10004,24 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .ai-sensor-note{{color:var(--muted);font-style:italic;}}
 .ai-sensor-note-set{{color:#1f7a3f;font-style:normal;font-weight:600;}}
 .ai-sensor-clear{{margin-left:6px;color:#c0392b;font-size:11px;}}
+.ai-unclassify-btn{{background:#b26a00;}}
+.ai-single-actions{{display:flex;gap:8px;justify-content:center;margin-top:10px;}}
+.ai-single-actions .ai-delete-btn{{margin-top:0;}}
+.ai-chip-imported{{background:#e3f2fd;color:#1565c0;font-weight:700;}}
+.ai-modal-back{{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:50;padding:16px;}}
+.ai-modal-back.open{{display:flex;}}
+.ai-modal{{background:#fff;border-radius:14px;padding:16px 20px;max-width:540px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.3);max-height:90vh;overflow:auto;}}
+.ai-modal-head{{display:flex;align-items:center;}}
+.ai-modal-head h3{{flex:1;margin:0;font-size:16px;}}
+.ai-modal-x{{background:none;border:none;font-size:22px;color:var(--muted);cursor:pointer;}}
+.ai-modal ul{{margin:8px 0 12px;padding-left:20px;font-size:13.5px;line-height:1.5;}}
+.ai-modal-btns{{display:flex;gap:8px;justify-content:flex-end;margin-top:12px;}}
+.btn-sec{{background:#fff;color:#333;border:1px solid #c9ced6;}}
+.ai-drop{{border:2px dashed #9aa5b1;border-radius:12px;padding:20px;text-align:center;color:var(--muted);background:#fafbfc;margin:12px 0;}}
+.ai-drop.over{{border-color:var(--accent);background:#eef6f2;}}
+.ai-import-note{{background:#f5f7fa;border-radius:8px;padding:8px 10px;font-size:13px;color:var(--muted);}}
+.ai-progress{{height:8px;background:#e2e5ea;border-radius:4px;margin:12px 0 4px;display:none;}}
+.ai-progress > div{{height:8px;width:0;background:var(--accent);border-radius:4px;}}
 a{{color:var(--accent);}}
 </style></head><body>
 
@@ -9818,7 +10029,7 @@ a{{color:var(--accent);}}
 
 <div class="card">
   <p class="card-title">📊 Training data overview</p>
-  <p class="hint" style="margin:0;">Samples collected so far: <b>{total_count}</b>
+  <p class="hint" style="margin:0;">Samples collected so far: <b>{total_count}</b>{source_split_html}
   ({unlabeled_count} not yet classified) — training images folder: <b>{ai_images_size_str}</b>
   across {ai_images_count} image(s).</p>
 </div>
@@ -9827,7 +10038,7 @@ a{{color:var(--accent);}}
   <p class="card-title">🤖 AI Sky Prediction(Sensor Based)</p>
   <p class="hint" id="modelStatus">{model_status_html}</p>
   <p class="hint">Classified so far, per label (need at least {AI_MODEL_MIN_SAMPLES_PER_CLASS} of each to
-  train): {eligibility_html}{ignore_unassigned_note_html}</p>
+  train): {eligibility_html}{ignore_unassigned_note_html}{" <span class='hint'>Imported images are never counted here (no sensor data).</span>" if imported_count else ""}</p>
   <button type="button" class="btn" onclick="trainModel()">Train model now</button>
   {reset_model_html}
   {sensor_data_delete_html}
@@ -9878,6 +10089,7 @@ a{{color:var(--accent);}}
     <button type="submit" class="btn">Filter</button>
     {view_toggle_html}
     {grid_controls_html}
+    {import_button_html}
   </form>
   <div class="toolbar">{label_buttons_html}</div>
   <p id="classifyStatus"></p>
@@ -9887,6 +10099,173 @@ a{{color:var(--accent);}}
  if view == "grid" else
  '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
 
+
+<div class="ai-modal-back" id="unclassifyModal" onclick="if(event.target===this)closeModal('unclassifyModal')">
+  <div class="ai-modal" role="dialog" aria-modal="true">
+    <div class="ai-modal-head"><h3 id="unclassifyTitle">Unclassify</h3>
+      <button type="button" class="ai-modal-x" onclick="closeModal('unclassifyModal')" aria-label="Close">&times;</button></div>
+    <ul id="unclassifyList"></ul>
+    <div class="ai-modal-btns"><button type="button" class="btn btn-sec" onclick="closeModal('unclassifyModal')">Cancel</button>
+      <button type="button" class="btn ai-unclassify-btn" id="unclassifyGo">Unclassify</button></div>
+  </div>
+</div>
+
+<div class="ai-modal-back" id="importModal" onclick="if(event.target===this && !importBusy)closeModal('importModal')">
+  <div class="ai-modal" role="dialog" aria-modal="true">
+    <div class="ai-modal-head"><h3>Import All Sky images</h3>
+      <button type="button" class="ai-modal-x" onclick="if(!importBusy)closeModal('importModal')" aria-label="Close">&times;</button></div>
+    <div class="ai-drop" id="importDrop">📁 Drop images here, or
+      <label class="btn btn-sec" for="importFiles" style="display:inline-block">Choose files…</label>
+      <input type="file" id="importFiles" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple style="display:none" onchange="setImportFiles(this.files)">
+      <br><span class="hint">JPG / PNG &middot; many at once &middot; max {AI_IMPORT_MAX_BYTES // (1024 * 1024)} MB each &middot; duplicates skipped</span></div>
+    <p class="hint" id="importSelected">No files selected.</p>
+    <p style="margin:8px 0"><b>Label as:</b> <select id="importLabel">{import_label_options_html}</select></p>
+    <p class="ai-import-note">🔒 Used for <b>AI Cloud Detect (All Sky)</b> only. Imports have no sensor readings,
+    so <b>AI Sky Prediction (Sensor Based)</b> never trains on them.</p>
+    <div class="ai-progress" id="importProgress"><div></div></div>
+    <p class="hint" id="importStatus" style="margin:0"></p>
+    <div class="ai-modal-btns"><button type="button" class="btn btn-sec" id="importCancel" onclick="closeModal('importModal')">Cancel</button>
+      <button type="button" class="btn" id="importGo" onclick="runImport()" disabled>Import</button></div>
+  </div>
+</div>
+
+<script>
+const aiShowFilter = {json.dumps(show)};
+function openModal(id) {{ document.getElementById(id).classList.add('open'); }}
+function closeModal(id) {{ document.getElementById(id).classList.remove('open'); }}
+document.addEventListener('keydown', e => {{
+  if (e.key !== 'Escape') return;
+  closeModal('unclassifyModal');
+  if (!importBusy) closeModal('importModal');
+}});
+// Unclassify: dry-run first so the popup can say how many will be skipped
+// (images already deleted after training can't be re-labeled), then commit.
+function showUnclassify(query, onDone) {{
+  const status = document.getElementById('classifyStatus');
+  fetch('/ai-classify-unclassify?dry=1&' + query)
+    .then(r => r.json())
+    .then(d => {{
+      if (!d.ok) {{ status.textContent = 'Failed: ' + (d.error || 'unknown error'); return; }}
+      const total = d.unclassified + d.skipped_no_image;
+      if (!total) {{ status.textContent = 'None of the selected images are classified.'; return; }}
+      document.getElementById('unclassifyTitle').textContent = 'Unclassify ' + total + ' image(s)?';
+      let items = '';
+      if (d.unclassified) items += '<li><b>' + d.unclassified + '</b> go back to <b>Unclassified only</b> ' +
+        '(labels removed, sensor readings kept).</li>';
+      if (d.skipped_no_image) items += '<li><b>' + d.skipped_no_image + '</b> skipped: the image was already ' +
+        'deleted, so it couldn&#39;t be re-labeled. <span class="hint">(Delete it instead if the label is wrong.)</span></li>';
+      items += '<li>The trained models don&#39;t change until the next <b>Train</b>.</li>';
+      document.getElementById('unclassifyList').innerHTML = items;
+      const go = document.getElementById('unclassifyGo');
+      go.textContent = 'Unclassify ' + d.unclassified;
+      go.disabled = !d.unclassified;
+      go.onclick = () => {{
+        go.disabled = true;
+        fetch('/ai-classify-unclassify?' + query)
+          .then(r => r.json())
+          .then(r2 => {{
+            closeModal('unclassifyModal');
+            if (!r2.ok) {{ status.textContent = 'Failed: ' + (r2.error || 'unknown error'); return; }}
+            onDone(r2);
+          }})
+          .catch(err => {{ closeModal('unclassifyModal'); status.textContent = 'Failed: ' + err; }});
+      }};
+      openModal('unclassifyModal');
+    }})
+    .catch(err => {{ status.textContent = 'Failed: ' + err; }});
+}}
+function unclassifySelected() {{
+  const status = document.getElementById('classifyStatus');
+  if (selectAllMode) {{
+    showUnclassify('all=' + encodeURIComponent(aiShowFilter), d => {{
+      status.textContent = 'Unclassified ' + d.unclassified + ' image(s). Reloading...';
+      window.location.reload();
+    }});
+    return;
+  }}
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
+  if (ids.length === 0) {{ status.textContent = 'Select at least one image first.'; return; }}
+  showUnclassify('ids=' + encodeURIComponent(ids.join(',')), d => {{
+    status.textContent = 'Unclassified ' + d.unclassified + ' image(s)' +
+      (d.skipped_no_image ? (', ' + d.skipped_no_image + ' skipped (no image)') : '') + '. Reloading...';
+    window.location.reload();
+  }});
+}}
+function unclassifySingle() {{
+  const card = document.getElementById('singleCard');
+  if (!card) return;
+  showUnclassify('ids=' + encodeURIComponent(card.dataset.id), d => {{ window.location.reload(); }});
+}}
+// Import: one file per request so the progress bar can move and one bad
+// file never sinks the whole batch.
+let importFiles = [];
+let importBusy = false;
+function openImport() {{
+  importFiles = [];
+  document.getElementById('importFiles').value = '';
+  document.getElementById('importSelected').textContent = 'No files selected.';
+  document.getElementById('importStatus').textContent = '';
+  document.getElementById('importProgress').style.display = 'none';
+  document.getElementById('importGo').disabled = true;
+  document.getElementById('importGo').textContent = 'Import';
+  openModal('importModal');
+}}
+function setImportFiles(list) {{
+  importFiles = Array.from(list).filter(f => /[.](jpe?g|png)$/i.test(f.name) || ["image/jpeg", "image/png"].includes(f.type));
+  const mb = importFiles.reduce((a, f) => a + f.size, 0) / (1024 * 1024);
+  document.getElementById('importSelected').innerHTML = importFiles.length
+    ? ('Selected: <b>' + importFiles.length + ' file(s)</b> (' + mb.toFixed(1) + ' MB) &middot; ' +
+       '<a href="#" onclick="openImport();return false;">clear</a>')
+    : 'No JPG / PNG files selected.';
+  const go = document.getElementById('importGo');
+  go.disabled = !importFiles.length;
+  go.textContent = importFiles.length ? ('Import ' + importFiles.length + ' image(s)') : 'Import';
+}}
+(function () {{
+  const drop = document.getElementById('importDrop');
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {{ e.preventDefault(); drop.classList.add('over'); }}));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {{ e.preventDefault(); drop.classList.remove('over'); }}));
+  drop.addEventListener('drop', e => setImportFiles(e.dataTransfer.files));
+}})();
+async function runImport() {{
+  if (!importFiles.length || importBusy) return;
+  importBusy = true;
+  const label = document.getElementById('importLabel').value;
+  const go = document.getElementById('importGo'), cancel = document.getElementById('importCancel');
+  const bar = document.getElementById('importProgress'), status = document.getElementById('importStatus');
+  go.disabled = true; cancel.disabled = true;
+  bar.style.display = 'block';
+  const tally = {{ imported: 0, duplicate: 0, rejected: 0 }};
+  const errors = [];
+  for (let i = 0; i < importFiles.length; i++) {{
+    status.textContent = 'Importing ' + (i + 1) + ' of ' + importFiles.length + '...';
+    const fd = new FormData();
+    fd.append('files', importFiles[i]);
+    fd.append('label', label);
+    try {{
+      const r = await fetch('/ai-classify-import', {{ method: 'POST', body: fd }});
+      const d = await r.json();
+      if (d.ok) {{ tally.imported += d.imported; tally.duplicate += d.duplicate; tally.rejected += d.rejected;
+                  errors.push(...(d.errors || [])); }}
+      else {{ tally.rejected++; errors.push(importFiles[i].name + ': ' + (d.error || 'failed')); }}
+    }} catch (err) {{ tally.rejected++; errors.push(importFiles[i].name + ': ' + err); }}
+    bar.firstElementChild.style.width = Math.round(100 * (i + 1) / importFiles.length) + '%';
+  }}
+  importBusy = false;
+  cancel.disabled = false;
+  let msg = '✓ ' + tally.imported + ' imported';
+  if (tally.duplicate) msg += ', ' + tally.duplicate + ' duplicate(s) skipped';
+  if (tally.rejected) msg += ', ' + tally.rejected + ' rejected';
+  if (errors.length || tally.duplicate) {{
+    status.innerHTML = msg + '.' + (errors.length ? '<br>' : '') + errors.slice(0, 5).map(e => e.replace(/</g, '&lt;')).join('<br>');
+    cancel.textContent = 'Close';
+    cancel.onclick = () => window.location.reload();
+    return;
+  }}
+  status.textContent = msg + '. Reloading...';
+  window.location.reload();
+}}
+</script>
 <script>
 // Grid view only (null in single view, where #aiGrid doesn't exist): the
 // URL of the next page, or null if this is already the last one - used to
