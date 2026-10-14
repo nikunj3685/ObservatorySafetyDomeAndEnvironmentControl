@@ -92,3 +92,17 @@ sudo systemctl restart dome-safety.service
 ```
 
 Passwordless sudo for restart/reboot (used by the Settings page's Service Control buttons) needs a one-time `visudo` entry - `install.sh` prints the exact line for your setup at the end of its run; otherwise see the hint text on that section of the Settings page.
+
+## Remote access (from outside your home network)
+
+Use [Tailscale](https://tailscale.com) on the Pi and your own devices — do **not** port-forward 11112 on your router.
+
+- Requests from the Pi itself or your home network: no login, exactly as before.
+- Requests from outside (Tailscale `100.64.0.0/10` / `fd7a:115c:a1e0::/48`, or anything public): username + password,
+  then a 6-digit code emailed to you, then full access. "Trust this browser" keeps you signed in for 7 days (configurable).
+- ASCOM Alpaca (`/api/…`, `/management/…`) is refused from outside; NINA on the observatory LAN is unaffected.
+- **Settings → Remote Access** (shown and saveable only from home): username, password, the email for codes
+  (Gmail: `smtp.gmail.com`, port 587, with a Google *App password*), trust days, "Send test email", "Sign out all
+  remote sessions". Passwords are stored only as scrypt hashes in `dome_config.json`.
+- Default username `admin`; change the default password from home after setup. Sign-ins and failures are logged
+  under the **Security** category on the Logs page.

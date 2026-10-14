@@ -49,12 +49,18 @@ page at http://<pi-ip>:11112/ and http://<pi-ip>:11112/config.
 """
 
 import hashlib
+import hmac
 import io
+import ipaddress
 import json
 import math
 import os
+import re
+import secrets
 import shutil
+import smtplib
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -63,13 +69,15 @@ import traceback
 import urllib.parse
 import uuid
 import zipfile
+from email.message import EmailMessage
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from html import escape as _html_escape
 from zoneinfo import ZoneInfo, available_timezones
 
 import requests
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, session, has_request_context
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Running under systemd, stdout is a pipe rather than a TTY, and Python's
 # default buffering for a non-TTY stream is fully-buffered (not
@@ -509,6 +517,24 @@ DEFAULT_SETTINGS = {
     # can be switched off from Settings to stop accumulating images for
     # that event, or the master switch can be turned off to stop all image
     # capture in one place.
+    # Remote Access (see the REMOTE ACCESS block near the Flask app): login
+    # + emailed code for requests from outside the home network. The
+    # default password ships ONLY as this scrypt hash (no plain text
+    # anywhere) - change it from Settings -> Remote Access at home. Every
+    # field here is edited only from the home network.
+    "remote_access": {
+        "enabled": True,
+        "username": "admin",
+        "password_hash": "scrypt:32768:8:1$OrRmS5DCB25YmyS5$987d8f1941bd1f5bb91026358874fea96cef87b34f059f082d13e305abaf19ea277273656ff48f9561f5bf8d385076e1e57f1ac4691a6351346dd061ad198ee7",
+        "email_to": "",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_user": "",
+        "smtp_password": "",
+        "trust_days": 7,
+        "session_epoch": 0,
+        "secret_key": "",
+    },
     "logging": {
         "image_retention_days": 30,
         "log_retention_days": 90,
@@ -587,7 +613,7 @@ manual_heater_power_percent = 0  # 0-100, used only in MANUAL
 # ==========================================================================
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_IMAGES_DIR = os.path.join(LOGS_DIR, "images")
-LOG_CATEGORIES = ["Safety", "Dome", "Heater", "Settings", "Service"]
+LOG_CATEGORIES = ["Safety", "Dome", "Heater", "Settings", "Service", "Security"]
 LOG_CLEANUP_INTERVAL_SEC = 3600  # re-check retention at most once an hour
 
 # AI Learning (Phase 1) - a separate tree from LOGS_DIR/LOG_IMAGES_DIR above,
@@ -4972,6 +4998,355 @@ OBS_UNIQUE_ID = get_unique_id("obs")
 # FLASK APP
 # ==========================================================================
 app = Flask(__name__)
+
+
+# ==========================================================================
+# REMOTE ACCESS - two-step login for requests from OUTSIDE the home network
+# (Tailscale 100.64.0.0/10 / fd7a:115c:a1e0::/48, or anything not private).
+# Requests from the Pi itself or the home LAN never see any of this. From
+# outside: username + password, then a 6-digit code emailed to the address
+# set under Settings -> Remote Access, then full access for the session.
+# The Remote Access settings themselves (and their save/test routes) are
+# hidden from, and refused for, outside requests even when signed in, so a
+# stolen session can never change the password or the code email. ASCOM
+# Alpaca (/api/, /management/) is refused from outside - NINA at the
+# observatory is on the LAN and unaffected. Passwords are only ever stored
+# as werkzeug scrypt hashes in dome_config.json (gitignored).
+# ==========================================================================
+RA_TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+RA_TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+RA_CODE_TTL_SEC = 300          # emailed code lifetime
+RA_CODE_MAX_TRIES = 3          # wrong codes before starting over from the password
+RA_RESEND_MIN_SEC = 30         # minimum gap between code emails
+RA_FAIL_LIMIT = 5              # wrong password/code attempts per address ...
+RA_FAIL_WINDOW_SEC = 15 * 60   # ... within this window -> blocked for the same window
+RA_UNTRUSTED_SESSION_SEC = 12 * 3600  # "trust this browser" unchecked
+# Paths an outside request may reach before signing in.
+RA_PUBLIC_PATHS = {"/login", "/login/code", "/login/resend", "/logout"}
+# Paths only ever served to the home network (Remote Access settings).
+RA_LOCAL_ONLY_PATHS = {"/remote-access-save", "/remote-access-test-email", "/remote-access-signout-all"}
+
+_ra_lock = threading.Lock()
+_ra_failures = {}   # ip -> [failure timestamps]
+_ra_pending = {}    # token -> {"user","code","exp","tries","ip","sent_at","next"}
+
+
+def _ra_client_ip():
+    """The connecting address. There's no reverse proxy in front of this
+    service, so remote_addr is the real peer and X-Forwarded-For (which a
+    client could forge) is deliberately ignored."""
+    return request.remote_addr or ""
+
+
+def _ra_ip_is_local(ip_str):
+    """True for the Pi itself and the home network; False for Tailscale
+    (CGNAT 100.64/10 + its IPv6 ULA) and anything public. Unparseable ->
+    treated as outside (fail closed)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return True
+    if (ip.version == 4 and ip in RA_TAILSCALE_V4) or (ip.version == 6 and ip in RA_TAILSCALE_V6):
+        return False
+    return ip.is_private or ip.is_link_local
+
+
+def _ra_request_is_remote():
+    return has_request_context() and not _ra_ip_is_local(_ra_client_ip())
+
+
+def _ra_cfg():
+    return get_setting("remote_access")
+
+
+def _ra_secret_key():
+    """Per-install random key that signs the session cookie - generated
+    once and kept in dome_config.json, so sessions survive restarts."""
+    key = _ra_cfg().get("secret_key")
+    if not key:
+        key = secrets.token_hex(32)
+        update_settings(lambda s: s["remote_access"].__setitem__("secret_key", key))
+    return key
+
+
+def _ra_blocked(ip):
+    now = time.time()
+    with _ra_lock:
+        recent = [t for t in _ra_failures.get(ip, []) if now - t < RA_FAIL_WINDOW_SEC]
+        _ra_failures[ip] = recent
+        return len(recent) >= RA_FAIL_LIMIT
+
+
+def _ra_note_failure(ip):
+    with _ra_lock:
+        _ra_failures.setdefault(ip, []).append(time.time())
+
+
+def _ra_signed_in():
+    cfg = _ra_cfg()
+    return (session.get("ra_ok") is True and session.get("ra_epoch") == cfg.get("session_epoch", 0)
+            and session.get("ra_exp", 0) > time.time())
+
+
+def _ra_email_configured(cfg=None):
+    cfg = cfg or _ra_cfg()
+    return all((cfg.get(k) or "").strip() for k in ("email_to", "smtp_host", "smtp_user", "smtp_password"))
+
+
+def _ra_mask_email(addr):
+    name, _, domain = (addr or "").partition("@")
+    if not domain:
+        return "your email"
+    return (name[:1] + "•" * max(1, len(name) - 2) + name[-1:] if len(name) > 2 else name[:1] + "•") + "@" + domain
+
+
+def _ra_send_email(subject, body, cfg=None):
+    """Sends one plain-text email via the SMTP settings (STARTTLS on 587,
+    implicit TLS on 465). Returns None on success or an error string."""
+    cfg = cfg or _ra_cfg()
+    if not _ra_email_configured(cfg):
+        return "Email for codes isn't set up yet (Settings → Remote Access, from your home network)."
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg["smtp_user"]
+    msg["To"] = cfg["email_to"]
+    msg.set_content(body)
+    try:
+        port = int(cfg.get("smtp_port") or 587)
+        ctx = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(cfg["smtp_host"], port, timeout=15, context=ctx) as smtp:
+                smtp.login(cfg["smtp_user"], cfg["smtp_password"])
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["smtp_host"], port, timeout=15) as smtp:
+                smtp.starttls(context=ctx)
+                smtp.login(cfg["smtp_user"], cfg["smtp_password"])
+                smtp.send_message(msg)
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def _ra_safe_next(nxt):
+    """Only same-site absolute paths - never an open redirect."""
+    if not nxt or not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
+        return "/"
+    return nxt
+
+
+def _ra_issue_code(user, ip, nxt):
+    """Creates (or replaces) this browser's pending code and emails it.
+    Returns an error string or None."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = time.time()
+    token = session.get("ra_pending")
+    with _ra_lock:
+        for t in [t for t, p in _ra_pending.items() if p["exp"] < now]:
+            _ra_pending.pop(t, None)
+        if not token or token not in _ra_pending:
+            token = secrets.token_urlsafe(24)
+        _ra_pending[token] = {"user": user, "code": code, "exp": now + RA_CODE_TTL_SEC, "tries": 0,
+                              "ip": ip, "sent_at": now, "next": nxt}
+    session["ra_pending"] = token
+    tz_name = get_setting("location").get("tz_name", "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    fmt = lambda t: datetime.fromtimestamp(t, tz).strftime("%I:%M %p").lstrip("0")
+    err = _ra_send_email(
+        f"Observatory sign-in code: {code}",
+        f"Your Observatory Control sign-in code is {code}.\n\n"
+        f"Requested from {ip} at {fmt(now)}; it expires at {fmt(now + RA_CODE_TTL_SEC)}.\n\n"
+        "If this wasn't you, someone knows your password - change it from your home network "
+        "(Settings -> Remote Access).\n")
+    if err:
+        with _ra_lock:
+            _ra_pending.pop(token, None)
+        session.pop("ra_pending", None)
+        _log_event("Security", f"Remote sign-in: could not email code to {_ra_mask_email(_ra_cfg().get('email_to'))} ({err})", severity="warn")
+    else:
+        _log_event("Security", f"Remote sign-in: password OK from {ip}, code emailed")
+    return err
+
+
+@app.before_request
+def _ra_gate():
+    """The one place outside requests are checked - every route, so a
+    hidden button is never the only protection."""
+    if _ra_ip_is_local(_ra_client_ip()):
+        return None
+    path = request.path
+    if path in RA_LOCAL_ONLY_PATHS:
+        return jsonify({"ok": False, "error": "Remote Access settings can only be changed from your home network."}), 403
+    if not _ra_cfg().get("enabled", True):
+        return None
+    if path.startswith("/api/") or path.startswith("/management/"):
+        return jsonify({"ErrorNumber": 1031, "ErrorMessage": "ASCOM Alpaca is not available from outside the home network",
+                        "ClientTransactionID": 0, "ServerTransactionID": 0, "Value": None}), 403
+    if path in RA_PUBLIC_PATHS:
+        return None
+    if _ra_signed_in():
+        return None
+    if request.method == "GET" and "text/html" in (request.headers.get("Accept") or ""):
+        nxt = request.full_path if request.query_string else path
+        return "", 302, {"Location": "/login?next=" + urllib.parse.quote(nxt, safe="")}
+    return jsonify({"ok": False, "error": "Sign in required"}), 401
+
+
+_RA_PAGE_CSS = """
+body{background:#f2f4f7;color:#1f2328;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;padding:16px;}
+.box{max-width:360px;margin:8vh auto 0;background:#fff;border-radius:14px;padding:22px 24px;box-shadow:0 6px 24px rgba(0,0,0,.12);}
+h1{font-size:20px;margin:0 0 4px;} .hint{font-size:13px;color:#6a7178;margin:0 0 10px;}
+label{display:block;font-size:13.5px;margin:12px 0 4px;color:#333;}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;font-size:15px;padding:8px 10px;border-radius:8px;border:1px solid #c9ced6;}
+input.code{text-align:center;letter-spacing:8px;font-size:22px;}
+.chk{display:flex;align-items:center;gap:8px;font-size:13.5px;margin:12px 0;}
+button{width:100%;margin-top:12px;padding:9px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-size:15px;font-weight:600;cursor:pointer;}
+.err{color:#c62828;font-size:13px;margin:10px 0 0;} .ok{color:#1a7f37;font-size:13px;margin:10px 0 0;}
+.links{font-size:13px;margin-top:12px;} .links form{display:inline;} .links button{all:unset;color:#2563eb;cursor:pointer;text-decoration:underline;}
+"""
+
+
+def _ra_page(title, inner):
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{title}</title>'
+            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<style>{_RA_PAGE_CSS}</style></head><body><div class="box">{inner}</div></body></html>')
+
+
+app.secret_key = _ra_secret_key()
+app.config.update(SESSION_COOKIE_NAME="obs_session", SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=timedelta(days=90))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def ra_login():
+    if not _ra_request_is_remote():
+        return "", 302, {"Location": "/"}
+    nxt = _ra_safe_next(request.values.get("next"))
+    if _ra_signed_in():
+        return "", 302, {"Location": nxt}
+    ip = _ra_client_ip()
+    cfg = _ra_cfg()
+    err = request.args.get("msg", "")
+    if request.method == "POST":
+        if _ra_blocked(ip):
+            err = "Too many wrong attempts from this address. Try again in 15 minutes."
+        else:
+            user = (request.form.get("username") or "").strip()
+            pw = request.form.get("password") or ""
+            try:
+                good = user == cfg.get("username") and check_password_hash(cfg.get("password_hash", ""), pw)
+            except Exception:
+                good = False
+            if not good:
+                _ra_note_failure(ip)
+                _log_event("Security", f"Remote sign-in: wrong username or password from {ip}", severity="warn")
+                err = "Wrong username or password."
+            elif not _ra_email_configured(cfg):
+                err = "Email for codes isn't set up yet — set it up under Settings → Remote Access from your home network."
+            else:
+                send_err = _ra_issue_code(user, ip, nxt)
+                if send_err:
+                    err = "Couldn't send the code email. Check the email settings from your home network."
+                else:
+                    return "", 302, {"Location": "/login/code"}
+    blocked_note = "" if not _ra_blocked(ip) else '<p class="err">This address is temporarily blocked.</p>'
+    return _ra_page("Sign in", f"""
+<h1>🔭 Observatory Control</h1><p class="hint">Remote access — please sign in.</p>
+<form method="post" action="/login">
+<input type="hidden" name="next" value="{_html_escape(nxt)}">
+<label for="u">Username</label><input type="text" id="u" name="username" autocomplete="username" autofocus required>
+<label for="p">Password</label><input type="password" id="p" name="password" autocomplete="current-password" required>
+<button type="submit">Next</button></form>
+{f'<p class="err">✗ {_html_escape(err)}</p>' if err else ''}{blocked_note}""")
+
+
+@app.route("/login/code", methods=["GET", "POST"])
+def ra_login_code():
+    if not _ra_request_is_remote():
+        return "", 302, {"Location": "/"}
+    token = session.get("ra_pending")
+    with _ra_lock:
+        pending = _ra_pending.get(token) if token else None
+    if not pending or pending["exp"] < time.time():
+        session.pop("ra_pending", None)
+        return "", 302, {"Location": "/login?msg=" + urllib.parse.quote("The code expired - sign in again.")}
+    ip = _ra_client_ip()
+    err = ""
+    info = request.args.get("info", "")
+    if request.method == "POST":
+        code = re.sub(r"\D", "", request.form.get("code") or "")
+        if _ra_blocked(ip):
+            err = "Too many wrong attempts from this address. Try again in 15 minutes."
+        elif hmac.compare_digest(code, pending["code"]):
+            with _ra_lock:
+                _ra_pending.pop(token, None)
+            trust = request.form.get("trust") == "on"
+            days = max(1, min(90, int(_ra_cfg().get("trust_days", 7) or 7)))
+            session.clear()
+            session.permanent = trust
+            session["ra_ok"] = True
+            session["ra_user"] = pending["user"]
+            session["ra_epoch"] = _ra_cfg().get("session_epoch", 0)
+            session["ra_exp"] = time.time() + (days * 86400 if trust else RA_UNTRUSTED_SESSION_SEC)
+            _log_event("Security", f"Remote sign-in: {pending['user']} signed in from {ip}"
+                                   + (f" (trusted for {days} days)" if trust else ""))
+            return "", 302, {"Location": _ra_safe_next(pending["next"])}
+        else:
+            _ra_note_failure(ip)
+            with _ra_lock:
+                pending["tries"] += 1
+                left = RA_CODE_MAX_TRIES - pending["tries"]
+                if left <= 0:
+                    _ra_pending.pop(token, None)
+            _log_event("Security", f"Remote sign-in: wrong code from {ip}", severity="warn")
+            if left <= 0:
+                session.pop("ra_pending", None)
+                return "", 302, {"Location": "/login?msg=" + urllib.parse.quote("Too many wrong codes - sign in again.")}
+            err = f"Wrong code ({left} {'try' if left == 1 else 'tries'} left)."
+    days = max(1, min(90, int(_ra_cfg().get("trust_days", 7) or 7)))
+    return _ra_page("Enter code", f"""
+<h1>Check your email</h1><p class="hint">We sent a 6-digit code to <b>{_html_escape(_ra_mask_email(_ra_cfg().get('email_to')))}</b>.
+It expires in {RA_CODE_TTL_SEC // 60} minutes.</p>
+<form method="post" action="/login/code">
+<label for="c">Code</label><input type="text" id="c" name="code" class="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" autofocus required>
+<label class="chk"><input type="checkbox" name="trust" checked> Trust this browser for {days} days</label>
+<button type="submit">Verify &amp; sign in</button></form>
+<div class="links"><form method="post" action="/login/resend"><button type="submit">Resend code</button></form> · <a href="/logout">Back</a></div>
+{f'<p class="err">✗ {_html_escape(err)}</p>' if err else ''}{f'<p class="ok">{_html_escape(info)}</p>' if info else ''}""")
+
+
+@app.route("/login/resend", methods=["POST"])
+def ra_login_resend():
+    if not _ra_request_is_remote():
+        return "", 302, {"Location": "/"}
+    token = session.get("ra_pending")
+    with _ra_lock:
+        pending = dict(_ra_pending[token]) if token in _ra_pending else None
+    if not pending:
+        return "", 302, {"Location": "/login"}
+    wait = RA_RESEND_MIN_SEC - (time.time() - pending["sent_at"])
+    if wait > 0:
+        return "", 302, {"Location": "/login/code?info=" + urllib.parse.quote(f"Please wait {int(wait) + 1} s before resending.")}
+    if _ra_issue_code(pending["user"], _ra_client_ip(), pending["next"]):
+        return "", 302, {"Location": "/login?msg=" + urllib.parse.quote("Couldn't send the code email.")}
+    return "", 302, {"Location": "/login/code?info=" + urllib.parse.quote("A new code was sent.")}
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def ra_logout():
+    if session.get("ra_ok"):
+        _log_event("Security", f"Remote sign-out: {session.get('ra_user')} from {_ra_client_ip()}")
+    session.clear()
+    return "", 302, {"Location": "/login" if _ra_request_is_remote() else "/"}
+
+
 safety_connected = False
 dome_connected = False
 obs_connected = False
@@ -7074,6 +7449,8 @@ h1{font-size:21px;margin:2px 0 2px;}
 .nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
 .nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
 .nav-restart:hover{background:#a71d1d;}
+.nav-remote{background:#e8f0fe;color:#1a56c4;border-radius:10px;padding:2px 9px;font-size:12px;font-weight:700;margin-right:4px;}
+.topnav a.nav-signout{padding:4px 8px;font-size:13px;font-weight:600;border-bottom:0;margin:0 6px 0 0;}
 """
 
 PAGE_HEADER_JS = """
@@ -7120,7 +7497,11 @@ def _page_header_html(active, unlabeled_count):
             + tab("settings", "/settings", "⚙ Settings")
             + tab("classify", "/ai-classify", f'🏷️ Classify (<span id="classifyCount">{unlabeled_count}</span>)')
             + tab("logs", "/logs", "🗒 Logs")
-            + '<span class="nav-sp"></span><span class="nav-restart-msg" id="hdrRestartMsg"></span>'
+            + '<span class="nav-sp"></span>'
+            + (f'<span class="nav-remote" title="Signed in from outside your home network">🌐 Remote · '
+               f'{_html_escape(session.get("ra_user") or "")}</span><a class="nav-signout" href="/logout">Sign out</a>'
+               if _ra_request_is_remote() and session.get("ra_ok") else '')
+            + '<span class="nav-restart-msg" id="hdrRestartMsg"></span>'
               '<button type="button" class="nav-restart" title="Restart service" aria-label="Restart service" '
               'onclick="hdrRestart()">&#8635;</button></nav>')
 
@@ -7137,6 +7518,140 @@ def _page_favicon_js(is_safe):
             "if(typeof d.overall_safe==='boolean' && d.overall_safe!==cur){cur=d.overall_safe;"
             "var el=document.getElementById('safetyFavicon');if(el)el.href=cur?S:U;}}).catch(function(){});}"
             "setInterval(tick,3000);})();</script>")
+
+
+def _remote_access_settings_html():
+    """Settings -> Remote Access group (home network only). Never echoes
+    the password hash or the SMTP password back into the page."""
+    cfg = _ra_cfg()
+    msg = request.args.get("ra_msg", "")
+    ok = request.args.get("ra_ok") == "1"
+    esc = lambda k: _html_escape(str(cfg.get(k) or ""))
+    smtp_pw_note = ("saved — leave blank to keep" if cfg.get("smtp_password") else "not set")
+    email_state = ("" if _ra_email_configured(cfg) else
+                   '<p class="hint hint-warn">Email for codes isn\'t set up yet — nobody can sign in from outside '
+                   'until it is (the password step works, but no code can be sent).</p>')
+    msg_html = (f'<p class="hint" style="color:{"var(--safe)" if ok else "var(--unsafe)"};font-weight:600">'
+                f'{"✓" if ok else "✗"} {_html_escape(msg)}</p>' if msg else "")
+    return f"""<div class="settings-group" id="remote-access">
+    <h3>Remote Access</h3>
+    <p class="hint" style="background:var(--safe-bg);color:var(--safe);border-radius:8px;padding:8px 10px">🏠 You're on your
+    <b>home network</b> ({_html_escape(_ra_client_ip())}) — no login needed here.</p>
+    <p class="hint">From outside your home network (Tailscale or anything else), every page asks for the username and
+    password, then a 6-digit code emailed to the address below. This section is only shown — and can only be saved —
+    from your home network.</p>
+    {msg_html}
+    <form action="/remote-access-save" method="post" autocomplete="off">
+      <label><input type="checkbox" name="enabled" {"checked" if cfg.get("enabled", True) else ""}> Require login + email code for outside access</label>
+      <p class="hint hint-warn">Unchecking this lets anyone who can reach the Pi from outside control everything with no login.</p>
+      <hr class="sep">
+      <label>Username</label>
+      <input type="text" name="username" value="{esc('username')}" required class="ra-in">
+      <label>New password <span class="hint">(leave blank to keep the current one)</span></label>
+      <input type="password" name="pw1" autocomplete="new-password" placeholder="at least 10 characters" class="ra-in">
+      <label>Confirm new password</label>
+      <input type="password" name="pw2" autocomplete="new-password" class="ra-in">
+      <p class="hint">No old password needed — you're on your home network. Stored only as a scrypt hash in
+      <code>dome_config.json</code>. Changing it signs out every outside session.</p>
+      <hr class="sep">
+      <label>Send codes to (email)</label>
+      <input type="email" name="email_to" value="{esc('email_to')}" class="ra-in">
+      <label>SMTP server</label>
+      <input type="text" name="smtp_host" value="{esc('smtp_host')}" class="ra-in">
+      <label>SMTP port</label>
+      <input type="number" name="smtp_port" value="{esc('smtp_port')}" min="1" max="65535" class="narrow-number">
+      <label>SMTP username (sending account)</label>
+      <input type="text" name="smtp_user" value="{esc('smtp_user')}" class="ra-in">
+      <label>SMTP app password <span class="hint">({smtp_pw_note})</span></label>
+      <input type="password" name="smtp_password" autocomplete="new-password" class="ra-in">
+      <p class="hint">Gmail: turn on 2-Step Verification, then create an <b>App password</b> (Google Account → Security →
+      App passwords) and paste it here — not your normal Gmail password. Server <code>smtp.gmail.com</code>, port 587.</p>
+      {email_state}
+      <hr class="sep">
+      <label>Trust a browser for this many days (when “Trust this browser” is ticked at sign-in)</label>
+      <input type="number" name="trust_days" value="{esc('trust_days')}" min="1" max="90" class="narrow-number">
+      <p class="hint">Unticked, a sign-in lasts 12 hours. 5 wrong passwords or codes from one address block it for 15 minutes.</p>
+      <div class="btn-row"><button type="submit" class="btn btn-safety">Save Remote Access</button>
+      <button type="button" class="btn btn-neutral" onclick="raPost('/remote-access-test-email')">Send test email</button>
+      <button type="button" class="btn btn-neutral" onclick="if(confirm('Sign out every browser signed in from outside?')) raPost('/remote-access-signout-all')">Sign out all remote sessions</button></div>
+      <p class="hint" id="raStatus"></p>
+    </form>
+    <script>
+    function raPost(url){{
+      var el=document.getElementById('raStatus'); el.textContent='Working...';
+      fetch(url,{{method:'POST'}}).then(function(r){{return r.json();}}).then(function(d){{
+        el.textContent=(d.ok?'✓ ':'✗ ')+(d.message||d.error||'');
+      }}).catch(function(e){{el.textContent='✗ '+e;}});
+    }}
+    </script>
+  </div>"""
+
+
+def _ra_settings_redirect(msg, ok):
+    return "", 302, {"Location": "/settings?ra_ok=" + ("1" if ok else "0") + "&ra_msg="
+                     + urllib.parse.quote(msg) + "#remote-access"}
+
+
+@app.route("/remote-access-save", methods=["POST"])
+def remote_access_save():
+    """Home network only (also enforced in _ra_gate()). POST, never GET, so
+    passwords never land in URLs or browser history."""
+    f = request.form
+    username = (f.get("username") or "").strip()
+    pw1, pw2 = f.get("pw1") or "", f.get("pw2") or ""
+    if not username:
+        return _ra_settings_redirect("Username can't be empty.", False)
+    if pw1 or pw2:
+        if pw1 != pw2:
+            return _ra_settings_redirect("The two new passwords don't match - nothing was saved.", False)
+        if len(pw1) < 10:
+            return _ra_settings_redirect("Password must be at least 10 characters - nothing was saved.", False)
+    try:
+        port = int(f.get("smtp_port") or 587)
+        trust_days = int(f.get("trust_days") or 7)
+    except ValueError:
+        return _ra_settings_redirect("Port and days must be numbers - nothing was saved.", False)
+    if not (1 <= port <= 65535) or not (1 <= trust_days <= 90):
+        return _ra_settings_redirect("Port must be 1-65535 and days 1-90 - nothing was saved.", False)
+    new_hash = generate_password_hash(pw1, method="scrypt") if pw1 else None
+    old = _ra_cfg()
+    signout = bool(new_hash) or username != old.get("username")
+
+    def patch(s):
+        ra = s["remote_access"]
+        ra["enabled"] = f.get("enabled") == "on"
+        ra["username"] = username
+        if new_hash:
+            ra["password_hash"] = new_hash
+        ra["email_to"] = (f.get("email_to") or "").strip()
+        ra["smtp_host"] = (f.get("smtp_host") or "").strip()
+        ra["smtp_port"] = port
+        ra["smtp_user"] = (f.get("smtp_user") or "").strip()
+        if f.get("smtp_password"):
+            ra["smtp_password"] = f.get("smtp_password")
+        ra["trust_days"] = trust_days
+        if signout:
+            ra["session_epoch"] = ra.get("session_epoch", 0) + 1
+    update_settings(patch)
+    _log_event("Security", "Remote Access settings saved from the home network"
+                           + (" (password changed, outside sessions signed out)" if new_hash else ""))
+    return _ra_settings_redirect("Saved." + (" Every outside session was signed out." if signout else ""), True)
+
+
+@app.route("/remote-access-test-email", methods=["POST"])
+def remote_access_test_email():
+    err = _ra_send_email("Observatory Control: test email",
+                         "This is a test from Settings -> Remote Access. Sign-in codes will arrive like this.")
+    if err:
+        return jsonify({"ok": False, "error": err})
+    return jsonify({"ok": True, "message": f"Test email sent to {_ra_mask_email(_ra_cfg().get('email_to'))}."})
+
+
+@app.route("/remote-access-signout-all", methods=["POST"])
+def remote_access_signout_all():
+    update_settings(lambda s: s["remote_access"].__setitem__("session_epoch", s["remote_access"].get("session_epoch", 0) + 1))
+    _log_event("Security", "All remote sessions signed out from the home network")
+    return jsonify({"ok": True, "message": "Every outside session is signed out."})
 
 
 @app.route("/", methods=["GET"])
@@ -7354,6 +7869,13 @@ def web_index():
         ("allsky-settings", "All Sky Camera"), ("ai-learning-settings", "AI Learning"),
         ("service-control", "Service Control"),
     ]
+    # Remote Access exists only for the home network - from outside it is
+    # left out of the menu and the page entirely (its save routes are also
+    # refused in _ra_gate()).
+    show_remote_access = not _ra_request_is_remote()
+    if show_remote_access:
+        SETTINGS_GROUPS.append(("remote-access", "Remote Access"))
+    remote_access_group_html = _remote_access_settings_html() if show_remote_access else ""
     settings_nav_html = ('<nav class="settings-nav" id="settingsNav">'
                          + "".join(f'<a href="#{gid}" data-g="{gid}">{_html_escape(label)}</a>' for gid, label in SETTINGS_GROUPS)
                          + '</nav>')
@@ -7480,6 +8002,7 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .btn-dome{{background:var(--accent-dome);color:#fff;}}
 .btn-heater{{background:var(--accent-heater);color:#fff;}}
 .btn-safety{{background:var(--accent-safety);color:#fff;}}
+.ra-in{{font-size:14px;padding:6px 8px;border-radius:6px;border:1px solid #ccc;width:100%;box-sizing:border-box;}}
 .btn:disabled{{opacity:.45;cursor:not-allowed;}}
 /* Used to grey out a whole settings section at once (the Dome schedule
    form, Heater thresholds form, and the reed/relay/MOSFET rows under
@@ -8100,6 +8623,8 @@ a{{color:var(--accent-safety);}}
     <p class="hint">(swap "admin" for whatever <code>User=</code> your dome-safety.service unit file uses,
     and confirm the systemctl path with <code>which systemctl</code>.)</p>
   </div>
+
+  {remote_access_group_html}
 
   </div>
   </div>
