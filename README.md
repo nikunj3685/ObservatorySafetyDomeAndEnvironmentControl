@@ -39,6 +39,7 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
 | `docs/handoff/` | Notes for resuming development in a new session. |
 | `tests/` | Automated tests - see "Tests" below. |
 | `hardware-tests/` | One-off hardware bring-up scripts used while wiring each sensor/actuator (`test_bme_mlx.py`, `test_dht_reed.py`, `test_mlx_oled.py`, `test_mosfet.py`, `test_relay.py`) - not part of the running service. |
+| `tools/recover_index.py` | Last-resort, read-only SD-card scan that recovers lost AI Learning samples (labels + sensor readings) - see Section 13 of the Setup Guide. |
 | `legacy/safety_aggregator.py` | An earlier prototype that only fused an ESP32 weather station's SafetyMonitor with simpleCloudDetect over the network - superseded by `dome_safety_service.py`. Kept for history. |
 
 ## Setup
