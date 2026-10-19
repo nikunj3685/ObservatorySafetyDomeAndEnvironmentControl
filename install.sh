@@ -25,7 +25,7 @@
 # Safe to re-run any time (e.g. after `git pull`-ing an update) - every
 # step below is idempotent and finishes with a service restart.
 #
-# See Observatory_Setup_Guide.docx for the hardware wiring (GPIO/I2C pin
+# See docs/Observatory_Setup_Guide.docx for the hardware wiring (GPIO/I2C pin
 # assignments) this script doesn't and can't handle for you.
 
 set -euo pipefail
@@ -229,6 +229,6 @@ echo " buttons work without a password prompt, run 'sudo visudo' and add:"
 echo
 echo "   $SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN restart dome-safety.service, $SYSTEMCTL_BIN reboot"
 echo
-echo " See Observatory_Setup_Guide.docx for GPIO/I2C wiring and every"
+echo " See docs/Observatory_Setup_Guide.docx for GPIO/I2C wiring and every"
 echo " Settings page in detail."
 echo "======================================================================"

@@ -25,18 +25,21 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
 
 ## Files
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `dome_safety_service.py` | The service - Alpaca server + web dashboard + logging, run continuously on the Pi. |
-| `Observatory_Setup_Guide.docx` | Full installation/setup guide - hardware prerequisites, installing and running the service, configuring every Settings section, connecting an ASCOM client, and publishing the project to GitHub. |
-| `preview_index.html` | A static snapshot of the dashboard's rendered HTML, for reference/preview only (not served by the app). |
-| `safety_aggregator.py` | An earlier prototype that only fused an ESP32 weather station's SafetyMonitor with simpleCloudDetect over the network - superseded by `dome_safety_service.py`, which reads all sensors directly off this Pi's own GPIO/I2C instead. Kept for history. |
-| `docker-compose.clouddetect.yml` | Compose file for running simpleCloudDetect itself (pointed at Allsky's captured image) alongside this service. |
-| `requirements.txt` | Pinned pip dependency list - `pip install -r requirements.txt`. |
-| `dome-safety.service` | Ready-to-copy systemd unit file - see "Running as a systemd service" below. |
+| `dome_safety_service.py` | The service - Alpaca server + web dashboard + logging, run continuously on the Pi. Stays at the top level: the systemd unit and the service's data folders (`ai_training/`, `logs/`, `dome_config.json`) live next to it. |
 | `install.sh` | One-shot installer - system packages, I2C enable, pip install (plus a best-effort `tflite-runtime`/`numpy` install for the Cloud Image Model gate), and a `dome-safety.service` generated for wherever you actually cloned this and whichever user runs it. `sudo bash install.sh`. |
-| `test_bme_mlx.py`, `test_dht_reed.py`, `test_mlx_oled.py`, `test_mosfet.py`, `test_relay.py` | One-off hardware bring-up scripts used while wiring each sensor/actuator - not part of the running service. |
+| `dome-safety.service` | Ready-to-copy systemd unit file - see "Running as a systemd service" below. |
+| `requirements.txt` | Pinned pip dependency list - `pip install -r requirements.txt`. |
 | `cloud-training-server/` | Standalone Windows-side server that trains the real image-classification sky model - see "Cloud training server" below and `cloud-training-server/README.md`. |
+| `docker/docker-compose.clouddetect.yml` | Compose file for running simpleCloudDetect itself (pointed at Allsky's captured image) alongside this service. Its config folder stays at `clouddetect-config/` in the top level. |
+| `docs/Observatory_Setup_Guide.docx` | Full installation/setup guide - hardware prerequisites, installing and running the service, configuring every Settings section, connecting an ASCOM client, and publishing the project to GitHub. |
+| `docs/previews/` | Static snapshots of the dashboard and Settings page HTML (`python3 tests/shot.py` regenerates them) - reference only, not served by the app. |
+| `docs/mockups/` | HTML mockups of each feature, made and approved before it was coded. |
+| `docs/handoff/` | Notes for resuming development in a new session. |
+| `tests/` | Automated tests - see "Tests" below. |
+| `hardware-tests/` | One-off hardware bring-up scripts used while wiring each sensor/actuator (`test_bme_mlx.py`, `test_dht_reed.py`, `test_mlx_oled.py`, `test_mosfet.py`, `test_relay.py`) - not part of the running service. |
+| `legacy/safety_aggregator.py` | An earlier prototype that only fused an ESP32 weather station's SafetyMonitor with simpleCloudDetect over the network - superseded by `dome_safety_service.py`. Kept for history. |
 
 ## Setup
 
@@ -59,7 +62,7 @@ All settings (location/timezone, which safety checks are enabled, schedule times
 
 ### All Sky camera overlay (optional)
 
-When **All Sky Camera** is enabled in Settings, this service can burn the current sensor readings onto the dashboard image and saved Event Log snapshots. To get the same readings inside Allsky's own gallery/view (not just here), set **Extra Text File path** to a file this service will keep rewritten every poll cycle, then point Allsky's own Settings → Overlay → "Extra Text File" field at that same path - Allsky bakes those lines into every frame it captures itself. A "Skip this service's own drawn overlay" checkbox avoids double-drawing once Allsky's overlay is doing the job. See Section 5.3 of `Observatory_Setup_Guide.docx` for full details, and its Troubleshooting FAQ if Allsky isn't picking up the readings.
+When **All Sky Camera** is enabled in Settings, this service can burn the current sensor readings onto the dashboard image and saved Event Log snapshots. To get the same readings inside Allsky's own gallery/view (not just here), set **Extra Text File path** to a file this service will keep rewritten every poll cycle, then point Allsky's own Settings → Overlay → "Extra Text File" field at that same path - Allsky bakes those lines into every frame it captures itself. A "Skip this service's own drawn overlay" checkbox avoids double-drawing once Allsky's overlay is doing the job. See Section 5.3 of `docs/Observatory_Setup_Guide.docx` for full details, and its Troubleshooting FAQ if Allsky isn't picking up the readings.
 
 ### AI Learning (optional)
 
@@ -67,7 +70,7 @@ The `/ai-classify` page captures a raw All Sky frame plus a full sensor snapshot
 
 Once trained, the model's prediction shows up on the dashboard as informational-only until you explicitly opt in - checking **AI Model check** under Settings → Safety Checks turns it into the SafetyMonitor gate described above (shown on the dashboard as "AI Sky Prediction"). Turning that on can never itself make the roof less safe than before it existed: if the model isn't trained yet, or has no fresh sensor reading to predict from right now, the gate fails open (behaves exactly as if it were off) instead of blocking SAFE or crashing - and neither case is silent, showing a dashboard banner, an inline warning row on the Safety Monitor card, a matching note on the Classify page, and a one-time Event Log entry the moment either state begins. A prediction of your configured "Ignore" label freezes the gate at its last real prediction instead, shown as **Ignore(*last prediction*)**, rather than counting a frame you've told it not to trust.
 
-By default, once a classified sample's image has been absorbed into a successful cloud training run its full-resolution copy is compressed to save disk space (**Keep full resolution Images**, on by default, skips that compression instead - useful if you want to re-export full-size images later). "Compress already-trained images" runs that same compression as a one-off backlog action for samples classified before you changed the setting. "Delete sensor records", "Delete resized images", and "Delete classified full-size images" each clear a different slice of storage independently, with download/upload `.zip` backup-and-restore for the two record-based actions. See Section 5.9 ("AI Learning" settings) and Section 10 ("AI Learning: Training and Using Your Own Sky Model") of `Observatory_Setup_Guide.docx` for the full step-by-step walkthrough and troubleshooting.
+By default, once a classified sample's image has been absorbed into a successful cloud training run its full-resolution copy is compressed to save disk space (**Keep full resolution Images**, on by default, skips that compression instead - useful if you want to re-export full-size images later). "Compress already-trained images" runs that same compression as a one-off backlog action for samples classified before you changed the setting. "Delete sensor records", "Delete resized images", and "Delete classified full-size images" each clear a different slice of storage independently, with download/upload `.zip` backup-and-restore for the two record-based actions. See Section 5.9 ("AI Learning" settings) and Section 10 ("AI Learning: Training and Using Your Own Sky Model") of `docs/Observatory_Setup_Guide.docx` for the full step-by-step walkthrough and troubleshooting.
 
 ### Cloud training server (optional)
 
@@ -106,3 +109,17 @@ Use [Tailscale](https://tailscale.com) on the Pi and your own devices — do **n
   remote sessions". Passwords are stored only as scrypt hashes in `dome_config.json`.
 - Default username `admin`; change the default password from home after setup. Sign-ins and failures are logged
   under the **Security** category on the Logs page.
+
+## Tests
+
+`tests/` runs the real `dome_safety_service.py` with the Pi hardware stubbed out (`tests/harness.py`), in a temp
+folder so nothing touches your config or data:
+
+    cd tests
+    python3 test_safety_history.py
+    python3 test_import_unclassify.py
+    python3 test_index_safety.py
+    python3 test_ai_smoothing.py
+    RA_DEFAULT_PW='<default remote password>' python3 test_remote_access.py
+
+`python3 tests/shot.py` regenerates `docs/previews/preview_index.html` / `preview_settings.html`.

@@ -120,6 +120,7 @@ h1{font-size:21px;margin:2px 0 2px;}
 .btn-dome{background:var(--accent-dome);color:#fff;}
 .btn-heater{background:var(--accent-heater);color:#fff;}
 .btn-safety{background:var(--accent-safety);color:#fff;}
+.ra-in{font-size:14px;padding:6px 8px;border-radius:6px;border:1px solid #ccc;width:100%;box-sizing:border-box;}
 .btn:disabled{opacity:.45;cursor:not-allowed;}
 /* Used to grey out a whole settings section at once (the Dome schedule
    form, Heater thresholds form, and the reed/relay/MOSFET rows under
@@ -171,6 +172,10 @@ input[type=number],input[type=time]{font-size:14px;padding:5px 7px;border-radius
 .setting-row label{display:flex;align-items:center;gap:6px;margin:0;flex:1 1 auto;min-width:180px;}
 .setting-row input[type=time]{margin-left:auto;}
 .narrow-number{width:80px;}
+.ai-steady{border:1px solid #e3e6ea;border-radius:10px;padding:8px 12px;margin:8px 0 12px;background:#fafbfc;}
+.ai-steady-title{font-weight:700;font-size:13.5px;margin:0 0 2px;}
+.ai-steady-row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;}
+.ai-steady-row label{margin:6px 0 4px;}
 .sensor-name-input{width:180px;max-width:100%;}
 .pin-row{display:flex;flex-direction:column;gap:6px;margin:14px 0;}
 .pin-row .pin-name{display:flex;align-items:center;gap:6px;margin:0;font-weight:600;}
@@ -190,6 +195,8 @@ h1{font-size:21px;margin:2px 0 2px;}
 .nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
 .nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
 .nav-restart:hover{background:#a71d1d;}
+.nav-remote{background:#e8f0fe;color:#1a56c4;border-radius:10px;padding:2px 9px;font-size:12px;font-weight:700;margin-right:4px;}
+.topnav a.nav-signout{padding:4px 8px;font-size:13px;font-weight:600;border-bottom:0;margin:0 6px 0 0;}
 
 /* closable notices */
 .banner{position:relative;padding-right:38px;}
@@ -224,7 +231,7 @@ h1{font-size:21px;margin:2px 0 2px;}
   <h2><span class="title">⚙️ Settings</span></h2>
 
   <div class="settings-shell">
-  <nav class="settings-nav" id="settingsNav"><a href="#location-timezone" data-g="location-timezone">Location &amp; Timezone</a><a href="#safety-checks" data-g="safety-checks">Safety Checks</a><a href="#logging-settings" data-g="logging-settings">Logging</a><a href="#hardware-pins" data-g="hardware-pins">Hardware Pins &amp; Addresses</a><a href="#device-names" data-g="device-names">ASCOM Device Names</a><a href="#dome-heater-features" data-g="dome-heater-features">Dome &amp; Heater</a><a href="#allsky-settings" data-g="allsky-settings">All Sky Camera</a><a href="#ai-learning-settings" data-g="ai-learning-settings">AI Learning</a><a href="#service-control" data-g="service-control">Service Control</a></nav>
+  <nav class="settings-nav" id="settingsNav"><a href="#location-timezone" data-g="location-timezone">Location &amp; Timezone</a><a href="#safety-checks" data-g="safety-checks">Safety Checks</a><a href="#logging-settings" data-g="logging-settings">Logging</a><a href="#hardware-pins" data-g="hardware-pins">Hardware Pins &amp; Addresses</a><a href="#device-names" data-g="device-names">ASCOM Device Names</a><a href="#dome-heater-features" data-g="dome-heater-features">Dome &amp; Heater</a><a href="#allsky-settings" data-g="allsky-settings">All Sky Camera</a><a href="#ai-learning-settings" data-g="ai-learning-settings">AI Learning</a><a href="#service-control" data-g="service-control">Service Control</a><a href="#remote-access" data-g="remote-access">Remote Access</a></nav>
   <div class="settings-columns">
   <div class="settings-col">
 
@@ -290,6 +297,21 @@ h1{font-size:21px;margin:2px 0 2px;}
       the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
       predict from. Train the model and set which predicted labels count as SAFE on the
       <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
+      <div class="ai-steady">
+        <p class="ai-steady-title">Steadier AI Sky Prediction</p>
+        <div class="ai-steady-row">
+          <div><label>Readings to combine</label>
+          <input type="number" name="aiSmoothN" min="1" max="60" value="10" class="narrow-number"></div>
+          <div><label>Combine using</label>
+          <select name="aiSmoothMethod"><option value="median" selected>Median (ignores glitches)</option><option value="average">Average</option></select></div>
+          <div><label>Dead band (°C)</label>
+          <input type="number" name="aiDeadband" min="0" max="3" step="0.1" value="0.5" class="narrow-number"></div>
+        </div>
+        <p class="hint">The MLX is read every 2 s, so 10 readings ≈ 20 s (≈10 s delay on real
+        clouds); 1 = off. Dead band: the prediction only changes once the value is past a cutoff by more than this
+        (e.g. Clear → Cloudy below the cutoff − 0.5 °C, back to Clear above the cutoff + 0.5 °C); 0 = off. Training
+        is not affected — it always uses the stored readings.</p>
+      </div>
       <label><input type="checkbox" name="cloudModelEnable" checked> Cloud Image Model check</label>
       <p class="hint">Include the cloud-trained image model's prediction in the SAFE/UNSAFE decision. Falls
       back to the other enabled checks above whenever no model has been downloaded yet, tflite-runtime isn't
@@ -623,6 +645,59 @@ h1{font-size:21px;margin:2px 0 2px;}
     <p class="hint"><code>admin ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart dome-safety.service, /usr/bin/systemctl reboot</code></p>
     <p class="hint">(swap "admin" for whatever <code>User=</code> your dome-safety.service unit file uses,
     and confirm the systemctl path with <code>which systemctl</code>.)</p>
+  </div>
+
+  <div class="settings-group" id="remote-access">
+    <h3>Remote Access</h3>
+    <p class="hint" style="background:var(--safe-bg);color:var(--safe);border-radius:8px;padding:8px 10px">🏠 You're on your
+    <b>home network</b> (127.0.0.1) — no login needed here.</p>
+    <p class="hint">From outside your home network (Tailscale or anything else), every page asks for the username and
+    password, then a 6-digit code emailed to the address below. This section is only shown — and can only be saved —
+    from your home network.</p>
+    
+    <form action="/remote-access-save" method="post" autocomplete="off">
+      <label><input type="checkbox" name="enabled" checked> Require login + email code for outside access</label>
+      <p class="hint hint-warn">Unchecking this lets anyone who can reach the Pi from outside control everything with no login.</p>
+      <hr class="sep">
+      <label>Username</label>
+      <input type="text" name="username" value="admin" required class="ra-in">
+      <label>New password <span class="hint">(leave blank to keep the current one)</span></label>
+      <input type="password" name="pw1" autocomplete="new-password" placeholder="at least 10 characters" class="ra-in">
+      <label>Confirm new password</label>
+      <input type="password" name="pw2" autocomplete="new-password" class="ra-in">
+      <p class="hint">No old password needed — you're on your home network. Stored only as a scrypt hash in
+      <code>dome_config.json</code>. Changing it signs out every outside session.</p>
+      <hr class="sep">
+      <label>Send codes to (email)</label>
+      <input type="email" name="email_to" value="" class="ra-in">
+      <label>SMTP server</label>
+      <input type="text" name="smtp_host" value="smtp.gmail.com" class="ra-in">
+      <label>SMTP port</label>
+      <input type="number" name="smtp_port" value="587" min="1" max="65535" class="narrow-number">
+      <label>SMTP username (sending account)</label>
+      <input type="text" name="smtp_user" value="" class="ra-in">
+      <label>SMTP app password <span class="hint">(not set)</span></label>
+      <input type="password" name="smtp_password" autocomplete="new-password" class="ra-in">
+      <p class="hint">Gmail: turn on 2-Step Verification, then create an <b>App password</b> (Google Account → Security →
+      App passwords) and paste it here — not your normal Gmail password. Server <code>smtp.gmail.com</code>, port 587.</p>
+      <p class="hint hint-warn">Email for codes isn't set up yet — nobody can sign in from outside until it is (the password step works, but no code can be sent).</p>
+      <hr class="sep">
+      <label>Trust a browser for this many days (when “Trust this browser” is ticked at sign-in)</label>
+      <input type="number" name="trust_days" value="7" min="1" max="90" class="narrow-number">
+      <p class="hint">Unticked, a sign-in lasts 12 hours. 5 wrong passwords or codes from one address block it for 15 minutes.</p>
+      <div class="btn-row"><button type="submit" class="btn btn-safety">Save Remote Access</button>
+      <button type="button" class="btn btn-neutral" onclick="raPost('/remote-access-test-email')">Send test email</button>
+      <button type="button" class="btn btn-neutral" onclick="if(confirm('Sign out every browser signed in from outside?')) raPost('/remote-access-signout-all')">Sign out all remote sessions</button></div>
+      <p class="hint" id="raStatus"></p>
+    </form>
+    <script>
+    function raPost(url){
+      var el=document.getElementById('raStatus'); el.textContent='Working...';
+      fetch(url,{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+        el.textContent=(d.ok?'✓ ':'✗ ')+(d.message||d.error||'');
+      }).catch(function(e){el.textContent='✗ '+e;});
+    }
+    </script>
   </div>
 
   </div>

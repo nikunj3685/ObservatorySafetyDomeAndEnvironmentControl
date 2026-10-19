@@ -1,0 +1,279 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Observatory Control</title>
+<link rel="icon" id="safetyFavicon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M21%2020%20L43%2044%20M43%2020%20L21%2044%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --safe:#1a7f37; --safe-bg:#e6f4ea;
+  --unsafe:#c62828; --unsafe-bg:#fdecea;
+  --warn:#9a6300; --warn-bg:#fff4e0;
+  --neutral:#5f6368; --neutral-bg:#eceff1;
+  --page-bg:#f2f4f7; --card-bg:#ffffff; --text:#1f2328; --muted:#6a7178;
+  --accent-safety:#2563eb; --accent-dome:#7c3aed; --accent-heater:#c2620a; --accent-schedule:#0f766e;
+  --accent-allsky:#1f6feb;
+}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      max-width:1040px;margin:0 auto;padding:18px 16px 48px;}
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.subtitle a{color:var(--accent-safety);text-decoration:none;}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;align-items:stretch;}
+.card{background:var(--card-bg);border-radius:14px;padding:18px 20px;margin:0;
+       box-shadow:0 1px 4px rgba(0,0,0,.08);border-top:5px solid var(--accent,#ccc);min-width:0;
+       display:flex;flex-direction:column;}
+/* Safety Monitor normally sits side-by-side with All Sky (a plain grid
+   item, sized like Dome/Heater below); it only spans the full width - via
+   this separate .full-width class, added in Python only when All Sky is
+   disabled - when there's no All Sky card to share the row with. */
+.card.settings{grid-column:1/-1;}
+.card.safety.full-width{grid-column:1/-1;}
+.card.safety{--accent:var(--accent-safety);}
+.card.dome{--accent:var(--accent-dome);}
+.card.heater{--accent:var(--accent-heater);}
+.card.settings{--accent:var(--accent-schedule);}
+.allsky-img-wrap{width:100%;border-radius:10px;overflow:hidden;background:#14161a;min-height:140px;
+  flex:none;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;}
+.allsky-img-wrap img{width:100%;height:100%;object-fit:cover;display:block;}
+/* All Sky + the Safety Checks History card (the old Sky History) sit
+   together in their own vertical flex column (not plain grid items) so
+   the history card can grow to fill exactly whatever
+   height All Sky's own (now fixed 1:1) aspect ratio leaves free, matching
+   the Safety Monitor card's height alongside it - see .card.history-compact
+   below. Only used when All Sky is enabled; with it off, Sky History (if it
+   has anything to show) is just a normal grid item like Dome/Heater. */
+.right-col{display:flex;flex-direction:column;gap:16px;}
+.card.allsky{--accent:var(--accent-allsky);flex:none;}
+.card.history-compact{--accent:#0f766e;padding:12px 14px 8px;flex:1 1 auto;display:flex;
+  flex-direction:column;min-height:0;}
+.card.history-compact h2{margin:0 0 6px;font-size:13px;flex:none;}
+.hist-wrap-c{display:flex;border:1px solid #e3e6ea;border-radius:8px;overflow:hidden;
+  background:#fafbfc;flex:1 1 auto;min-height:0;}
+.hist-zone-axis-c{flex:0 0 48px;position:relative;background:#fafbfc;border-right:1px solid #e3e6ea;}
+.hist-zone-axis-c .zlabel{position:absolute;left:4px;right:2px;font-size:9px;font-weight:700;line-height:1.05;}
+.hist-scroll-c{flex:1 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;}
+.hist-chart-compact{display:block;width:3062.5px;}
+.sc-lane-and{font-weight:400;color:#6b7480;font-size:10px;}
+.sc-lane-label{position:absolute;left:6px;right:4px;display:flex;align-items:center;font-size:10.5px;
+  font-weight:700;color:#2c3e50;line-height:1.05;}
+.sc-pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;margin-left:8px;
+  vertical-align:middle;}
+.sc-pill-safe{background:var(--safe-bg);color:var(--safe);}
+.sc-pill-unsafe{background:var(--unsafe-bg);color:var(--unsafe);}
+#scTip{position:fixed;pointer-events:none;background:#1f2328;color:#fff;font-size:11px;border-radius:8px;
+  padding:8px 10px;display:none;z-index:50;min-width:170px;box-shadow:0 4px 14px rgba(0,0,0,.25);}
+#scTip b{display:block;margin-bottom:4px;font-size:11.5px;}
+#scTip div{display:flex;justify-content:space-between;gap:14px;line-height:1.5;}
+#scTip .blue{color:#8ec5f5;}#scTip .grey{color:#c9cfd6;}#scTip .move{color:#c8b6f0;}#scTip .ok{color:#7ee2a0;}#scTip .warn{color:#ffd166;}#scTip .bad{color:#ff9a96;}#scTip .unk{color:#b4bcc6;}
+.hist-zone-sub-c{flex:0 0 56px;position:relative;background:#fafbfc;border-left:1px solid #e3e6ea;}
+.hist-zone-sub-c .sublabel{position:absolute;left:4px;right:2px;font-size:6.4px;font-weight:600;
+  opacity:0.85;line-height:1.0;}
+@media (min-width:741px){
+  /* Three independent vertical stacks, not a shared grid: column 1 is
+     Location & Timezone, Safety Checks, then Logging; column 2 is
+     Hardware Pins & Addresses, then ASCOM Device Names (kept right after
+     Hardware Pins since device naming is really just another facet of
+     "how this hardware is set up"); column 3 is Dome & Heater, All Sky
+     Camera, AI Learning (right after All Sky since it depends on it),
+     then Service Control. Deliberately NOT css grid rows -
+     grid would force every item in the same row to match the tallest
+     one, so a group in one column growing taller (e.g. Dome & Heater
+     picking up new fields) used to stretch an unrelated, shorter group
+     in a different column, leaving an ugly gap under the shorter one.
+     Each .settings-col here is its own flex column, sized purely from
+     its own contents, with zero height coupling to the other two. */
+  .settings-columns{display:flex;align-items:flex-start;gap:28px;}
+  .settings-col{flex:1;min-width:0;}
+}
+.card input[type=text],.card select{width:100%;box-sizing:border-box;padding:6px 8px;margin:4px 0 2px;
+      border-radius:6px;border:1px solid #ccc;font-size:14px;}
+.hint{font-size:12px;color:var(--muted);margin:2px 0 10px;}
+.hint-warn{color:var(--unsafe);}
+.settings-group{margin-bottom:6px;}
+/* Separate each Settings section with the same splitter line style used
+   elsewhere on the page (.sep, e.g. between blocks in the Safety Monitor
+   card) - here as a top rule on every section but the first, so it reads
+   as a divider between consecutive sections rather than framing each one. */
+.settings-group + .settings-group{border-top:1px solid #eee;margin-top:16px;padding-top:16px;}
+.sub-opt{margin-left:26px;padding-left:12px;border-left:3px solid #bcd9f2;}
+.sub-opt.sub-off{opacity:.5;}
+.settings-group h3{font-size:13.5px;margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}
+.card h2{margin:0 0 14px;font-size:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.card h2 .title{display:flex;align-items:center;gap:8px;}
+.badge{display:inline-block;padding:4px 13px;border-radius:20px;font-weight:700;font-size:13px;letter-spacing:.3px;}
+.badge-safe{background:var(--safe-bg);color:var(--safe);}
+.badge-unsafe{background:var(--unsafe-bg);color:var(--unsafe);}
+.badge-open{background:var(--safe-bg);color:var(--safe);}
+.badge-closed{background:var(--neutral-bg);color:var(--neutral);}
+.badge-moving{background:var(--warn-bg);color:var(--warn);}
+.badge-fault{background:var(--unsafe-bg);color:var(--unsafe);}
+.badge-disabled{background:var(--neutral-bg);color:var(--neutral);}
+.override-label{font-size:12px;color:var(--muted);margin:-8px 0 12px;}
+.hold-countdown{font-size:13px;color:var(--warn);background:var(--warn-bg);border-radius:8px;
+      padding:6px 10px;margin:-4px 0 12px;display:inline-block;}
+.btn-row{margin-bottom:4px;}
+.btn{display:inline-block;text-decoration:none;padding:9px 16px;border-radius:8px;font-size:13px;font-weight:600;
+      border:none;cursor:pointer;margin:2px 6px 6px 0;}
+.btn-safe{background:var(--safe);color:#fff;}
+.btn-unsafe{background:var(--unsafe);color:#fff;}
+.btn-neutral{background:var(--neutral-bg);color:var(--text);}
+.btn-dome{background:var(--accent-dome);color:#fff;}
+.btn-heater{background:var(--accent-heater);color:#fff;}
+.btn-safety{background:var(--accent-safety);color:#fff;}
+.btn:disabled{opacity:.45;cursor:not-allowed;}
+/* Used to grey out a whole settings section at once (the Dome schedule
+   form, Heater thresholds form, and the reed/relay/MOSFET rows under
+   Hardware Pins) when the Dome or Heater master switch is off - a plain
+   <fieldset disabled> stops every input/button inside from being edited or
+   submitted, and the opacity here makes that visually obvious rather than
+   leaving it looking accidentally broken. Reset to remove the browser's
+   default border/padding/margin so it's invisible when NOT disabled. */
+fieldset{border:none;margin:0;padding:0;min-width:0;}
+fieldset:disabled{opacity:.5;}
+.banner{border-radius:9px;padding:10px 14px;font-size:13.5px;margin:4px 0 14px;}
+.banner-warn{background:var(--warn-bg);color:var(--warn);border:1px solid #f0d38a;}
+.top-banner{font-size:14.5px;padding:12px 16px;}
+.top-banner a{color:var(--warn);font-weight:600;text-decoration:underline;}
+.field{font-size:14.5px;margin:6px 0;color:#333;}
+.field b{color:#111;}
+.muted{color:var(--muted);font-size:12.5px;}
+.tag{display:inline-block;font-size:11px;color:var(--muted);border:1px solid #ddd;border-radius:4px;
+     padding:1px 6px;margin-left:4px;vertical-align:middle;}
+.tag-warn{color:var(--unsafe);border-color:var(--unsafe);}
+.warn-text{color:var(--unsafe);}
+.status-dot{display:inline-block;width:15px;height:15px;border-radius:50%;
+     vertical-align:middle;cursor:help;box-shadow:0 0 0 1px rgba(0,0,0,.08);flex-shrink:0;}
+.dot-safe{background:var(--safe);}
+.dot-unsafe{background:var(--unsafe);}
+.dot-neutral{background:var(--muted);}
+/* Every Safety Monitor reading is a 3-column grid row: a dot slot, an icon
+   slot, then the text. Each <p> is its own grid, but they all share the
+   same column widths, so the dots line up with each other, the icons line
+   up with each other, and the text lines up with the text - down the
+   whole card - instead of just flowing as one run of inline content.
+   col-dot/col-icon are pinned to the top of the row and given a fixed
+   line-height so they sit level with the first line of text even when the
+   text column wraps onto multiple lines (e.g. the Outside/Sky readings). */
+.field-grid{display:grid;grid-template-columns:24px 26px 1fr;column-gap:2px;align-items:start;}
+.col-dot,.col-icon{display:flex;align-items:center;height:21px;line-height:21px;}
+.col-text{line-height:1.45;}
+/* The light-gray "previous status" line shown under a safety-affecting
+   reading (Day/Night, Rain, Sky/MLX90614, simpleCloudDetect) - what it
+   read before its last change, and when. Deliberately lighter/smaller than
+   the regular .muted text elsewhere, so it reads as secondary history, not
+   part of the current reading. */
+.prev-status{color:#b0b5bb;font-size:11.5px;margin-top:-4px;margin-bottom:10px;}
+.prev-status b{color:#b0b5bb;font-weight:600;}
+.sep{border:0;border-top:1px solid #eee;margin:12px 0;}
+label{font-size:13.5px;display:block;margin:10px 0 4px;color:#333;}
+input[type=number],input[type=time]{font-size:14px;padding:5px 7px;border-radius:6px;border:1px solid #ccc;}
+.setting-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin:10px 0;}
+.setting-row label{display:flex;align-items:center;gap:6px;margin:0;flex:1 1 auto;min-width:180px;}
+.setting-row input[type=time]{margin-left:auto;}
+.narrow-number{width:80px;}
+.sensor-name-input{width:180px;max-width:100%;}
+.pin-row{display:flex;flex-direction:column;gap:6px;margin:14px 0;}
+.pin-row .pin-name{display:flex;align-items:center;gap:6px;margin:0;font-weight:600;}
+.pin-field{display:flex;align-items:center;gap:8px;margin-left:24px;}
+.pin-field .pin-label{color:var(--muted);font-size:12.5px;min-width:36px;}
+input[type=checkbox]{vertical-align:middle;margin-right:6px;}
+input[type=range]{width:100%;accent-color:var(--accent-heater);}
+a{color:var(--accent-safety);}
+
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.topnav{display:flex;align-items:center;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
+.topnav a{padding:9px 14px;text-decoration:none;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px;}
+.topnav a:hover{color:#2563eb;}
+.topnav a.on{color:#2563eb;border-bottom-color:#2563eb;}
+.topnav .nav-sp{flex:1;}
+.nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
+.nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
+.nav-restart:hover{background:#a71d1d;}
+
+/* closable notices */
+.banner{position:relative;padding-right:38px;}
+.banner .banner-x{position:absolute;top:6px;right:8px;width:24px;height:24px;border:0;border-radius:50%;background:transparent;color:inherit;font-size:18px;line-height:22px;cursor:pointer;padding:0;opacity:.75;}
+.banner .banner-x:hover{background:rgba(0,0,0,.09);opacity:1;}
+.banner.banner-dismissed{display:none;}
+.notice-restore{font-size:12px;color:var(--muted);margin:0 2px 10px;}
+.notice-restore a{cursor:pointer;}
+/* Settings page: left menu, one group at a time */
+.settings-shell{display:flex;gap:18px;align-items:flex-start;}
+.settings-nav{flex:0 0 210px;display:flex;flex-direction:column;gap:2px;background:#f6f7f9;border-radius:12px;padding:8px;position:sticky;top:8px;}
+.settings-nav a{display:block;padding:8px 10px;border-radius:8px;color:#2c3e50;text-decoration:none;font-size:13.5px;}
+.settings-nav a:hover{background:#eceff2;}
+.settings-nav a.on{background:#dcefec;color:#0f766e;font-weight:700;}
+.view-settings .grid{display:block;max-width:1100px;}
+.view-settings .settings-columns{display:block;flex:1;min-width:0;}
+.view-settings .settings-col{display:block;}
+.view-settings .settings-group{display:none;border-top:0!important;margin-top:0!important;padding-top:0!important;}
+.view-settings .settings-group.sg-on{display:block;}
+@media (max-width:760px){.settings-shell{flex-direction:column;}.settings-nav{flex:none;width:100%;flex-direction:row;flex-wrap:wrap;position:static;}}
+</style><style>
+.mk{background:#fff3cd;border:1px solid #e8d48a;border-radius:8px;padding:8px 12px;margin:10px 0 14px;font-size:14px}
+.rbadge{background:#e8f0fe;color:#1a56c4;border-radius:10px;padding:2px 9px;font-size:12px;font-weight:700;margin-right:8px}
+.rbadge.ro{background:#eceff1;color:#455a64}.rbadge.rw{background:#e6f4ea;color:#1a7f37}
+.btn-unlock{background:#b26a00;color:#fff;font-size:12.5px;padding:4px 10px;margin-right:8px}
+.so{font-size:13px;margin-right:10px}.lk{font-size:12px}
+button:disabled{opacity:.55;cursor:not-allowed}.rofs{border:0;padding:0;margin:0;opacity:.6}
+.mcard{background:#fff;border-radius:14px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin:18px 0}
+.mcard>.t{font-weight:700;font-size:13px;color:#6b7480;margin:0 0 10px;letter-spacing:.3px}
+.dlg-back{background:rgba(0,0,0,.35);border-radius:14px;padding:22px 12px;display:flex;justify-content:center}
+.dlg{background:#fff;border-radius:14px;padding:18px 22px;width:340px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.dlg h3,.dlg h2{margin:0 0 6px}
+.ra-in{font-size:14px;padding:6px 8px;border-radius:6px;border:1px solid #ccc;width:260px;max-width:100%}
+.dlg .ra-in{width:100%}
+.ra-check{display:flex!important;align-items:center;gap:8px;font-size:13.5px;margin:10px 0!important;color:#333}
+.mcard label,.dlg label{display:block;font-size:13.5px;margin:10px 0 4px;color:#333}
+.g2{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:0 16px}
+.ra-where{border-radius:8px;padding:8px 10px;font-size:13.5px;margin:0 0 10px;background:var(--safe-bg);color:var(--safe)}
+.sub{font-weight:700;font-size:13px;margin:16px 0 0;color:#333;border-top:1px solid #eee;padding-top:12px}
+table.mt{border-collapse:collapse;width:100%;font-size:13.5px}table.mt td,table.mt th{border:1px solid #e2e5ea;padding:6px 8px;text-align:left}
+.flow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13.5px}
+.flow span.s{background:#f2f4f7;border-radius:8px;padding:6px 10px}
+.navdemo{display:block;width:210px;background:#f5f7f9;border-radius:10px;padding:6px}
+.navdemo a{display:block;padding:7px 10px;border-radius:8px;color:#2c3e50;font-size:13.5px}
+.navdemo a.on{background:#dcefec;color:#0f766e;font-weight:700}
+</style></head><body class="view-dash">
+
+<h1>🔭 Observatory Control</h1>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p>
+<div class="mk"><b>MOCKUP ONLY</b> — no code changed. Two-step login from outside (password + email code), then full access.</div><div class="mcard"><p class="t">HOW IT WORKS FROM OUTSIDE</p><div class="flow">
+<span class="s">1 · Open the URL</span>→<span class="s">2 · Login password<br><small>username + password</small></span>→
+<span class="s">3 · Email code<br><small>6 digits, 5 min</small></span>→<span class="s">4 · Full access<br><small>no more prompts</small></span></div>
+<p class="hint">On your home network: no login at all, exactly as today.</p></div><div class="mcard"><p class="t">STEP 2 · LOGIN PASSWORD</p><div class="dlg-back" style="background:var(--page-bg)">
+<div class="dlg"><h2>🔭 Observatory Control</h2><p class="hint" style="margin:0 0 6px">Remote access — please sign in.</p>
+<label>Username</label><input class="ra-in" value="admin"><label>Password</label><input class="ra-in" type="password" value="xxxxxxxxxxxx">
+<button class="btn btn-safety" style="width:100%;margin-top:12px">Next</button>
+<p class="hint" style="color:var(--unsafe);margin:8px 0 0">✗ Wrong username or password (3 tries left).</p></div></div></div><div class="mcard"><p class="t">STEP 3 · EMAIL CODE (sent automatically when the password is correct)</p><div class="dlg-back" style="background:var(--page-bg)">
+<div class="dlg"><h2>Check your email</h2><p class="hint" style="margin:0 0 6px">We sent a 6-digit code to <b>n••••••5@gmail.com</b>. It expires in 5 minutes.</p>
+<label>Code</label><input class="ra-in" value="4 8 1 9 _ _" style="text-align:center;letter-spacing:6px;font-size:20px">
+<label class="ra-check"><input type="checkbox" checked> Trust this browser for 7 days</label>
+<button class="btn btn-safety" style="width:100%">Verify &amp; sign in</button>
+<p class="hint" style="margin:8px 0 0"><a href="#">Resend code</a> · <a href="#">Back</a></p>
+<p class="hint" style="color:var(--unsafe);margin:6px 0 0">✗ Wrong code (2 tries left). After 3, start again from the password.</p></div></div>
+<p class="hint">Email says: <i>“Observatory sign-in code: 481920. Requested from 100.101.22.7 at 3:12 PM, expires 3:17 PM. If this wasn't you, change your password from home.”</i></p></div><div class="mcard"><p class="t">STEP 4 · SIGNED IN — everything works as at home (no third layer)</p><nav class="topnav"><a href="/" class="on">🏠 Dashboard</a><a href="/settings">⚙ Settings</a><a href="/ai-classify">🏷️ Classify (<span id="classifyCount">0</span>)</a><a href="/logs">🗒 Logs</a><span class="nav-sp"></span><span class="rbadge">🌐 Remote · admin</span><a href="#" class="so">Sign out</a><span class="nav-restart-msg" id="hdrRestartMsg"></span><button type="button" class="nav-restart" title="Restart service" aria-label="Restart service" onclick="hdrRestart()">&#8635;</button></nav>
+<div class="card dome"><h2><span class="title">🚪 Dome <span class="badge badge-safe">OPEN</span></span></h2>
+<div class="btn-row"><button class="btn btn-dome">OPEN</button><button class="btn btn-neutral">CLOSE</button></div>
+<p class="hint">OPEN/CLOSE, overrides, settings, Classify, Restart — all usable. Only the Remote Access section is missing (below).</p></div></div><div class="mcard"><p class="t">SETTINGS → REMOTE ACCESS (home network only)</p>
+<div style="display:flex;gap:20px;flex-wrap:wrap"><div><p class="hint" style="margin:0 0 6px"><b>Home network</b></p><div class="navdemo"><a>Location &amp; Timezone</a><a>…</a><a>Service Control</a><a class="on">Remote Access</a></div>
+<p class="hint" style="margin:12px 0 6px"><b>Outside</b></p><div class="navdemo"><a>Location &amp; Timezone</a><a>…</a><a>Service Control</a></div></div>
+<div style="flex:1;min-width:280px"><p class="ra-where">🏠 You're on your <b>home network</b> (192.168.1.42) — no login needed here.</p>
+<label class="ra-check"><input type="checkbox" checked> Require login + email code for outside access</label>
+<p class="sub">Login</p><label>Username</label><input class="ra-in" value="admin">
+<div class="g2"><div><label>New password</label><input class="ra-in" type="password" placeholder="at least 10 characters"></div><div><label>Confirm</label><input class="ra-in" type="password"></div></div>
+<p class="sub">Email for codes</p>
+<div class="g2"><div><label>Send codes to</label><input class="ra-in" value="nikunj…@gmail.com"></div>
+<div><label>SMTP server : port</label><input class="ra-in" value="smtp.gmail.com : 587"></div>
+<div><label>SMTP username</label><input class="ra-in" value="nikunj…@gmail.com"></div>
+<div><label>SMTP app password</label><input class="ra-in" type="password" value="xxxxxxxxxxxxxxxx"></div></div>
+<p class="hint">Gmail: use an <b>App password</b> (Google Account → Security → App passwords), not your normal password.</p>
+<div class="g2"><div><label>Trust a browser for (days)</label><input class="ra-in" type="number" value="7" style="width:90px"></div></div>
+<div class="btn-row" style="margin-top:12px"><button class="btn btn-neutral">Send test email</button><button class="btn btn-safety">Save</button><button class="btn btn-neutral">Sign out all remote sessions</button></div>
+<p class="hint">No old password needed here. Login password stored only as a scrypt hash in <code>dome_config.json</code> (never in GitHub).</p></div></div>
+<p class="hint" style="margin-top:12px"><b>From outside</b>, this menu item and section are hidden, and the Pi refuses any save to it even from a direct link.</p></div><div class="mcard"><p class="t">RULES</p><table class="mt">
+<tr><th>From</th><th>Web pages</th><th>Remote Access settings</th><th>ASCOM Alpaca (NINA)</th></tr>
+<tr><td>Home network / the Pi itself</td><td>No login</td><td>✓</td><td>✓ as today</td></tr>
+<tr><td>Outside (Tailscale or anything else)</td><td>Password + email code, then full access</td><td>hidden &amp; refused</td><td>refused</td></tr></table>
+<p class="hint">5 wrong passwords from one address → blocked 15 min. Sign-ins, codes sent and failures go to <b>Logs</b>. The Pi's safety auto-close always works.</p></div></body></html>

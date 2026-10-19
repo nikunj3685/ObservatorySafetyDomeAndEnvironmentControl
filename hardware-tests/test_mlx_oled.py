@@ -17,7 +17,7 @@ long cable run out to the display can't stall or glitch the sensor bus
 that the safety-monitor logic actually depends on.
 
 Run with:
-    python3 test_mlx_oled.py
+    python3 hardware-tests/test_mlx_oled.py
 Stop with Ctrl+C.
 """
 import time

@@ -37,7 +37,7 @@ same way it found the ESP32 directly before.
 
 Setup:
     pip install flask requests
-    python3 safety_aggregator.py
+    python3 legacy/safety_aggregator.py
 
 Then point SGPro at THIS Pi's IP instead of the ESP32's IP directly.
 """

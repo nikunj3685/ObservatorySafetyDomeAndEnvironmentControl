@@ -17,7 +17,7 @@ Starts in the OFF (LOW) state for safety, then flips ON/OFF every 3
 seconds so you can confirm it switches cleanly both ways.
 
 Run with:
-    python3 test_relay.py
+    python3 hardware-tests/test_relay.py
 Stop with Ctrl+C (this leaves the relay OFF on exit).
 """
 import time

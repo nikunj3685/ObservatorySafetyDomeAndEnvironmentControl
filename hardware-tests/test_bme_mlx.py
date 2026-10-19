@@ -10,7 +10,7 @@ scripts, this just proves the wiring + libraries work before everything
 gets folded into the unified Phase 5 service.
 
 Run with:
-    python3 test_bme_mlx.py
+    python3 hardware-tests/test_bme_mlx.py
 Stop with Ctrl+C.
 """
 import time

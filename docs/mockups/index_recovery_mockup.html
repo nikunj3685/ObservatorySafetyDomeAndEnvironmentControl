@@ -1,0 +1,101 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Learning — Classify</title>
+<link rel="icon" id="safetyFavicon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M21%2020%20L43%2044%20M43%2020%20L21%2044%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --page-bg:#f2f4f7; --card-bg:#ffffff; --text:#1f2328; --muted:#6a7178;
+  --accent:#0f766e; --info:#2563eb; --warn:#9a6300; --warn-bg:#fff4e0;
+}
+*{box-sizing:border-box;}
+body{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      max-width:1040px;margin:0 auto;padding:18px 16px 48px;}
+
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.topnav{display:flex;align-items:center;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
+.topnav a{padding:9px 14px;text-decoration:none;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px;}
+.topnav a:hover{color:#2563eb;}
+.topnav a.on{color:#2563eb;border-bottom-color:#2563eb;}
+.topnav .nav-sp{flex:1;}
+.nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
+.nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
+.nav-restart:hover{background:#a71d1d;}
+
+.subtitle a{color:var(--accent);text-decoration:none;}
+.card{background:var(--card-bg);border-radius:14px;padding:16px 18px;margin:0 0 16px;
+       box-shadow:0 1px 4px rgba(0,0,0,.08);}
+.card-title{font-size:15px;font-weight:700;margin:0 0 10px;color:var(--text);}
+.hint{color:var(--muted);font-size:12.5px;}
+.btn{padding:7px 14px;border-radius:8px;border:none;font-size:14px;font-weight:600;cursor:pointer;
+      background:var(--accent);color:#fff;text-decoration:none;display:inline-block;}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}
+.toolbar select{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}
+.ai-label-btn{background:var(--info);}
+.ai-upload-btn{background:var(--info);}
+.ai-nav-btn-disabled{background:#c7cdd2;cursor:default;}
+#classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}
+.ai-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}
+.ai-card{background:#fafbfc;border-radius:10px;padding:8px;position:relative;}
+.ai-card-select{display:block;cursor:pointer;}
+.ai-card-select img{width:100%;border-radius:6px;display:block;background:#14161a;}
+.ai-card-select input[type=checkbox]{position:absolute;top:12px;left:12px;width:18px;height:18px;}
+.ai-card-noimg{width:100%;min-height:120px;border-radius:6px;background:#eceff1;color:var(--muted);
+                 font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;
+                 padding:10px;box-sizing:border-box;}
+.ai-single-noimg{max-height:none;min-height:160px;}
+.ai-label-badge{position:absolute;top:12px;right:12px;background:var(--accent);color:#fff;
+                  border-radius:10px;padding:1px 9px;font-size:11.5px;font-weight:600;}
+.ai-card-time{font-size:11.5px;color:var(--muted);margin-top:6px;}
+.ai-card-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}
+.ai-chip{background:#eceff1;border-radius:6px;padding:2px 6px;font-size:11px;color:var(--muted);}
+.ai-fullsize-link{display:inline-block;margin-top:6px;font-size:12px;}
+.pager{display:flex;justify-content:space-between;margin-top:16px;}
+.ai-delete-btn{background:#c0392b;}
+.ai-single-wrap{display:flex;justify-content:center;}
+.ai-single-card{background:#fafbfc;border-radius:10px;padding:14px;position:relative;max-width:640px;width:100%;text-align:center;}
+.ai-single-img{width:100%;max-height:65vh;object-fit:contain;border-radius:8px;background:#14161a;display:block;margin:0 auto;}
+.ai-single-position{font-size:12px;color:var(--muted);margin-bottom:6px;}
+.ai-single-card .ai-card-chips{justify-content:center;}
+.ai-single-card .ai-delete-btn{margin-top:10px;}
+.ai-sensor-row{margin-top:8px;padding-top:8px;border-top:1px dashed #d3d8dc;text-align:left;}
+.ai-sensor-caption{font-size:11px;color:var(--muted);margin-bottom:6px;}
+.ai-sensor-btns{display:flex;flex-wrap:wrap;gap:4px;}
+.ai-sensor-btn{background:#eceff1;color:var(--muted);padding:3px 8px;font-size:11.5px;font-weight:600;}
+.ai-sensor-btn.active{background:#1f7a3f;color:#fff;}
+.ai-sensor-note-wrap{margin-top:6px;font-size:11.5px;}
+.ai-sensor-note{color:var(--muted);font-style:italic;}
+.ai-sensor-note-set{color:#1f7a3f;font-style:normal;font-weight:600;}
+.ai-sensor-clear{margin-left:6px;color:#c0392b;font-size:11px;}
+a{color:var(--accent);}
+</style></head><body>
+
+<h1>🔭 Observatory Control</h1>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p>
+<nav class="topnav"><a href="/">🏠 Dashboard</a><a href="/settings">⚙ Settings</a><a href="/ai-classify" class="on">🏷️ Classify (<span id="classifyCount">5</span>)</a><a href="/logs">🗒 Logs</a><span class="nav-sp"></span><span class="nav-restart-msg" id="hdrRestartMsg"></span><button type="button" class="nav-restart" title="Restart service" aria-label="Restart service" onclick="hdrRestart()">&#8635;</button></nav>
+
+<div style="background:#fff3cd;border:1px solid #e8d48a;border-radius:8px;padding:8px 12px;margin:0 0 14px;font-size:14px"><b>MOCKUP ONLY</b> — no code changed. Classify page after the fix, with your current numbers.</div><div class="card" style="border:2px solid #b26a00;background:#fff8ec">
+<p class="card-title">⚠️ 3,709 images on disk aren't in the list</p>
+<p class="hint">The sample list (index) was damaged and lost entries — the image files themselves are safe. Restoring adds them
+back to the list as <b>unclassified</b> (date/time from the file name; sensor readings aren't in the image files).</p>
+<div class="toolbar"><button class="btn" style="background:#b26a00">Restore 3,709 images to the list</button></div>
+<hr style="border:0;border-top:1px solid #eadbc2;margin:12px 0">
+<p class="hint"><b>Then restore labels &amp; sensor readings</b> from any “Download sensor records” zips you kept (oldest first is fine —
+newer ones win). Matching is by sample ID; images already deleted after training come back as records without a picture.</p>
+<div class="toolbar"><button class="btn ai-upload-btn" style="background:#2563eb">Upload sensor records (.zip) — restores labels too</button></div>
+<p class="hint" style="color:#1a7f37;font-weight:600">✓ Restored 1,196 labels + sensor readings from ai_sensor_data_20260930-144904.zip (35 IDs not found).</p>
+</div>
+<div class="card" style="border:2px solid #1f6feb;background:#eef4ff">
+<p class="card-title">🖼️ 65 samples have no image file <span style="background:#b26a00;color:#fff;font-size:11px;border-radius:6px;padding:1px 7px">NEW</span></p>
+<p class="hint">Their labels and sensor readings are safe. 63 matching frames found in the AllSky archive (taken within 90 s).</p>
+<div class="toolbar"><button class="btn" style="background:#1f6feb">Recover 63 images from AllSky archive</button></div>
+<p class="hint">Cards still without an image show “Image not on disk” instead of a broken picture, and unlabeled ones are hidden from <b>Unclassified only</b>.</p></div>
+<div class="card" style="border:2px solid #c62828;background:#fdecea">
+<p class="card-title">⛔ Shown only if the index file can't be read</p>
+<p class="hint">“The training list file is damaged. It was kept as <code>index.json.corrupt-20261017-0021</code> and new captures/labels
+are paused so nothing gets overwritten. <b>Restore from last good backup (2026-10-16 03:00, 4,511 samples)</b> or rebuild from images.”</p>
+<div class="toolbar"><button class="btn">Restore backup from 2026-10-16</button><button class="btn" style="background:#b26a00">Rebuild from images</button></div></div><div class="card">
+  <p class="card-title">📊 Training data overview</p>
+  <p class="hint" style="margin:0;">Samples collected so far: <b>33</b> (1 not yet classified) — training images folder: <b>90.8 MB</b> across 3742 image(s).</p>
+</div>
+
+</body></html>

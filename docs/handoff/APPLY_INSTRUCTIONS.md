@@ -1,3 +1,5 @@
+> **Historical note (2026-10-19):** this file used to live in `handsOff/`. Mockups are now in `docs/mockups/`; the old `dome-safety-session-updates.bundle` was applied long ago and removed. Current notes for resuming work are kept outside the repo.
+
 # How to use this handsOff folder
 
 This folder exists so a Claude sandbox session (which can never `git

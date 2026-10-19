@@ -5,7 +5,7 @@ switch (closed/not-closed), once every 2 seconds.
 
 Both are safe passive reads - nothing here triggers the relay or the
 heater MOSFET. Run with:
-    python3 test_dht_reed.py
+    python3 hardware-tests/test_dht_reed.py
 Stop with Ctrl+C.
 """
 import time

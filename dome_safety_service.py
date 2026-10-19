@@ -48,6 +48,8 @@ dome_config.json next to this script - edit by hand or through the web
 page at http://<pi-ip>:11112/ and http://<pi-ip>:11112/config.
 """
 
+import bisect
+import functools
 import hashlib
 import hmac
 import io
@@ -276,6 +278,12 @@ DEFAULT_SETTINGS = {
         # fail-open fallback behavior when this is on but no valid trained
         # model exists yet (or it has no fresh data to predict from).
         "ai_model_enabled": False,
+        # Steadier AI Sky Prediction: combine the last N MLX readings (1 =
+        # off) by median or average, and only change class once the value
+        # is past a cutoff by more than the dead band (0 = off).
+        "ai_smooth_readings": 10,
+        "ai_smooth_method": "median",
+        "ai_deadband_c": 0.5,
         # Sixth gate, off by default: a genuine image classifier trained by
         # the separate cloud-training-server (see cloud-training-server/ in
         # this repo) from the SAME labeled Classify page samples as the AI
@@ -410,6 +418,9 @@ DEFAULT_SETTINGS = {
     # safety_checks.ml_cloud_ignore_classes.
     "ai_learning": {
         "enabled": False,
+        # Where the AllSky software archives its frames - used only by the
+        # Classify page's "Recover images from AllSky archive" action.
+        "allsky_archive_dir": "~/allsky/images",
         "capture_interval_min": 15,
         # Only UNLABELED samples are ever auto-deleted by age - once a
         # sample has been manually classified it becomes curated training
@@ -1178,34 +1189,273 @@ def _log_cleanup():
 # later phases - not built yet). Wired into sensor_poll_loop() below, on its
 # own interval, the same way _log_cleanup() already runs on its own timer.
 # ==========================================================================
+# ---- AI Learning index safety (see the 2026-10-16 incident) -------------
+# index.json used to be the ONLY copy of every sample's label + sensor
+# readings. Two overlapping saves wrote the same ".tmp" file, the mixed-up
+# result replaced index.json, the loader then treated the unreadable file
+# as empty, and the next capture saved a 1-sample list over everything.
+# Now: (1) one re-entrant lock around every read-change-save, (2) a unique
+# temp file per save + fsync, (3) an unreadable index is moved aside and
+# ALL saving pauses instead of starting over empty, (4) every save also
+# appends what changed to an append-only sensor_log.jsonl that nothing
+# ever truncates (sensor data must never be lost), (5) a copy of
+# index.json is kept at each training run (last 7), (6) each training
+# image also carries its own sensor snapshot in its JPEG metadata.
+AI_SENSOR_LOG_PATH = os.path.join(AI_TRAINING_DIR, "sensor_log.jsonl")
+AI_INDEX_COPIES_DIR = os.path.join(AI_TRAINING_DIR, "index_copies")
+AI_INDEX_COPIES_KEEP = 7
+_ai_index_lock = threading.RLock()
+_ai_index_state = {"damaged": None, "baseline": None}  # damaged: {"file","at"}; baseline: id -> record json
+
+
+def _with_ai_index_lock(fn):
+    """Runs the whole function under the index lock - for load-change-save
+    handlers that don't do slow network/image work."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with _ai_index_lock:
+            return fn(*a, **k)
+    return wrapper
+
+
 def _load_ai_training_index():
-    """Best-effort load of the AI Learning sample index. Returns a fresh,
-    empty index on a missing file or any read/parse error - same fallback
-    philosophy as _load_status_history()."""
-    try:
-        if os.path.exists(AI_TRAINING_INDEX_PATH):
+    """The AI Learning sample index. A missing file is a normal empty index.
+    An UNREADABLE file is never treated as empty any more: it's moved to
+    index.json.corrupt-<time>, saving pauses (see _save_ai_training_index)
+    and the Classify page offers a restore."""
+    with _ai_index_lock:
+        if _ai_index_state["damaged"]:
+            return {"samples": []}
+        if not os.path.exists(AI_TRAINING_INDEX_PATH):
+            return {"samples": []}
+        try:
             with open(AI_TRAINING_INDEX_PATH, "r") as f:
                 idx = json.load(f)
             if isinstance(idx, dict) and isinstance(idx.get("samples"), list):
                 return idx
-    except Exception:
-        pass
-    return {"samples": []}
+            raise ValueError("no samples list")
+        except Exception as e:
+            bad = AI_TRAINING_INDEX_PATH + time.strftime(".corrupt-%Y%m%d-%H%M%S")
+            try:
+                os.replace(AI_TRAINING_INDEX_PATH, bad)
+            except Exception:
+                bad = AI_TRAINING_INDEX_PATH
+            _ai_index_state["damaged"] = {"file": os.path.basename(bad), "at": time.time()}
+            print(f"[ai-learning] training index unreadable ({e}) - kept as {bad}; saving PAUSED until restored")
+            try:
+                _log_event("Settings", f"AI Learning: training list file was damaged - kept as "
+                                       f"{os.path.basename(bad)}, saving paused until it is restored", severity="warn")
+            except Exception:
+                pass
+            return {"samples": []}
 
 
-def _save_ai_training_index(idx):
-    """Atomic (tmp + os.replace) persist of the AI Learning sample index -
-    unlike _save_status_history()'s plain overwrite, this file is read back
-    by a future labeling page while capture keeps running concurrently, so a
-    half-written file must never be visible to a reader. Never raises."""
+def _ai_sensor_log_append(events):
+    """Append-only. Nothing in this service ever truncates, rewrites or
+    deletes sensor_log.jsonl."""
+    if not events:
+        return
     try:
         os.makedirs(AI_TRAINING_DIR, exist_ok=True)
-        tmp = AI_TRAINING_INDEX_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(idx, f, indent=2)
-        os.replace(tmp, AI_TRAINING_INDEX_PATH)
+        with open(AI_SENSOR_LOG_PATH, "a") as f:
+            for ev in events:
+                f.write(json.dumps(ev, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
-        print(f"[ai-learning] Failed to save training index: {e}")
+        print(f"[ai-learning] failed to append sensor log: {e}")
+
+
+def _ai_index_baseline():
+    """id -> json of each record as last saved (for the log diff)."""
+    if _ai_index_state["baseline"] is None:
+        base = {}
+        try:
+            if os.path.exists(AI_TRAINING_INDEX_PATH):
+                with open(AI_TRAINING_INDEX_PATH) as f:
+                    for rec in json.load(f).get("samples", []):
+                        base[rec["id"]] = json.dumps(rec, sort_keys=True)
+        except Exception:
+            base = {}
+        if not os.path.exists(AI_SENSOR_LOG_PATH) and base:
+            # First run with the log: seed it with everything already known.
+            now = time.time()
+            _ai_sensor_log_append([{"t": now, "op": "add", "rec": json.loads(v)} for v in base.values()])
+        _ai_index_state["baseline"] = base
+    return _ai_index_state["baseline"]
+
+
+def _ai_log_index_changes(idx):
+    base = _ai_index_baseline()
+    now = time.time()
+    events, new_base = [], {}
+    for rec in idx["samples"]:
+        sid = rec.get("id")
+        if not sid:
+            continue
+        cur = json.dumps(rec, sort_keys=True)
+        new_base[sid] = cur
+        old = base.get(sid)
+        if old is None:
+            events.append({"t": now, "op": "add", "rec": rec})
+        elif old != cur:
+            prev = json.loads(old)
+            changed = {k: v for k, v in rec.items() if prev.get(k) != v}
+            unset = [k for k in prev if k not in rec]
+            ev = {"t": now, "op": "set", "id": sid, "f": changed}
+            if unset:
+                ev["unset"] = unset
+            events.append(ev)
+    for sid in base:
+        if sid not in new_base:
+            events.append({"t": now, "op": "del", "id": sid})
+    _ai_sensor_log_append(events)
+    _ai_index_state["baseline"] = new_base
+
+
+def _save_ai_training_index(idx, force=False):
+    """Atomic, locked save: unique temp file + fsync + os.replace, so two
+    saves can never mix into one file. Refused while a damaged index is
+    pending restore (force=True is used only by the restore actions). Every
+    save also appends what changed to the append-only sensor log."""
+    with _ai_index_lock:
+        if _ai_index_state["damaged"] and not force:
+            print("[ai-learning] save skipped - training list is damaged and waiting to be restored")
+            return False
+        try:
+            os.makedirs(AI_TRAINING_DIR, exist_ok=True)
+            _ai_log_index_changes(idx)
+            tmp = f"{AI_TRAINING_INDEX_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(idx, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, AI_TRAINING_INDEX_PATH)
+            if force:
+                _ai_index_state["damaged"] = None
+            return True
+        except Exception as e:
+            print(f"[ai-learning] Failed to save training index: {e}")
+            return False
+
+
+def _ai_replay_sensor_log():
+    """Rebuilds samples from the append-only log. Returns (live, deleted):
+    live = id -> record as the list last had it; deleted = id -> last known
+    record of samples later removed (kept for recovery). Sensor readings
+    are never dropped by a replay, even if the list once cleared them."""
+    live, deleted = {}, {}
+    if not os.path.exists(AI_SENSOR_LOG_PATH):
+        return live, deleted
+    with open(AI_SENSOR_LOG_PATH) as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue  # a torn last line from a power cut - skip it
+            op = ev.get("op")
+            if op == "add":
+                rec = dict(ev["rec"])
+                old = live.get(rec["id"]) or deleted.get(rec["id"])
+                if old and old.get("sensors") and not rec.get("sensors"):
+                    rec["sensors"] = old["sensors"]
+                live[rec["id"]] = rec
+                deleted.pop(rec["id"], None)
+            elif op == "set" and ev.get("id") in live:
+                rec = live[ev["id"]]
+                for k, v in ev.get("f", {}).items():
+                    if k == "sensors" and not v:
+                        continue
+                    rec[k] = v
+                for k in ev.get("unset", []):
+                    if k != "sensors":
+                        rec.pop(k, None)
+            elif op == "del" and ev.get("id") in live:
+                deleted[ev["id"]] = live.pop(ev["id"])
+    return live, deleted
+
+
+def _ai_index_copy(reason):
+    """Keeps a copy of index.json at each training run (last 7)."""
+    try:
+        with _ai_index_lock:
+            if _ai_index_state["damaged"] or not os.path.exists(AI_TRAINING_INDEX_PATH):
+                return
+            os.makedirs(AI_INDEX_COPIES_DIR, exist_ok=True)
+            dst = os.path.join(AI_INDEX_COPIES_DIR, time.strftime(f"index-%Y%m%d-%H%M%S-{reason}.json"))
+            shutil.copy2(AI_TRAINING_INDEX_PATH, dst)
+        copies = sorted(f for f in os.listdir(AI_INDEX_COPIES_DIR) if f.startswith("index-") and f.endswith(".json"))
+        for old in copies[:-AI_INDEX_COPIES_KEEP]:
+            os.remove(os.path.join(AI_INDEX_COPIES_DIR, old))
+    except Exception as e:
+        print(f"[ai-learning] failed to keep a training copy of the index: {e}")
+
+
+def _ai_index_copies():
+    """[(filename, sample_count, mtime)] newest first."""
+    out = []
+    try:
+        for name in sorted(os.listdir(AI_INDEX_COPIES_DIR), reverse=True):
+            if name.startswith("index-") and name.endswith(".json"):
+                path = os.path.join(AI_INDEX_COPIES_DIR, name)
+                try:
+                    with open(path) as f:
+                        n = len(json.load(f)["samples"])
+                except Exception:
+                    continue
+                out.append((name, n, os.path.getmtime(path)))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+# ---- JPEG metadata: each training image carries its own sensor snapshot ---
+_JPEG_META_TAG = b"OBSMETA:"
+
+
+def _jpeg_with_meta(data, meta):
+    """Returns the JPEG bytes with a COM segment holding `meta` as JSON,
+    inserted right after SOI - the picture data is not re-encoded. Any
+    previous OBSMETA segment is replaced. Non-JPEG data is returned as is."""
+    try:
+        if not data or data[:2] != b"\xff\xd8":
+            return data
+        data = _jpeg_strip_meta(data)
+        payload = _JPEG_META_TAG + json.dumps(meta, separators=(",", ":")).encode()
+        if len(payload) > 65000:
+            return data
+        seg = b"\xff\xfe" + (len(payload) + 2).to_bytes(2, "big") + payload
+        return data[:2] + seg + data[2:]
+    except Exception:
+        return data
+
+
+def _jpeg_strip_meta(data):
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF and data[i + 1] not in (0xDA, 0xD9):
+        ln = int.from_bytes(data[i + 2:i + 4], "big")
+        if data[i + 1] == 0xFE and data[i + 4:i + 4 + len(_JPEG_META_TAG)] == _JPEG_META_TAG:
+            return data[:i] + data[i + 2 + ln:]
+        i += 2 + ln
+    return data
+
+
+def _jpeg_read_meta(path):
+    """The OBSMETA dict stored in a training image, or None."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(70000)
+        i = 2
+        if data[:2] != b"\xff\xd8":
+            return None
+        while i + 4 <= len(data) and data[i] == 0xFF and data[i + 1] not in (0xDA, 0xD9):
+            ln = int.from_bytes(data[i + 2:i + 4], "big")
+            if data[i + 1] == 0xFE and data[i + 4:i + 4 + len(_JPEG_META_TAG)] == _JPEG_META_TAG:
+                return json.loads(data[i + 4 + len(_JPEG_META_TAG):i + 2 + ln])
+            i += 2 + ln
+    except Exception:
+        return None
+    return None
 
 
 def _ai_training_sensor_features():
@@ -1262,23 +1512,29 @@ def _capture_ai_training_sample():
         now = time.time()
         sample_id = f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(now))}_{uuid.uuid4().hex[:8]}"
         fname = f"{sample_id}.jpg"
+        sensors = _ai_training_sensor_features()
+        # Last-resort copy of the readings inside the image itself (see
+        # _jpeg_with_meta) - the stored picture is otherwise unchanged.
+        data = _jpeg_with_meta(data, {"id": sample_id, "ts": now, "sensors": sensors})
         with open(os.path.join(AI_TRAINING_IMAGES_DIR, fname), "wb") as f:
             f.write(data)
 
-        idx = _load_ai_training_index()
-        idx["samples"].append({
-            "id": sample_id,
-            "ts": now,
-            "image": fname,
-            "sensors": _ai_training_sensor_features(),
-            "label": None,
-            "labeled_at": None,
-        })
-        _save_ai_training_index(idx)
+        with _ai_index_lock:
+            idx = _load_ai_training_index()
+            idx["samples"].append({
+                "id": sample_id,
+                "ts": now,
+                "image": fname,
+                "sensors": sensors,
+                "label": None,
+                "labeled_at": None,
+            })
+            _save_ai_training_index(idx)
     except Exception as e:
         print(f"[ai-learning] Failed to capture training sample: {e}")
 
 
+@_with_ai_index_lock
 def _ai_training_cleanup():
     """Delete UNLABELED AI Learning samples (and their images) older than
     ai_learning.unlabeled_retention_days - never a labeled one, no matter
@@ -1574,6 +1830,7 @@ def _train_ai_sky_model():
         "method": "corrected_delta",
     }
     _save_ai_sky_model(model)
+    _ai_index_copy("sensor-train")
     return model, None
 
 
@@ -1753,6 +2010,12 @@ def _compress_training_image_in_place(path, max_dim=CLOUD_UPLOAD_RESIZE_MAX_DIM,
                 scale = max_dim / float(longest)
                 img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
             img.save(tmp, format="JPEG", quality=quality)
+        meta = _jpeg_read_meta(path)
+        if meta is not None:  # keep the embedded sensor snapshot through the re-encode
+            with open(tmp, "rb") as f:
+                data = f.read()
+            with open(tmp, "wb") as f:
+                f.write(_jpeg_with_meta(data, meta))
         os.replace(tmp, path)
         return True
     except Exception as e:
@@ -1856,25 +2119,31 @@ def _absorb_cloud_training_success(sample_ids):
     if not sample_ids:
         return
     id_set = set(sample_ids)
-    idx = _load_ai_training_index()
     now = time.time()
     keep_full_res = get_setting("ai_learning").get("keep_full_res_images", True)
-    changed = False
-    for sample in idx["samples"]:
-        if sample["id"] not in id_set or sample.get("cloud_trained_at"):
-            continue
-        changed = True
-        sample["cloud_trained_at"] = now
-        if keep_full_res:
-            continue  # leave the full-resolution image exactly as it is
-        image_name = sample.get("image")
-        if not image_name:
-            continue
-        img_path = os.path.join(AI_TRAINING_IMAGES_DIR, image_name)
-        if os.path.isfile(img_path) and _compress_training_image_in_place(img_path):
-            sample["image_compressed"] = True
-    if changed:
-        _save_ai_training_index(idx)
+    # Slow part (compressing images) runs WITHOUT the index lock so captures
+    # and labeling aren't held up; the index itself is then re-read and
+    # updated under the lock, so nothing saved meanwhile is overwritten.
+    compressed = set()
+    if not keep_full_res:
+        for sample in _load_ai_training_index()["samples"]:
+            if sample["id"] not in id_set or sample.get("cloud_trained_at") or not sample.get("image"):
+                continue
+            img_path = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+            if os.path.isfile(img_path) and _compress_training_image_in_place(img_path):
+                compressed.add(sample["id"])
+    with _ai_index_lock:
+        idx = _load_ai_training_index()
+        changed = False
+        for sample in idx["samples"]:
+            if sample["id"] not in id_set or sample.get("cloud_trained_at"):
+                continue
+            changed = True
+            sample["cloud_trained_at"] = now
+            if sample["id"] in compressed:
+                sample["image_compressed"] = True
+        if changed:
+            _save_ai_training_index(idx)
 
 
 def _compress_trained_backlog_images():
@@ -1892,22 +2161,21 @@ def _compress_trained_backlog_images():
     if get_setting("ai_learning").get("keep_full_res_images", True):
         return 0, ('"Keep full resolution Images" is currently ON under Settings — turn it off first, '
                    'then run this again to compress the existing backlog.')
-    idx = _load_ai_training_index()
-    compressed = 0
-    changed = False
-    for sample in idx["samples"]:
+    done_ids = set()
+    for sample in _load_ai_training_index()["samples"]:
         if not sample.get("cloud_trained_at") or sample.get("image_compressed") or not sample.get("image"):
             continue
         img_path = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
-        if not os.path.isfile(img_path):
-            continue
-        if _compress_training_image_in_place(img_path):
-            sample["image_compressed"] = True
-            compressed += 1
-            changed = True
-    if changed:
-        _save_ai_training_index(idx)
-    return compressed, None
+        if os.path.isfile(img_path) and _compress_training_image_in_place(img_path):
+            done_ids.add(sample["id"])
+    if done_ids:
+        with _ai_index_lock:  # re-read under the lock - see _absorb_cloud_training_success()
+            idx = _load_ai_training_index()
+            for sample in idx["samples"]:
+                if sample["id"] in done_ids:
+                    sample["image_compressed"] = True
+            _save_ai_training_index(idx)
+    return len(done_ids), None
 
 
 def _load_cloud_model_meta():
@@ -2173,6 +2441,7 @@ def _start_cloud_training(triggered_by="manual"):
     if not api_key:
         return False, "No cloud training server API key configured - set one under Settings → AI Learning."
 
+    _ai_index_copy("cloud-train")
     zip_buf, labeled_count, sample_ids = _ai_training_export_zip(
         only_untrained=True, resize_max_dim=CLOUD_UPLOAD_RESIZE_MAX_DIM)
     if labeled_count == 0:
@@ -2706,14 +2975,15 @@ def _reset_cloud_model():
                             "uploaded_bytes": None, "total_bytes": None, "last_progress_at": None,
                             "attempt_id": uuid.uuid4().hex[:12]})
 
-    idx = _load_ai_training_index()
-    cleared_absorbed = 0
-    for sample in idx["samples"]:
-        if sample.get("cloud_trained_at"):
-            sample["cloud_trained_at"] = None
-            cleared_absorbed += 1
-    if cleared_absorbed:
-        _save_ai_training_index(idx)
+    with _ai_index_lock:
+        idx = _load_ai_training_index()
+        cleared_absorbed = 0
+        for sample in idx["samples"]:
+            if sample.get("cloud_trained_at"):
+                sample["cloud_trained_at"] = None
+                cleared_absorbed += 1
+        if cleared_absorbed:
+            _save_ai_training_index(idx)
 
     ai_cfg = get_setting("ai_learning")
     server_url = (ai_cfg.get("cloud_server_url") or "").strip()
@@ -3010,7 +3280,7 @@ sensor_state = {
     # None except while status is "active". Shown on the dashboard instead
     # of a confidence percentage (this method doesn't have one - see
     # _predict_ai_sky_class()'s docstring).
-    "ai_model_anomaly_c": None,
+    "ai_model_anomaly_c": None, "ai_model_margin_c": None, "ai_model_margin_to": None, "ai_model_smooth_n": 0,
     # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
     # for the full set of status values), independent of cloud_model_enabled.
     "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
@@ -3603,6 +3873,73 @@ def _track_status_change(key, current_value, now):
     return hist["prev"], hist["since"]
 
 
+# ---- Steadier AI Sky Prediction (2026-10-18) -------------------------------
+# On a warm clear night the corrected reading sat ~0.3 °C from the Clear/
+# Cloudy cutoff and normal ±0.5 °C sensor noise flipped SAFE/UNSAFE every few
+# seconds. The live value is now the median (or average) of the last N MLX
+# readings, and a dead band means the class only changes once the value is
+# past a cutoff by more than `ai_deadband_c`.
+_ai_smooth_buf = deque()          # (poll_ts, anomaly)
+_ai_smooth_state = {"last_poll": None, "prev": None}
+AI_ZONE_ORDER = ["Overcast", "Cloudy", "Clear"]
+
+
+def _ai_zone(value, tc, to):
+    return "Clear" if value >= tc else ("Cloudy" if value >= to else "Overcast")
+
+
+def _ai_steady_classify(model, anomaly, poll_ts, now, checks):
+    """Returns (predicted_class, smoothed_anomaly, (margin_c, next_class)).
+    predicted_class is None when there's no fresh reading (status no_data)."""
+    n = max(1, min(60, int(checks.get("ai_smooth_readings", 10) or 1)))
+    method = checks.get("ai_smooth_method", "median")
+    band = max(0.0, min(3.0, float(checks.get("ai_deadband_c", 0.5) or 0.0)))
+    tc = model.get("threshold_clear_c", AI_MODEL_DEFAULT_THRESHOLD_CLEAR_C)
+    to = model.get("threshold_overcast_c", AI_MODEL_DEFAULT_THRESHOLD_OVERCAST_C)
+    if anomaly is None:
+        _ai_smooth_buf.clear()          # stale/missing sensor: start fresh, never reuse old readings
+        _ai_smooth_state.update(last_poll=None, prev=None)
+        return None, None, (None, None)
+    if poll_ts is None or poll_ts != _ai_smooth_state["last_poll"]:
+        _ai_smooth_buf.append((poll_ts or now, anomaly))
+        _ai_smooth_state["last_poll"] = poll_ts
+    while len(_ai_smooth_buf) > n:
+        _ai_smooth_buf.popleft()
+    # drop readings far older than N polls should take (e.g. after a sensor gap)
+    max_age = max(30.0, n * SENSOR_POLL_INTERVAL_SEC * 3)
+    while _ai_smooth_buf and now - _ai_smooth_buf[0][0] > max_age:
+        _ai_smooth_buf.popleft()
+    vals = sorted(v for _, v in _ai_smooth_buf) or [anomaly]
+    if method == "average":
+        value = sum(vals) / len(vals)
+    else:
+        m = len(vals) // 2
+        value = vals[m] if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2
+    raw = _ai_zone(value, tc, to)
+    prev = _ai_smooth_state["prev"]
+    if prev is None or band == 0:
+        cls = raw
+    else:
+        # Leave the current class only once past its boundary by more than the band.
+        lo = {"Clear": tc - band, "Cloudy": to - band, "Overcast": float("-inf")}[prev]
+        hi = {"Clear": float("inf"), "Cloudy": tc + band, "Overcast": to + band}[prev]
+        if lo <= value < hi:
+            cls = prev
+        else:
+            cls = _ai_zone(value + (band if value < lo else -band), tc, to)
+    _ai_smooth_state["prev"] = cls
+    # Distance to the next class change (toward the nearer side).
+    down = {"Clear": tc - band, "Cloudy": to - band, "Overcast": None}[cls]
+    up = {"Clear": None, "Cloudy": tc + band, "Overcast": to + band}[cls]
+    options = []
+    if down is not None:
+        options.append((value - down, AI_ZONE_ORDER[AI_ZONE_ORDER.index(cls) - 1]))
+    if up is not None:
+        options.append((up - value, AI_ZONE_ORDER[AI_ZONE_ORDER.index(cls) + 1]))
+    margin = min(options) if options else (None, None)
+    return cls, value, margin
+
+
 def recompute_overall_safe():
     """Fail-safe fusion across FOUR independently-toggleable gates. A gate
     that's disabled in settings always passes (True); a gate that's enabled
@@ -3828,9 +4165,13 @@ def recompute_overall_safe():
                 delta - (mlx_correction_slope * ambient_ref_c + mlx_correction_intercept)
                 if (delta is not None and ambient_ref_c is not None) else None
             )
-            ai_predicted, _ai_scores, ai_confidence = _predict_ai_sky_class(
-                ai_model, {"mlx_delta_anomaly_c": mlx_delta_anomaly_c})
-            ai_anomaly_c = mlx_delta_anomaly_c
+            # Steadier prediction (Settings -> Safety Checks): combine the
+            # last N readings (median/average) and apply a dead band around
+            # each cutoff - see _ai_steady_classify(). Training is untouched.
+            ai_predicted, ai_anomaly_c, ai_margin = _ai_steady_classify(
+                ai_model, mlx_delta_anomaly_c, sensor_state.get("mlx_last_poll"), now, checks)
+            sensor_state["ai_model_margin_c"], sensor_state["ai_model_margin_to"] = ai_margin
+            sensor_state["ai_model_smooth_n"] = len(_ai_smooth_buf)
 
         # Unlike simpleCloudDetect and the Cloud Image Model below - both of
         # which classify a photo, where "Ignore" (a bad/unreliable frame) is
@@ -3872,7 +4213,7 @@ def recompute_overall_safe():
                 pending_logs.append(("Safety", f"AI Sky Prediction(Sensor Based) changed from "
                                                 f"{prev_ai_pred} to {ai_predicted}", "info", "ai_model"))
 
-        if ai_model_wanted and ai_model_status == "active":
+        if ai_model_wanted and ai_model_status == "active" and ai_predicted is not None:
             safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
             gate_ai_model = ai_predicted.strip().lower() in safe_labels
         else:
@@ -3912,7 +4253,10 @@ def recompute_overall_safe():
         cloud_model_wanted = checks.get("cloud_model_enabled", False)
         cloud_model_status = sensor_state["cloud_model_status"]
         cloud_predicted = sensor_state["cloud_model_predicted"]
-        if cloud_model_wanted and cloud_model_status == "active":
+        # cloud_predicted can be None while "active": the model's first
+        # reading after a restart was "Ignore", so there's no trusted value
+        # to hold yet - skip the gate (fail open) instead of crashing.
+        if cloud_model_wanted and cloud_model_status == "active" and cloud_predicted is not None:
             safe_labels = {c.strip().lower() for c in ai_cfg.get("safe_labels", "Clear").split(",") if c.strip()}
             gate_cloud_model = cloud_predicted.strip().lower() in safe_labels
         else:
@@ -6077,6 +6421,15 @@ def save_checks():
         s["safety_checks"]["dew_check_enabled"] = "dewEnable" in request.args
         s["safety_checks"]["ai_model_enabled"] = "aiModelEnable" in request.args
         s["safety_checks"]["cloud_model_enabled"] = "cloudModelEnable" in request.args
+        try:
+            if "aiSmoothN" in request.args:
+                s["safety_checks"]["ai_smooth_readings"] = max(1, min(60, int(request.args["aiSmoothN"])))
+            if "aiDeadband" in request.args:
+                s["safety_checks"]["ai_deadband_c"] = max(0.0, min(3.0, float(request.args["aiDeadband"])))
+        except ValueError:
+            pass
+        if request.args.get("aiSmoothMethod") in ("median", "average"):
+            s["safety_checks"]["ai_smooth_method"] = request.args["aiSmoothMethod"]
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
         if request.args.get("aiGraphStyle") in ("chart", "lanes"):
             s["safety_checks"]["ai_graph_style"] = request.args["aiGraphStyle"]
@@ -6658,6 +7011,13 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         ai_anomaly_c = s.get("ai_model_anomaly_c")
         ai_anomaly_str = (f" <span class=\"muted\">(corrected &Delta; {ai_anomaly_c:+.1f}&deg;C vs "
                            f"expected-clear)</span>" if ai_anomaly_c is not None else "")
+        margin_c, margin_to = s.get("ai_model_margin_c"), s.get("ai_model_margin_to")
+        smooth_n = s.get("ai_model_smooth_n") or 0
+        if margin_c is not None and margin_to:
+            ai_anomaly_str += f' <span class="tag">{max(0.0, margin_c):.1f}&deg;C from {margin_to}</span>'
+        if smooth_n > 1:
+            method = "average" if checks.get("ai_smooth_method") == "average" else "median"
+            ai_anomaly_str += f' <span class="tag">{method} of {smooth_n}</span>'
         ai_dot = _status_dot(
             s.get("ai_model_pass", True), ai_model_wanted,
             f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
@@ -8054,6 +8414,10 @@ input[type=number],input[type=time]{{font-size:14px;padding:5px 7px;border-radiu
 .setting-row label{{display:flex;align-items:center;gap:6px;margin:0;flex:1 1 auto;min-width:180px;}}
 .setting-row input[type=time]{{margin-left:auto;}}
 .narrow-number{{width:80px;}}
+.ai-steady{{border:1px solid #e3e6ea;border-radius:10px;padding:8px 12px;margin:8px 0 12px;background:#fafbfc;}}
+.ai-steady-title{{font-weight:700;font-size:13.5px;margin:0 0 2px;}}
+.ai-steady-row{{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;}}
+.ai-steady-row label{{margin:6px 0 4px;}}
 .sensor-name-input{{width:180px;max-width:100%;}}
 .pin-row{{display:flex;flex-direction:column;gap:6px;margin:14px 0;}}
 .pin-row .pin-name{{display:flex;align-items:center;gap:6px;margin:0;font-weight:600;}}
@@ -8283,6 +8647,21 @@ a{{color:var(--accent-safety);}}
       the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
       predict from. Train the model and set which predicted labels count as SAFE on the
       <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
+      <div class="ai-steady">
+        <p class="ai-steady-title">Steadier AI Sky Prediction</p>
+        <div class="ai-steady-row">
+          <div><label>Readings to combine</label>
+          <input type="number" name="aiSmoothN" min="1" max="60" value="{checks.get('ai_smooth_readings', 10)}" class="narrow-number"></div>
+          <div><label>Combine using</label>
+          <select name="aiSmoothMethod">{"".join(f'<option value="{v}"{" selected" if checks.get("ai_smooth_method", "median") == v else ""}>{t}</option>' for v, t in (("median", "Median (ignores glitches)"), ("average", "Average")))}</select></div>
+          <div><label>Dead band (°C)</label>
+          <input type="number" name="aiDeadband" min="0" max="3" step="0.1" value="{checks.get('ai_deadband_c', 0.5)}" class="narrow-number"></div>
+        </div>
+        <p class="hint">The MLX is read every {SENSOR_POLL_INTERVAL_SEC} s, so 10 readings ≈ 20 s (≈10 s delay on real
+        clouds); 1 = off. Dead band: the prediction only changes once the value is past a cutoff by more than this
+        (e.g. Clear → Cloudy below the cutoff − 0.5 °C, back to Clear above the cutoff + 0.5 °C); 0 = off. Training
+        is not affected — it always uses the stored readings.</p>
+      </div>
       <label><input type="checkbox" name="cloudModelEnable" {"checked" if checks.get('cloud_model_enabled') else ""}> Cloud Image Model check</label>
       <p class="hint">Include the cloud-trained image model's prediction in the SAFE/UNSAFE decision. Falls
       back to the other enabled checks above whenever no model has been downloaded yet, tflite-runtime isn't
@@ -9157,7 +9536,10 @@ def _ai_samples_matching_filter(idx, filt):
     if filt == "all":
         return list(samples)
     if filt == "unclassified":
-        return [s for s in samples if s.get("label") is None]
+        # Left out: no image to look at (it can't be labeled) - see the
+        # Classify page's Recovery card for getting the image back.
+        return [s for s in samples if s.get("label") is None and s.get("image")
+                and os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, s["image"]))]
     if filt and filt.startswith("label:"):
         wanted = filt[len("label:"):]
         return [s for s in samples if s.get("label") == wanted]
@@ -9176,6 +9558,7 @@ def _ai_bulk_filter_ok(filt):
 
 
 @app.route("/ai-classify-save", methods=["GET"])
+@_with_ai_index_lock
 def ai_classify_save():
     """Applies one label to one or more sample IDs at once - the batch
     action behind the classify page's "select several, click one label
@@ -9227,6 +9610,7 @@ def _ai_sample_has_image(sample):
     return bool(name) and os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, name))
 
 
+@_with_ai_index_lock
 def _unclassify_ai_samples(ids, dry_run=False):
     """Sends the given LABELED samples back to unclassified - the Classify
     page's "Unclassify selected" / single-view "Unclassify" action. Clears
@@ -9306,7 +9690,7 @@ def _import_ai_training_image(data, filename, label=None):
                 data = out.getvalue()
     except Exception:
         return "rejected", "not a readable image"
-    with _ai_import_lock:
+    with _ai_index_lock:
         idx = _load_ai_training_index()
         if any(s.get("import_sha1") == digest for s in idx["samples"]):
             return "duplicate", "already imported"
@@ -9314,6 +9698,7 @@ def _import_ai_training_image(data, filename, label=None):
         now = time.time()
         sample_id = f"imp_{time.strftime('%Y%m%d_%H%M%S', time.localtime(now))}_{uuid.uuid4().hex[:8]}"
         fname = f"{sample_id}.jpg"
+        data = _jpeg_with_meta(data, {"id": sample_id, "ts": now, "source": AI_IMPORT_SOURCE, "label": label})
         with open(os.path.join(AI_TRAINING_IMAGES_DIR, fname), "wb") as f:
             f.write(data)
         sample = {"id": sample_id, "ts": now, "image": fname, "label": label, "sensors": {},
@@ -9326,7 +9711,6 @@ def _import_ai_training_image(data, filename, label=None):
     return "imported", sample_id
 
 
-_ai_import_lock = threading.Lock()
 
 
 @app.route("/ai-classify-import", methods=["POST"])
@@ -9356,6 +9740,7 @@ def ai_classify_import():
 
 
 @app.route("/ai-classify-set-sensor-label", methods=["GET"])
+@_with_ai_index_lock
 def ai_classify_set_sensor_label():
     """Sets (or clears, with an empty `label`) one sample's separate
     `sensor_label` field - only meaningful on a sample whose main `label`
@@ -9576,6 +9961,7 @@ def ai_classify_cloud_status():
     return jsonify({"ok": True, **_load_cloud_job_state()})
 
 
+@_with_ai_index_lock
 def _delete_ai_training_samples(ids):
     """Removes the given sample ids from the index (record + image
     together) and deletes their image files from disk - used by "Delete
@@ -9660,6 +10046,7 @@ def _ai_classify_sensor_backup_zip():
     return buf, len(records)
 
 
+@_with_ai_index_lock
 def _ai_classify_delete_sensor_data():
     """Clears just the 'sensors' snapshot from every classified sample that
     currently has one - the record itself (id/label/image/timestamps) is
@@ -9679,34 +10066,278 @@ def _ai_classify_delete_sensor_data():
     return cleared
 
 
-def _ai_classify_restore_sensor_data(zip_bytes):
-    """Restores sensor snapshots from a zip previously produced by
-    _ai_classify_sensor_backup_zip(), matching each entry back to its
-    original sample by id. A sample id no longer present in the index
-    (its whole record was removed some other way, not just its sensor
-    data) is skipped - there's nothing left to restore it into. Raises
-    ValueError on a zip that isn't a valid backup of this kind. Returns
-    (restored, skipped)."""
+@_with_ai_index_lock
+def _ai_classify_restore_sensor_data(file_bytes):
+    """Restores labels + sensor readings from a "Download sensor records"
+    zip (sensor_records.json inside) or a plain JSON file (a list of
+    records, or {"samples": [...]} such as a recovered index). Merges by
+    sample id and never removes anything: a matching sample gets the
+    record's sensor readings (when it has any) and its label if it has
+    none yet; an id not in the list is re-created (with its image when the
+    file is still on disk). Raises ValueError on anything else. Returns
+    (restored, created)."""
+    records = None
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             with zf.open("sensor_records.json") as f:
                 records = json.load(f)
+    except zipfile.BadZipFile:
+        try:
+            records = json.loads(file_bytes.decode("utf-8"))
+        except Exception as e:
+            raise ValueError(f"Not a sensor-records zip or JSON file: {e}")
     except Exception as e:
         raise ValueError(f"Not a valid sensor-data backup zip: {e}")
+    if isinstance(records, dict):
+        records = records.get("samples")
+    if not isinstance(records, list):
+        raise ValueError("No sample records found in the file.")
     idx = _load_ai_training_index()
     by_id = {s["id"]: s for s in idx["samples"]}
-    restored = 0
-    skipped = 0
+    restored = created = 0
     for rec in records:
-        sample = by_id.get(rec.get("id"))
-        if sample is None:
-            skipped += 1
+        if not isinstance(rec, dict) or not rec.get("id"):
             continue
-        sample["sensors"] = rec.get("sensors")
-        restored += 1
-    if restored:
+        sample = by_id.get(rec["id"])
+        if sample is None:
+            image = rec.get("image") or f"{rec['id']}.jpg"
+            sample = {"id": rec["id"], "ts": rec.get("ts") or 0,
+                      "image": image if os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, image)) else None,
+                      "label": rec.get("label"), "labeled_at": rec.get("labeled_at"),
+                      "sensors": rec.get("sensors") or {}}
+            for k in ("sensor_label", "source", "cloud_trained_at", "image_compressed"):
+                if rec.get(k) is not None:
+                    sample[k] = rec[k]
+            idx["samples"].append(sample)
+            by_id[rec["id"]] = sample
+            created += 1
+            continue
+        touched = False
+        if rec.get("sensors"):
+            sample["sensors"] = rec["sensors"]
+            touched = True
+        if rec.get("label") and not sample.get("label"):
+            sample["label"] = rec["label"]
+            sample["labeled_at"] = rec.get("labeled_at")
+            touched = True
+        restored += touched
+    if restored or created:
+        idx["samples"].sort(key=lambda x: x.get("ts") or 0)
         _save_ai_training_index(idx)
-    return restored, skipped
+    return restored, created
+
+
+# ---- Recovery actions (Classify page) -------------------------------------
+_AI_IMAGE_TS_RE = re.compile(r"^(?:imp_)?(\d{8}_\d{6})_[0-9a-f]{8}\.jpg$")
+
+
+def _ai_orphan_images(idx=None):
+    """Image files in ai_training/images that no sample points to."""
+    idx = idx or _load_ai_training_index()
+    used = {s.get("image") for s in idx["samples"] if s.get("image")}
+    try:
+        names = os.listdir(AI_TRAINING_IMAGES_DIR)
+    except FileNotFoundError:
+        return []
+    return sorted(n for n in names if _AI_IMAGE_TS_RE.match(n) and n not in used)
+
+
+def _ai_missing_image_samples(idx=None):
+    """Samples whose image file is no longer on disk."""
+    idx = idx or _load_ai_training_index()
+    return [s for s in idx["samples"]
+            if s.get("image") and not os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, s["image"]))]
+
+
+@_with_ai_index_lock
+def _ai_restore_orphan_images():
+    """Puts every orphan image back in the list. Best data first: the
+    append-only sensor log, then the image's own embedded metadata, else an
+    unclassified record dated from the file name. Returns
+    (restored, with_sensor_readings)."""
+    idx = _load_ai_training_index()
+    orphans = _ai_orphan_images(idx)
+    if not orphans:
+        return 0, 0
+    live, deleted = _ai_replay_sensor_log()
+    known = {**deleted, **live}
+    with_sensors = 0
+    for name in orphans:
+        sid = name[:-4]
+        rec = dict(known[sid]) if sid in known else None
+        if rec is None:
+            meta = _jpeg_read_meta(os.path.join(AI_TRAINING_IMAGES_DIR, name)) or {}
+            m = _AI_IMAGE_TS_RE.match(name)
+            ts = meta.get("ts")
+            if not ts:
+                try:
+                    ts = time.mktime(time.strptime(m.group(1), "%Y%m%d_%H%M%S"))
+                except ValueError:  # odd file name - fall back to the file's own date
+                    ts = os.path.getmtime(os.path.join(AI_TRAINING_IMAGES_DIR, name))
+            rec = {"id": sid, "ts": ts, "label": meta.get("label"), "labeled_at": None,
+                   "sensors": meta.get("sensors") or {}}
+            if name.startswith("imp_"):
+                rec["source"] = AI_IMPORT_SOURCE
+        rec["image"] = name
+        if (rec.get("sensors") or {}).get("mlx_delta_c") is not None:
+            with_sensors += 1
+        idx["samples"].append(rec)
+    idx["samples"].sort(key=lambda x: x.get("ts") or 0)
+    _save_ai_training_index(idx)
+    _log_event("Settings", f"AI Learning: restored {len(orphans)} image(s) to the training list "
+                           f"({with_sensors} with sensor readings)")
+    return len(orphans), with_sensors
+
+
+def _ai_allsky_archive_dir():
+    return os.path.expanduser(get_setting("ai_learning").get("allsky_archive_dir") or "~/allsky/images")
+
+
+def _ai_archive_index():
+    """{timestamp: path} for every image-YYYYMMDDHHMMSS.jpg in the AllSky archive."""
+    out = {}
+    root = _ai_allsky_archive_dir()
+    try:
+        days = os.listdir(root)
+    except Exception:
+        return out
+    for day in days:
+        folder = os.path.join(root, day)
+        if not os.path.isdir(folder):
+            continue
+        for name in os.listdir(folder):
+            if name.startswith("image-") and name.endswith(".jpg") and len(name) >= 24:
+                try:
+                    out[time.mktime(time.strptime(name[6:20], "%Y%m%d%H%M%S"))] = os.path.join(folder, name)
+                except ValueError:
+                    pass
+    return out
+
+
+AI_ARCHIVE_MATCH_SEC = 90
+
+
+def _ai_archive_matches(samples, archive):
+    times = sorted(archive)
+    out = {}
+    for smp in samples:
+        ts = smp.get("ts") or 0
+        i = bisect.bisect_left(times, ts)
+        near = [times[j] for j in (i - 1, i) if 0 <= j < len(times)]
+        if near:
+            t = min(near, key=lambda t: abs(t - ts))
+            if abs(t - ts) <= AI_ARCHIVE_MATCH_SEC:
+                out[smp["id"]] = archive[t]
+    return out
+
+
+def _ai_recover_images_from_archive():
+    """Copies the AllSky archive frame taken within 90 s of each sample
+    whose training image is missing back into place (the archive itself is
+    never changed). Returns (recovered, still_missing)."""
+    missing = _ai_missing_image_samples()
+    matches = _ai_archive_matches(missing, _ai_archive_index())
+    recovered = 0
+    for smp in missing:
+        src = matches.get(smp["id"])
+        if not src:
+            continue
+        try:
+            with open(src, "rb") as f:
+                data = f.read()
+            data = _jpeg_with_meta(data, {"id": smp["id"], "ts": smp.get("ts"), "sensors": smp.get("sensors") or {},
+                                          "recovered_from": os.path.basename(src)})
+            dst = os.path.join(AI_TRAINING_IMAGES_DIR, smp["image"])
+            with open(dst + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(dst + ".tmp", dst)
+            recovered += 1
+        except Exception as e:
+            print(f"[ai-learning] archive recovery failed for {smp['id']}: {e}")
+    if recovered:
+        _log_event("Settings", f"AI Learning: recovered {recovered} missing training image(s) from the AllSky archive")
+    return recovered, len(missing) - recovered
+
+
+@_with_ai_index_lock
+def _ai_restore_index(source):
+    """Damaged-list restore: source "log" rebuilds from the sensor log,
+    otherwise it's the file name of a training copy. Returns sample count."""
+    if source == "log":
+        live, _ = _ai_replay_sensor_log()
+        samples = sorted(live.values(), key=lambda x: x.get("ts") or 0)
+    else:
+        name = os.path.basename(source)
+        with open(os.path.join(AI_INDEX_COPIES_DIR, name)) as f:
+            samples = json.load(f)["samples"]
+    if not samples:
+        raise ValueError("That source has no samples in it.")
+    _ai_index_state["baseline"] = None
+    _save_ai_training_index({"samples": samples}, force=True)
+    _log_event("Settings", f"AI Learning: training list restored from "
+                           f"{'the sensor log' if source == 'log' else source} ({len(samples)} samples)")
+    return len(samples)
+
+
+@app.route("/ai-recovery/<action>", methods=["POST"])
+def ai_recovery(action):
+    try:
+        if action == "orphans":
+            n, sens = _ai_restore_orphan_images()
+            return jsonify({"ok": True, "message": f"Restored {n} image(s) to the list ({sens} with sensor readings)."})
+        if action == "archive":
+            n, left = _ai_recover_images_from_archive()
+            return jsonify({"ok": True, "message": f"Recovered {n} image(s) from the AllSky archive"
+                                                   + (f"; {left} still without an image." if left else ".")})
+        if action == "restore":
+            n = _ai_restore_index(request.args.get("source", ""))
+            return jsonify({"ok": True, "message": f"Training list restored ({n} samples)."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": False, "error": "unknown action"}), 404
+
+
+def _ai_recovery_card_html(idx):
+    """Classify page card shown only when something needs recovering."""
+    parts = []
+    dmg = _ai_index_state["damaged"]
+    if dmg:
+        btns = "".join(
+            f"<button type=\"button\" class=\"btn\" onclick=\"aiRecover('restore', '{_html_escape(n)}')\">"
+            f"Restore training copy {_html_escape(n[6:21])} ({c:,} samples)</button>"
+            for n, c, _ in _ai_index_copies()[:3])
+        parts.append(
+            "<div class=\"rec-box rec-red\"><p class=\"card-title\">⛔ The training list file is damaged</p>"
+            f"<p class=\"hint\">It was kept as <code>{_html_escape(dmg['file'])}</code> and saving is <b>paused</b> so "
+            "nothing gets overwritten. New images are still saved and can be restored afterwards. Restore from a "
+            "training copy, or rebuild from the sensor log.</p>"
+            f"<div class=\"toolbar\">{btns}<button type=\"button\" class=\"btn rec-amber\" "
+            "onclick=\"aiRecover('restore', 'log')\">Rebuild from sensor log</button></div></div>")
+    orphans = [] if dmg else _ai_orphan_images(idx)
+    if orphans:
+        parts.append(
+            f"<div class=\"rec-box rec-amber-box\"><p class=\"card-title\">⚠️ {len(orphans):,} image(s) on disk "
+            "aren't in the list</p><p class=\"hint\">Restoring adds them back, with their sensor readings and labels "
+            "from the sensor log or the image's own metadata when available, otherwise as <b>unclassified</b>.</p>"
+            "<div class=\"toolbar\"><button type=\"button\" class=\"btn rec-amber\" onclick=\"aiRecover('orphans')\">"
+            f"Restore {len(orphans):,} image(s) to the list</button></div></div>")
+    missing = [] if dmg else _ai_missing_image_samples(idx)
+    if missing:
+        matches = _ai_archive_matches(missing, _ai_archive_index())
+        action = ("<div class=\"toolbar\"><button type=\"button\" class=\"btn rec-blue\" "
+                  f"onclick=\"aiRecover('archive')\">Recover {len(matches):,} image(s) from AllSky archive</button></div>"
+                  if matches else
+                  f"<p class=\"hint\">No matching frames found in <code>{_html_escape(_ai_allsky_archive_dir())}</code>.</p>")
+        parts.append(
+            f"<div class=\"rec-box rec-blue-box\"><p class=\"card-title\">🖼️ {len(missing):,} sample(s) have no image "
+            f"file</p><p class=\"hint\">Their labels and sensor readings are safe. {len(matches):,} matching AllSky "
+            f"archive frame(s) found (taken within {AI_ARCHIVE_MATCH_SEC} s).</p>{action}"
+            "<p class=\"hint\">Cards without an image show “Image not on disk”; unlabeled ones are left out of "
+            "<b>Unclassified only</b>.</p></div>")
+    if not parts:
+        return ""
+    return ("<div class=\"card\"><p class=\"card-title\">🛟 Recovery</p>" + "".join(parts)
+            + "<p class=\"hint\" id=\"aiRecoverStatus\"></p></div>")
 
 
 def _ai_classify_resized_images_backup_zip():
@@ -9731,6 +10362,7 @@ def _ai_classify_resized_images_backup_zip():
     return buf, count
 
 
+@_with_ai_index_lock
 def _ai_classify_delete_resized_images():
     """Deletes every currently-compressed sample's image file from disk and
     clears the record's image/image_compressed fields - keeps the label
@@ -9758,6 +10390,7 @@ def _ai_classify_delete_resized_images():
     return removed
 
 
+@_with_ai_index_lock
 def _ai_classify_restore_resized_images(zip_bytes):
     """Restores resized images from a zip previously produced by
     _ai_classify_resized_images_backup_zip(), matching each image back to
@@ -9817,6 +10450,7 @@ def _ai_classify_fullsize_backup_zip():
     return buf, count
 
 
+@_with_ai_index_lock
 def _ai_classify_delete_fullsize_images():
     """Deletes the full-resolution image for every classified sample that
     still has one (skips samples already compressed - see "Delete resized
@@ -9878,12 +10512,13 @@ def ai_classify_upload_sensor_data():
     if not f:
         return jsonify({"ok": False, "error": "No file uploaded"})
     try:
-        restored, skipped = _ai_classify_restore_sensor_data(f.read())
+        restored, created = _ai_classify_restore_sensor_data(f.read())
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)})
-    if restored:
-        _log_event("Settings", f"AI Learning: restored sensor data for {restored} sample(s) from an uploaded zip")
-    return jsonify({"ok": True, "restored": restored, "skipped": skipped})
+    if restored or created:
+        _log_event("Settings", f"AI Learning: sensor records upload updated {restored} and re-created "
+                               f"{created} sample(s)")
+    return jsonify({"ok": True, "restored": restored, "created": created})
 
 
 @app.route("/ai-classify-backup-resized-images", methods=["GET"])
@@ -10046,7 +10681,12 @@ def _render_ai_classify_card(sample, tz, label_classes):
     # for those - everything else about the card (label, time, chips,
     # selection checkbox) still works exactly the same, since none of it
     # depends on the image file existing.
-    if sample.get("image"):
+    image_on_disk = bool(sample.get("image")) and os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"]))
+    if sample.get("image") and not image_on_disk:
+        image_html = ('<div class="ai-card-noimg">Image not on disk — see Recovery at the top of this page. '
+                      'Label and sensor readings are kept.</div>')
+        fullsize_html = ""
+    elif sample.get("image"):
         img_url = f"/ai-training-image/{sample['image']}?w=220"
         full_url = f"/ai-training-image/{sample['image']}"
         image_html = f'<img src="{img_url}" loading="lazy" alt="All Sky frame">'
@@ -10084,7 +10724,10 @@ def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
     chips_html = _ai_classify_card_chips_html(sample)
     sensor_row_html = _ai_sensor_label_row_html(sample, label_classes)
     # See _render_ai_classify_card()'s comment above - same reasoning here.
-    if sample.get("image"):
+    if sample.get("image") and not os.path.isfile(os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])):
+        image_html = ('<div class="ai-card-noimg ai-single-noimg">Image not on disk — see Recovery at the top of '
+                      'this page. Label and sensor readings are kept.</div>')
+    elif sample.get("image"):
         full_url = f"/ai-training-image/{sample['image']}"
         image_html = f'<img class="ai-single-img" src="{full_url}" alt="All Sky frame">'
     else:
@@ -10533,6 +11176,12 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .ai-single-actions{{display:flex;gap:8px;justify-content:center;margin-top:10px;}}
 .ai-single-actions .ai-delete-btn{{margin-top:0;}}
 .ai-chip-imported{{background:#e3f2fd;color:#1565c0;font-weight:700;}}
+.rec-box{{border-radius:10px;padding:10px 14px;margin:10px 0;}}
+.rec-red{{border:2px solid #c62828;background:#fdecea;}}
+.rec-amber-box{{border:2px solid #b26a00;background:#fff8ec;}}
+.rec-blue-box{{border:2px solid #1f6feb;background:#eef4ff;}}
+.rec-amber{{background:#b26a00;}}
+.rec-blue{{background:#1f6feb;}}
 .ai-modal-back{{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:50;padding:16px;}}
 .ai-modal-back.open{{display:flex;}}
 .ai-modal{{background:#fff;border-radius:14px;padding:16px 20px;max-width:540px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.3);max-height:90vh;overflow:auto;}}
@@ -10552,6 +11201,7 @@ a{{color:var(--accent);}}
 
 {_page_header_html("classify", unlabeled_count)}
 
+{_ai_recovery_card_html(idx)}
 <div class="card">
   <p class="card-title">📊 Training data overview</p>
   <p class="hint" style="margin:0;">Samples collected so far: <b>{total_count}</b>{source_split_html}
@@ -10569,7 +11219,7 @@ a{{color:var(--accent);}}
   {sensor_data_delete_html}
   {sensor_data_download_html}
   <label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor records (.zip)</label>
-  <input type="file" id="sensorDataUploadInput" accept=".zip" style="display:none" onchange="uploadSensorData(this)">
+  <input type="file" id="sensorDataUploadInput" accept=".zip,.json" style="display:none" onchange="uploadSensorData(this)">
   <p id="trainStatus" class="hint"></p>
   <p id="sensorDataStatus" class="hint"></p>
 </div>
@@ -10656,6 +11306,15 @@ a{{color:var(--accent);}}
 
 <script>
 const aiShowFilter = {json.dumps(show)};
+function aiRecover(action, source) {{
+  const el = document.getElementById('aiRecoverStatus');
+  if (el) el.textContent = 'Working...';
+  let url = '/ai-recovery/' + action + (source ? ('?source=' + encodeURIComponent(source)) : '');
+  fetch(url, {{method: 'POST'}}).then(r => r.json()).then(d => {{
+    if (el) el.textContent = (d.ok ? '✓ ' : '✗ ') + (d.message || d.error || '') + (d.ok ? ' Reloading...' : '');
+    if (d.ok) setTimeout(() => window.location.reload(), 1200);
+  }}).catch(e => {{ if (el) el.textContent = '✗ ' + e; }});
+}}
 function openModal(id) {{ document.getElementById(id).classList.add('open'); }}
 function closeModal(id) {{ document.getElementById(id).classList.remove('open'); }}
 document.addEventListener('keydown', e => {{
@@ -11017,8 +11676,8 @@ function uploadSensorData(input) {{
         status.textContent = data.error || 'Failed to restore: unknown error';
         return;
       }}
-      status.textContent = 'Restored sensor data for ' + data.restored + ' sample(s)' +
-        (data.skipped ? (', skipped ' + data.skipped + ' (record no longer exists)') : '') + '.';
+      status.textContent = 'Updated ' + data.restored + ' sample(s) and re-created ' + data.created +
+        ' missing one(s) with their labels and sensor readings. Reload to see them.';
     }})
     .catch(err => {{ status.textContent = 'Failed to restore: ' + err; }})
     .finally(() => {{ input.value = ''; }});

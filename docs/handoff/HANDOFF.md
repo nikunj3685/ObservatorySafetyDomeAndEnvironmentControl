@@ -1,3 +1,5 @@
+> **Historical note (2026-10-19):** this file used to live in `handsOff/`. Mockups are now in `docs/mockups/`; the old `dome-safety-session-updates.bundle` was applied long ago and removed. Current notes for resuming work are kept outside the repo.
+
 # Handoff notes — dome-safety session (last updated 2026-10-06, Safety Checks History added)
 
 This file exists so a **new Claude session/project** can pick up this

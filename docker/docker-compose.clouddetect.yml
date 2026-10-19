@@ -20,7 +20,7 @@ services:
       - MQTT_TOPIC=Astro/SimpleCloudDetect   # only matters if you're also using MQTT elsewhere - harmless if not
     volumes:
       - /home/admin/allsky/tmp/image.jpg:/data/image.jpg:ro   # confirm the filename is really "image.jpg" with: ls -la /home/admin/allsky/tmp/
-      - ./clouddetect-config:/config                        # persists alpaca_config.json across restarts
+      - ../clouddetect-config:/config                        # persists alpaca_config.json across restarts
       # Once Phase 3 (training) is done, mount your trained model over the stock one:
       # - ./keras_model.h5:/app/keras_model.h5:ro
       # - ./labels.txt:/app/labels.txt:ro
