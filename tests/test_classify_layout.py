@@ -46,20 +46,20 @@ m = re.search(r"const aiNextPageUrl = (.*?);", p2).group(1)
 label(ids(p2))
 p3 = get(json.loads(m))
 ck("auto 'load next batch' URL also continues with no skip", ids(p3) == [f"s{i:03d}" for i in range(23, -1, -1)])
-ck("last page: Next disabled", "ai-nav-btn-disabled\">Next" in p3)
+ck("last page: Next disabled", 'class="dis">Next' in p3)
 
 # Prev from a page goes to the images right before it
 save(S)
 p1 = get("/ai-classify?show=all")
 p2 = get(href(p1, "Next"))
-back = get(href(p2, "&larr; Prev"))
+back = get(href(p2, "&lsaquo; Prev"))
 ck("Prev returns to the previous 24", ids(back) == ids(p1))
 ck("old ?page= links still work", ids(get("/ai-classify?show=all&page=1")) == ids(p2))
 ck("garbled cursor ignored", ids(get("/ai-classify?show=all&after=zzz")) == ids(p1))
 
 # Past the end: friendly message + Prev
 end = get("/ai-classify?show=all&after=" + urllib.parse.quote("1000.0~s000"))
-ck("past the end: message + Prev", "No more images after this point" in end and "&larr; Prev</a>" in end)
+ck("past the end: message + Prev", "No more images after this point" in end and "&lsaquo; Prev</a>" in end)
 
 # ---- one-by-one view: classify moves to the next image, any filter ----
 save(S)

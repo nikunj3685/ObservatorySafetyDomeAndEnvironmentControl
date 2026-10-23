@@ -7885,6 +7885,49 @@ def _sc_family(label, safe_labels):
     return "Clear" if low in safe_labels else "Overcast"
 
 
+def _cloud_graph_pos(label, conf, safe_labels):
+    """Where AI Cloud Detect sits on the Overcast/Cloudy/Clear chart, 0 = top
+    (Overcast) .. 1 = bottom (Clear). The class picks the band (Clear;
+    Partly/Mostly Cloudy -> Cloudy; Overcast/Rain/Snow/Freezing Rain ->
+    Overcast) and the line never leaves it; the confidence picks the spot in
+    the band: 100% = deepest (Clear at the bottom, Overcast at the top,
+    Partly/Mostly Cloudy at the middle), less sure = toward the neighbouring
+    band (Partly Cloudy toward Clear, Mostly Cloudy toward Overcast)."""
+    if label is None:
+        return None
+    try:
+        c = max(0.0, min(1.0, float(conf)))
+    except (TypeError, ValueError):
+        c = 1.0
+    d = (max(0.5, c) - 0.5) / 0.5          # 0 at <=50% .. 1 at 100%
+    third, edge = 1.0 / 3.0, 0.02
+    fam = _sc_family(label, safe_labels)
+    low = str(label).strip().lower()
+    if fam == "Clear":
+        return 2 * third + edge + d * (third - 2 * edge)
+    if fam == "Overcast":
+        return third - edge - d * (third - 2 * edge)
+    half = third / 2 - edge
+    if low == "partly cloudy":
+        return 0.5 + (1 - d) * half
+    if low == "mostly cloudy":
+        return 0.5 - (1 - d) * half
+    return 0.5
+
+
+def _rec_cloud_conf(rec, safe_labels):
+    """AI Cloud Detect confidence (0..1) for one history record: the saved
+    snapshot value, else worked back from the older clear score "ic"
+    (= confidence for a SAFE label, 1 - confidence otherwise)."""
+    c = (rec.get("s") or {}).get("cloud_model_confidence")
+    if c is not None:
+        return c
+    ic, lab = rec.get("ic"), rec.get("i")
+    if ic is None or lab is None:
+        return None
+    return ic if str(lab).strip().lower() in safe_labels else 1.0 - ic
+
+
 def _sc_dome_enabled_in_graph():
     try:
         return bool(dome_feature_enabled() and get_setting("features").get("dome_graph_enabled", True))
@@ -7928,7 +7971,12 @@ def _sc_cell(key, rec, safe_labels, detail=False):
         if raw is None:
             return ("No data", "unk")
         fam = _sc_family(raw, safe_labels)
-        text = f"{fam} ({raw})" if (detail and str(raw).strip().lower() != fam.lower()) else fam
+        extra = [str(raw)] if (detail and str(raw).strip().lower() != fam.lower()) else []
+        if detail and key == "cloudimg":
+            conf = _rec_cloud_conf(rec, safe_labels)
+            if conf is not None:
+                extra.append(f"{round(float(conf) * 100)}%")
+        text = f"{fam} ({', '.join(extra)})" if extra else fam
         return (text, SC_FAMILY_CLS[fam])
     return ("", "unk")
 
@@ -8020,7 +8068,8 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
             ai_points = ([p for p in sample_points if first_rec_t is None or p[0] < first_rec_t]
                           + rec_points)
             ai_points.sort(key=lambda p: p[0])
-        cloud_points = [(r["t"], r["ic"]) for r in recs if r.get("ic") is not None] if en["cloudimg"] else []
+        cloud_points = ([(r["t"], _cloud_graph_pos(r["i"], _rec_cloud_conf(r, safe_labels), safe_labels))
+                         for r in recs if r.get("i") is not None] if en["cloudimg"] else [])
 
     if not recs and ((lanes_style and not ai_pre) or (not lanes_style and len(ai_points) < 2 and not cloud_points)):
         return _card('<p class="hint">No safety history to show yet - it records one point a minute '
@@ -8188,7 +8237,7 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
                 label_y += 10.0
         if en["cloudimg"]:
             def y_for_score(sc):
-                return ay + max(0.03, min(0.97, sc)) * ah       # score 0..1 maps linearly across the 3 bands
+                return ay + max(0.0, min(1.0, sc)) * ah         # 0 = top of Overcast .. 1 = bottom of Clear (see _cloud_graph_pos)
             if len(cloud_points) >= 2:
                 segs = [[]]
                 dots = []
@@ -8210,7 +8259,8 @@ def render_sky_history_html(samples, s, tz_name="UTC"):
             else:
                 svg.append(f'<text x="{AI_HISTORY_LEFT_PAD + 80}" y="{ay + ah - 20:.1f}" font-size="8" font-weight="700" '
                            f'fill="#1d6fb8">AI Cloud Detect: no predictions recorded yet</text>')
-            now_c = _cloud_model_clear_score(s, safe_labels)
+            now_c = (_cloud_graph_pos(s.get("cloud_model_predicted"), s.get("cloud_model_confidence"), safe_labels)
+                     if s.get("cloud_model_status") == "active" else None)
             if now_c is not None:
                 now_markers.append(f'<circle cx="{AI_HISTORY_LEFT_PAD}" cy="{y_for_score(now_c):.2f}" r="3.4" fill="#1d6fb8" '
                                    f'stroke="#ffffff" stroke-width="1.2"/>')
@@ -10303,7 +10353,29 @@ def ai_training_image(name):
     return resp
 
 
-def _ai_samples_matching_filter(idx, filt):
+AI_PERIODS = ("both", "day", "night")
+
+
+def _ai_period_arg():
+    """Classify page's Day / Night filter from the request: "both" (default,
+    everything), "day" or "night"."""
+    p = request.args.get("period", "both")
+    return p if p in AI_PERIODS else "both"
+
+
+def _ai_period_ok(sample, period):
+    """Day only / Night only use the Day/Night reading saved with the image;
+    a sample without one shows only under Day + Night."""
+    if period == "both":
+        return True
+    return ((sample.get("sensors") or {}).get("daynight") or "").lower() == period
+
+
+def _ai_samples_matching_filter(idx, filt, period="both"):
+    return [s for s in _ai_samples_matching_filter_base(idx, filt) if _ai_period_ok(s, period)]
+
+
+def _ai_samples_matching_filter_base(idx, filt):
     """Every sample matching a Classify-page filter value: "all" (every
     sample), "unclassified" (no label yet), or "label:<name>" (exactly
     that label) - shared by the page's own display filtering and the
@@ -10335,6 +10407,14 @@ def _ai_bulk_filter_ok(filt):
             or (filt or "").startswith("label:"))
 
 
+def _ai_filtered_count(idx):
+    """How many samples match the Classify page's current filter (`show`),
+    so its pager can update after a label/delete without reloading. None
+    when the request didn't say which filter."""
+    show = request.args.get("show")
+    return len(_ai_samples_matching_filter(idx, show, _ai_period_arg())) if _ai_bulk_filter_ok(show) else None
+
+
 @app.route("/ai-classify-save", methods=["GET"])
 @_with_ai_index_lock
 def ai_classify_save():
@@ -10357,7 +10437,7 @@ def ai_classify_save():
     all_filter = request.args.get("all")
     idx = _load_ai_training_index()
     if _ai_bulk_filter_ok(all_filter):
-        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg())]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids or not label:
@@ -10377,7 +10457,7 @@ def ai_classify_save():
 
     unlabeled_count = sum(1 for s in idx["samples"] if s.get("label") is None)
     return jsonify({"ok": True, "matched": matched, "unlabeled_count": unlabeled_count,
-                     "total_count": len(idx["samples"])})
+                     "total_count": len(idx["samples"]), "filtered_count": _ai_filtered_count(idx)})
 
 
 def _ai_sample_has_image(sample):
@@ -10430,7 +10510,7 @@ def ai_classify_unclassify():
     all_filter = request.args.get("all")
     idx = _load_ai_training_index()
     if _ai_bulk_filter_ok(all_filter):
-        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg())]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids:
@@ -10794,7 +10874,7 @@ def ai_classify_delete():
     all_filter = request.args.get("all")
     if _ai_bulk_filter_ok(all_filter):
         idx = _load_ai_training_index()
-        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter)]
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg())]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids:
@@ -10805,7 +10885,7 @@ def ai_classify_delete():
     idx = _load_ai_training_index()
     return jsonify({"ok": True, "deleted": removed,
                      "unlabeled_count": sum(1 for s in idx["samples"] if s.get("label") is None),
-                     "total_count": len(idx["samples"])})
+                     "total_count": len(idx["samples"]), "filtered_count": _ai_filtered_count(idx)})
 
 
 def _ai_classify_sensor_backup_zip():
@@ -11617,6 +11697,47 @@ def _ai_parse_cursor(value):
         return None
 
 
+def _ai_page_numbers(cur, pages):
+    """Page numbers for the Classify pager: always the first and last page
+    and two either side of `cur` (1-based); None marks a "…" gap."""
+    want = {1, pages} | set(range(cur - 2, cur + 3))
+    out, prev = [], 0
+    for n in sorted(x for x in want if 1 <= x <= pages):
+        if n - prev > 1:
+            out.append(None)
+        out.append(n)
+        prev = n
+    return out
+
+
+def _ai_pager_html(show, start, shown, total, size, prev_url, next_url, period="both"):
+    """Classify grid pager: "Showing a–b of N images · Page p of P" plus
+    Prev / page numbers / Next. Prev/Next keep the cursor links (no skipped
+    images after classifying); a number jumps to that page. The page's JS
+    rebuilds the same thing after label/delete (aiPagerRender)."""
+    pq = "" if period == "both" else f"&amp;period={period}"
+    attrs = (f' data-show="{_html_escape(show)}" data-pq="{pq}" data-start="{start}" data-total="{total}" data-size="{size}"'
+             f' data-prev="{_html_escape(prev_url or "")}" data-next="{_html_escape(next_url or "")}"')
+    if not total:
+        return f'<div class="cls-pager"{attrs}><div class="info">No images for this filter</div></div>'
+    pages = max(1, -(-total // size))
+    cur = min(pages, start // size + 1)
+    info = (f'Showing <b>{start + 1:,}–{start + shown:,}</b> of <b>{total:,}</b> image{"s" if total != 1 else ""}'
+            f' &middot; Page <b>{cur}</b> of <b>{pages}</b>') if shown else (
+            f'<b>{total:,}</b> image{"s" if total != 1 else ""} &middot; {pages} page{"s" if pages != 1 else ""}')
+    show_q = urllib.parse.quote(show)
+    parts = [f'<a href="{_html_escape(prev_url)}">&lsaquo; Prev</a>' if prev_url else '<span class="dis">&lsaquo; Prev</span>']
+    for n in _ai_page_numbers(cur, pages):
+        if n is None:
+            parts.append('<span class="gap">&hellip;</span>')
+        elif n == cur and shown:
+            parts.append(f'<span class="cur">{n}</span>')
+        else:
+            parts.append(f'<a href="/ai-classify?show={show_q}{pq}&amp;view=grid&amp;page={n - 1}">{n}</a>')
+    parts.append(f'<a href="{_html_escape(next_url)}">Next &rsaquo;</a>' if next_url else '<span class="dis">Next &rsaquo;</span>')
+    return f'<div class="cls-pager"{attrs}><div class="info">{info}</div><div class="nums">{"".join(parts)}</div></div>'
+
+
 def _ai_cursor_page(filtered, after, before, page, size):
     """One page of `filtered` (already sorted newest first). Next/Prev use a
     cursor (the last/first sample shown) instead of a page number, so
@@ -11666,7 +11787,9 @@ def ai_classify_page():
     ai_images_count, ai_images_bytes = _ai_training_images_folder_stats()
     ai_images_size_str = _format_size_general(ai_images_bytes)
 
-    filtered = _ai_samples_matching_filter(idx, show)
+    period = _ai_period_arg()
+    pq = "" if period == "both" else f"&period={period}"          # carried on every Classify link
+    filtered = _ai_samples_matching_filter(idx, show, period)
     # Newest first - the most recent capture is what you actually want to
     # check right after it's taken (e.g. "did the sky just clear up?"),
     # and it's what a person expects Prev/Next to walk through in order.
@@ -11681,12 +11804,12 @@ def ai_classify_page():
     has_prev = start > 0
     has_next = start + len(page_samples) < len(filtered)
     show_q = urllib.parse.quote(show)
-    next_url = (f"/ai-classify?show={show_q}&view=grid&after={urllib.parse.quote(_ai_cursor(page_samples[-1]))}"
+    next_url = (f"/ai-classify?show={show_q}{pq}&view=grid&after={urllib.parse.quote(_ai_cursor(page_samples[-1]))}"
                 if has_next and page_samples else None)
     if page_samples:
-        prev_url = f"/ai-classify?show={show_q}&view=grid&before={urllib.parse.quote(_ai_cursor(page_samples[0]))}"
+        prev_url = f"/ai-classify?show={show_q}{pq}&view=grid&before={urllib.parse.quote(_ai_cursor(page_samples[0]))}"
     elif filtered and cur_after is not None:
-        prev_url = f"/ai-classify?show={show_q}&view=grid&before={urllib.parse.quote(request.args['after'])}"
+        prev_url = f"/ai-classify?show={show_q}{pq}&view=grid&before={urllib.parse.quote(request.args['after'])}"
         has_prev = True
     else:
         prev_url = None
@@ -11728,9 +11851,9 @@ def ai_classify_page():
         single_prev_q = "before=" + urllib.parse.quote(request.args["after"])
     else:
         single_prev_q = "before=" + urllib.parse.quote(single_cursor) if single_cursor else ""
-    prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={urllib.parse.quote(show)}&amp;view=single&amp;{single_prev_q}">&larr; Prev</a>'
+    prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={urllib.parse.quote(show)}{_html_escape(pq)}&amp;view=single&amp;{single_prev_q}">&larr; Prev</a>'
                          if total_filtered and (single_end or sidx > 0) else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
-    next_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={urllib.parse.quote(show)}&amp;view=single&amp;after={urllib.parse.quote(single_cursor)}">Next &rarr;</a>'
+    next_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={urllib.parse.quote(show)}{_html_escape(pq)}&amp;view=single&amp;after={urllib.parse.quote(single_cursor)}">Next &rarr;</a>'
                          if single_cursor and sidx < total_filtered - 1 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
 
     label_fn = "applyLabel" if view == "grid" else "applyLabelSingle"
@@ -11751,9 +11874,9 @@ def ai_classify_page():
             f"<option value='label:{c}'{' selected' if show == f'label:{c}' else ''}>{c}</option>"
             for c in label_classes) + "</optgroup>"
 
-    view_toggle_html = (f'<a class="btn" href="/ai-classify?show={show}&amp;view=single&amp;idx=0">👁 One by one</a>'
+    view_toggle_html = (f'<a class="btn" href="/ai-classify?show={show}{_html_escape(pq)}&amp;view=single&amp;idx=0">👁 One by one</a>'
                          if view == "grid" else
-                         f'<a class="btn" href="/ai-classify?show={show}&amp;view=grid&amp;page=0">▦ Grid view</a>')
+                         f'<a class="btn" href="/ai-classify?show={show}{_html_escape(pq)}&amp;view=grid&amp;page=0">▦ Grid view</a>')
 
     # Bulk-select controls only make sense against a grid of checkboxes.
     # "Select ALL" spans every sample matching the current filter across
@@ -11798,6 +11921,9 @@ def ai_classify_page():
                        if has_prev and prev_url else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
     next_link_html = (f'<a class="btn ai-nav-btn" href="{_html_escape(next_url)}">Next &rarr;</a>'
                        if next_url else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
+
+    grid_pager_html = _ai_pager_html(show, start, len(page_samples), len(filtered), AI_CLASSIFY_PAGE_SIZE,
+                                     prev_url if has_prev else None, next_url, period)
 
     # Model status card - how close the classified set is to trainable
     # (per AI_MODEL_MIN_SAMPLES_PER_CLASS), and whether a model already
@@ -12231,6 +12357,15 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .ai-chip{{background:#eceff1;border-radius:6px;padding:2px 6px;font-size:11px;color:var(--muted);}}
 .ai-fullsize-link{{display:inline-block;margin-top:6px;font-size:12px;}}
 .pager{{display:flex;justify-content:space-between;margin-top:16px;}}
+.cls-pager{{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 14px;padding:8px 0;font-size:13px;}}
+.cls-pager .info{{color:#4b5563;}}
+.cls-pager .info b{{color:#1f2328;}}
+.cls-pager .nums{{display:flex;flex-wrap:wrap;gap:4px;align-items:center;}}
+.cls-pager a,.cls-pager span.cur,.cls-pager span.gap,.cls-pager span.dis{{min-width:30px;height:30px;padding:0 8px;display:inline-flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid #d0d5dd;background:#fff;color:#1f2328;text-decoration:none;font-size:13px;box-sizing:border-box;}}
+.cls-pager a:hover{{background:#f1f5f9;}}
+.cls-pager span.cur{{background:#0f766e;border-color:#0f766e;color:#fff;font-weight:700;}}
+.cls-pager span.gap{{border:0;background:none;min-width:14px;padding:0;}}
+.cls-pager span.dis{{opacity:.4;}}
 .ai-delete-btn{{background:#c0392b;}}
 .ai-single-wrap{{display:flex;justify-content:center;}}
 .ai-single-card{{background:#fafbfc;border-radius:10px;padding:14px;position:relative;max-width:640px;width:100%;text-align:center;}}
@@ -12365,6 +12500,7 @@ a{{color:var(--accent);}}
         <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
         <form class="cls-row" action="/ai-classify" method="get">
           <select name="show" onchange="this.form.submit()">{show_options}</select>
+          <select name="period" onchange="this.form.submit()" aria-label="Day / Night">{"".join(f"<option value='{v}'{' selected' if v == period else ''}>{t}</option>" for v, t in (("both", "--"), ("day", "Day"), ("night", "Night")))}</select>
           <input type="hidden" name="view" value="{view}">
           <button type="submit" class="btn">Filter</button>
           {view_toggle_html}
@@ -12375,7 +12511,7 @@ a{{color:var(--accent);}}
         <hr class="cls-sep">
         <div class="cls-row">{label_buttons_html}{unclassify_html}</div>
         <p id="classifyStatus"></p>
-        {'<div class="ai-grid" id="aiGrid">' + cards_html + '</div><div class="pager">' + prev_link_html + next_link_html + '</div>'
+        {grid_pager_html + '<div class="ai-grid" id="aiGrid">' + cards_html + '</div>' + grid_pager_html
          if view == "grid" else
          '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
       </div>
@@ -12549,7 +12685,7 @@ function showUnclassify(query, onDone) {{
 function unclassifySelected() {{
   const status = document.getElementById('classifyStatus');
   if (selectAllMode) {{
-    showUnclassify('all=' + encodeURIComponent(aiShowFilter), d => {{
+    showUnclassify('all=' + encodeURIComponent(aiShowFilter) + AI_PQ, d => {{
       status.textContent = 'Unclassified ' + d.unclassified + ' image(s). Reloading...';
       window.location.reload();
     }});
@@ -12647,11 +12783,50 @@ const aiNextPageUrl = {json.dumps(next_url) if view == "grid" else "null"};
 const aiSingleCursor = {json.dumps(single_cursor)};
 function maybeAutoAdvance() {{
   const grid = document.getElementById('aiGrid');
-  if (!grid || !aiNextPageUrl) return;
+  if (!grid) return;
   if (grid.querySelectorAll('.ai-card').length > 0) return;
+  // Page emptied: next 24 if there are more, else the previous page, else
+  // reload (shows the fresh totals / "No images for this filter").
+  const pg = document.querySelector('.cls-pager');
+  const prevUrl = pg ? pg.dataset.prev : '';
   const status = document.getElementById('classifyStatus');
-  if (status) status.textContent += ' Loading the next batch...';
-  window.location = aiNextPageUrl;
+  if (status) status.textContent += ' Loading...';
+  window.location = aiNextPageUrl || prevUrl || window.location.href;
+}}
+const AI_SHOW = {json.dumps(show)};
+const AI_PQ = {json.dumps(pq)};
+// Rebuild the pager(s) after label/delete: totals for the current filter
+// come from the server (filtered_count), the range from the cards left.
+function aiPagerRender(total) {{
+  document.querySelectorAll('.cls-pager').forEach(pg => {{
+    if (total === null || total === undefined) total = parseInt(pg.dataset.total, 10);
+    pg.dataset.total = total;
+    const start = parseInt(pg.dataset.start, 10), size = parseInt(pg.dataset.size, 10);
+    const shown = document.querySelectorAll('#aiGrid .ai-card').length;
+    const fmt = n => n.toLocaleString('en-US');
+    const plural = n => n === 1 ? 'image' : 'images';
+    if (!total) {{ pg.innerHTML = '<div class="info">No images for this filter</div>'; return; }}
+    const pages = Math.max(1, Math.ceil(total / size));
+    const cur = Math.min(pages, Math.floor(start / size) + 1);
+    const info = shown
+      ? 'Showing <b>' + fmt(start + 1) + '–' + fmt(start + shown) + '</b> of <b>' + fmt(total) + '</b> ' + plural(total) +
+        ' &middot; Page <b>' + cur + '</b> of <b>' + pages + '</b>'
+      : '<b>' + fmt(total) + '</b> ' + plural(total) + ' &middot; ' + pages + (pages === 1 ? ' page' : ' pages');
+    const want = new Set([1, pages]);
+    for (let n = cur - 2; n <= cur + 2; n++) if (n >= 1 && n <= pages) want.add(n);
+    const nums = Array.from(want).sort((a, b) => a - b);
+    const esc = u => u.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    let h = pg.dataset.prev ? '<a href="' + esc(pg.dataset.prev) + '">&lsaquo; Prev</a>' : '<span class="dis">&lsaquo; Prev</span>';
+    let prev = 0;
+    nums.forEach(n => {{
+      if (n - prev > 1) h += '<span class="gap">&hellip;</span>';
+      h += (n === cur && shown) ? '<span class="cur">' + n + '</span>'
+        : '<a href="/ai-classify?show=' + encodeURIComponent(pg.dataset.show) + pg.dataset.pq + '&amp;view=grid&amp;page=' + (n - 1) + '">' + n + '</a>';
+      prev = n;
+    }});
+    h += (pg.dataset.next && start + shown < total) ? '<a href="' + esc(pg.dataset.next) + '">Next &rsaquo;</a>' : '<span class="dis">Next &rsaquo;</span>';
+    pg.innerHTML = '<div class="info">' + info + '</div><div class="nums">' + h + '</div>';
+  }});
 }}
 
 // true once "Select ALL" (spanning every page, not just what's on screen)
@@ -12674,7 +12849,7 @@ function applyLabel(label) {{
   const status = document.getElementById('classifyStatus');
   if (selectAllMode) {{
     status.textContent = 'Saving...';
-    fetch('/ai-classify-save?all={show}&label=' + encodeURIComponent(label))
+    fetch('/ai-classify-save?all={show}' + AI_PQ + '&label=' + encodeURIComponent(label))
       .then(r => r.json())
       .then(data => {{
         if (!data.ok) {{
@@ -12693,7 +12868,7 @@ function applyLabel(label) {{
     return;
   }}
   status.textContent = 'Saving...';
-  fetch('/ai-classify-save?ids=' + encodeURIComponent(ids.join(',')) + '&label=' + encodeURIComponent(label))
+  fetch('/ai-classify-save?ids=' + encodeURIComponent(ids.join(',')) + '&label=' + encodeURIComponent(label) + '&show=' + encodeURIComponent(AI_SHOW) + AI_PQ)
     .then(r => r.json())
     .then(data => {{
       if (!data.ok) {{
@@ -12709,6 +12884,7 @@ function applyLabel(label) {{
       if (totalEl) totalEl.textContent = data.total_count;
       if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
       status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
+      aiPagerRender(data.filtered_count);
       maybeAutoAdvance();
     }})
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
@@ -12718,7 +12894,7 @@ function deleteSelected() {{
   if (selectAllMode) {{
     if (!confirm('Delete ALL matching image(s)? This cannot be undone.')) return;
     status.textContent = 'Deleting...';
-    fetch('/ai-classify-delete?all={show}')
+    fetch('/ai-classify-delete?all={show}' + AI_PQ)
       .then(r => r.json())
       .then(data => {{
         if (!data.ok) {{
@@ -12738,7 +12914,7 @@ function deleteSelected() {{
   }}
   if (!confirm('Delete ' + ids.length + ' selected image(s)? This cannot be undone.')) return;
   status.textContent = 'Deleting...';
-  fetch('/ai-classify-delete?ids=' + encodeURIComponent(ids.join(',')))
+  fetch('/ai-classify-delete?ids=' + encodeURIComponent(ids.join(',')) + '&show=' + encodeURIComponent(AI_SHOW) + AI_PQ)
     .then(r => r.json())
     .then(data => {{
       if (!data.ok) {{
@@ -12754,6 +12930,7 @@ function deleteSelected() {{
       if (totalEl) totalEl.textContent = data.total_count;
       if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
       status.textContent = 'Deleted ' + data.deleted + ' image(s).';
+      aiPagerRender(data.filtered_count);
       maybeAutoAdvance();
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
@@ -12928,7 +13105,7 @@ function applyLabelSingle(label) {{
       // "unclassified only": it drops OUT of the list, so staying at the
       // same index naturally shows whatever shifted into that slot next.
       // Always the image right after this one, whichever filter is on.
-      window.location = '/ai-classify?show={urllib.parse.quote(show)}&view=single&after=' + encodeURIComponent(aiSingleCursor);
+      window.location = '/ai-classify?show={urllib.parse.quote(show)}{pq}&view=single&after=' + encodeURIComponent(aiSingleCursor);
     }})
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
 }}
@@ -12948,7 +13125,7 @@ function deleteSingle() {{
       }}
       // A deleted image always drops out of every list, so staying at the
       // same index shows whatever shifted into that slot next.
-      window.location = '/ai-classify?show={urllib.parse.quote(show)}&view=single&after=' + encodeURIComponent(aiSingleCursor);
+      window.location = '/ai-classify?show={urllib.parse.quote(show)}{pq}&view=single&after=' + encodeURIComponent(aiSingleCursor);
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
 }}
