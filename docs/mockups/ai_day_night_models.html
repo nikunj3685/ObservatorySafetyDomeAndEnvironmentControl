@@ -1,0 +1,61 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mockup: Day / Night AI Models</title>
+<style>
+:root{--bg:#0f1419;--card:#1a2129;--line:#2c3742;--text:#e6edf3;--mut:#8b98a5;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,sans-serif;padding:16px}
+h1{font-size:18px;margin:0 0 4px}.note{color:var(--mut);font-size:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px;max-width:760px}
+.card h2{font-size:15px;margin:0 0 10px}
+.row{display:grid;grid-template-columns:200px 1fr;gap:10px;align-items:center;margin:8px 0}
+select{background:#0d1117;color:var(--text);border:1px solid var(--line);border-radius:5px;padding:5px 8px;font-size:14px}
+.acc{display:inline-block;margin-left:10px;font-size:13px}
+.pill{padding:2px 8px;border-radius:10px;font-weight:600;font-size:12px}
+.g{background:#1f3a26;color:var(--ok)}.y{background:#3a3016;color:var(--warn)}.r{background:#3d1d1d;color:var(--bad)}
+table{border-collapse:collapse;width:100%;margin-top:6px;font-size:13px}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(--mut);font-weight:500}
+tr.sel td{background:#16263a}
+.mut{color:var(--mut);font-size:12px}
+.dash{display:flex;justify-content:space-between;align-items:center}
+.tag{font-size:11px;color:var(--acc);border:1px solid var(--acc);border-radius:4px;padding:1px 5px;margin-left:6px}
+@media(max-width:560px){.row{grid-template-columns:1fr}}
+</style></head><body>
+<h1>Mockup — AI Sky Prediction: Day / Night models</h1>
+<div class="note">Numbers from your 18 Oct export (4,717 labelled samples: 2,752 day, 1,965 night). Live page recomputes them at each training.</div>
+
+<div class="card">
+<h2>Settings → Safety Checks → AI Model check → Model per period</h2>
+<div class="row"><label>Model used during <b>day</b></label>
+<div><select id="selDay" onchange="upd()"><option value="all" selected>Day + Night model</option><option value="day">Day model</option><option value="night">Night model</option></select>
+<span class="acc" id="accDay"></span></div></div>
+<div class="row"><label>Model used during <b>night</b></label>
+<div><select id="selNight" onchange="upd()"><option value="all">Day + Night model</option><option value="day">Day model</option><option value="night" selected>Night model</option></select>
+<span class="acc" id="accNight"></span></div></div>
+<div class="mut">Day/Night switch follows the existing Daytime check (sun altitude). Steadier-reading buffer resets when the model switches.</div>
+
+<table id="tbl"><thead><tr><th>Model</th><th>Trained on</th><th>Accuracy — day data</th><th>Accuracy — night data</th><th>Warm clear nights (≥10 °C)</th></tr></thead><tbody></tbody></table>
+<div class="mut" style="margin-top:6px">Highlighted rows = models in use. Last trained: 18 Oct 2026 21:40.</div>
+</div>
+
+<div class="card">
+<h2>Classify page → Train model</h2>
+<div>“Train sensor model” now trains all three models in one click.</div>
+<div class="mut">Result: Day model 2,752 samples · Night model 1,965 · Day + Night 4,717</div>
+</div>
+
+<div class="card">
+<h2>Dashboard row</h2>
+<div class="dash"><span>AI Sky Prediction <span class="tag" id="dashTag">Night model</span></span><span><b style="color:var(--ok)">Clear</b> <span class="mut">2.1 °C from Cloudy · median of 10</span></span></div>
+</div>
+
+<script>
+const M={all:{n:"Day + Night model",on:"4,717 (all)",d:70,ni:78,w:2},day:{n:"Day model",on:"2,752 (day)",d:71,ni:75,w:0},night:{n:"Night model",on:"1,965 (night)",d:59,ni:77,w:95}};
+const cls=v=>v>=75?"g":v>=65?"y":"r";
+function upd(){const d=selDay.value,n=selNight.value;
+accDay.innerHTML=`<span class="pill ${cls(M[d].d)}">${M[d].d}% on day data</span>`;
+accNight.innerHTML=`<span class="pill ${cls(M[n].ni)}">${M[n].ni}% on night data</span> <span class="pill ${cls(M[n].w)}">warm clear ${M[n].w}%</span>`;
+tbl.tBodies[0].innerHTML=Object.entries(M).map(([k,m])=>`<tr class="${k===d||k===n?'sel':''}"><td>${m.n}</td><td>${m.on}</td><td>${m.d}%</td><td>${m.ni}%</td><td>${m.w}%</td></tr>`).join("");
+dashTag.textContent=M[n].n;}
+upd();
+</script>
+</body></html>

@@ -284,6 +284,21 @@ DEFAULT_SETTINGS = {
         "ai_smooth_readings": 10,
         "ai_smooth_method": "median",
         "ai_deadband_c": 0.5,
+        # Ignore short MLX sky jumps: a sky reading that jumps more than
+        # ai_spike_jump_c from the accepted value is ignored until it has
+        # lasted ai_spike_hold_min minutes (a real cloud stays). Off = as before.
+        "ai_spike_enabled": False,
+        "ai_spike_jump_c": 5.0,
+        "ai_spike_hold_min": 2,
+        # Combine AI Sky Prediction with AI Cloud Detect: when the sensor's
+        # confidence is below ai_camera_below_pct, the camera's answer is used
+        # (Clear -> Clear, any cloud -> Cloudy). Off = as before.
+        "ai_camera_combine_enabled": False,
+        "ai_camera_below_pct": 75,
+        # Which sensor model is used by day / by night: "all" (Day + Night),
+        # "day" or "night". Training always builds all three.
+        "ai_model_day": "all",
+        "ai_model_night": "night",
         # Sixth gate, off by default: a genuine image classifier trained by
         # the separate cloud-training-server (see cloud-training-server/ in
         # this repo) from the SAME labeled Classify page samples as the AI
@@ -828,6 +843,74 @@ def _log_sensor_snapshot():
         "box_temp_c": s["dht_temp_c"] if box_fresh else None,
         "box_humidity": s["dht_humidity"] if box_fresh else None,
     }
+
+
+def _full_sensor_snapshot():
+    """Every reading from the sensors and features that are turned on right
+    now - saved with each training image and each safety-history minute,
+    not just the ones the models use today. A sensor that's turned off is
+    left out entirely; one that's on but has no fresh reading is saved as
+    None, so a dropout is visible. Never raises."""
+    try:
+        now = time.time()
+        with sensor_lock:
+            s = dict(sensor_state)
+        with heater_lock:
+            h = dict(heater_state)
+        checks = get_setting("safety_checks")
+        fresh = lambda ok, t: bool(ok) and now - (t or 0) <= STALE_AFTER_SEC
+        r = lambda v, n=2: None if v is None else round(float(v), n)
+        out = {"sun_elevation_deg": r(s.get("solar_elevation_deg"), 1),
+               "raw_safe": s.get("raw_safe")}
+        if MLX_INSTALLED:
+            ok = fresh(s.get("mlx_ok"), s.get("mlx_last_poll"))
+            out.update({"mlx_body_c": r(s.get("mlx_ambient_c")) if ok else None,
+                        "mlx_ambient_source": s.get("mlx_ambient_ref_source")})
+        if BME280_INSTALLED:
+            ok = fresh(s.get("bme_ok"), s.get("bme_last_poll"))
+            out.update({"bme_temp_c": r(s.get("bme_temp_c")) if ok else None,
+                        "bme_humidity": r(s.get("bme_humidity"), 1) if ok else None,
+                        "bme_pressure_hpa": r(s.get("bme_pressure"), 1) if ok else None})
+        if DHT11_INSTALLED:
+            ok = fresh(s.get("dht_ok"), s.get("dht_last_poll"))
+            out.update({"dht_temp_c": r(s.get("dht_temp_c"), 1) if ok else None,
+                        "dht_humidity": r(s.get("dht_humidity"), 1) if ok else None})
+        if RAIN_INSTALLED:
+            out["rain_detected"] = s.get("rain_detected") if fresh(s.get("rain_ok"), s.get("rain_last_poll")) else None
+        t, rh = s.get("env_temp_c"), s.get("env_humidity")
+        if t is not None and rh is not None:
+            dp = dew_point_c(t, rh)
+            out.update({"dew_point_c": r(dp), "dew_spread_c": r(t - dp)})
+        if heater_feature_enabled():
+            out.update({"heater_on": h.get("on"), "heater_power_percent": h.get("target_power_percent"),
+                        "heater_auto_power_percent": h.get("auto_power_percent"),
+                        "heater_freezing": h.get("freezing"), "heater_dew_risk": h.get("dew_risk")})
+        if checks.get("ml_cloud_enabled"):
+            ok = fresh(s.get("cloud_ok"), s.get("cloud_last_poll"))
+            out.update({"ml_cloud_class": s.get("cloud_class") if ok else None,
+                        "ml_cloud_confidence": r(s.get("cloud_confidence"), 3) if ok else None})
+        if s.get("ai_model_status") not in (None, "untrained"):
+            out.update({"ai_model_predicted": s.get("ai_model_predicted"),
+                        "ai_model_value_c": r(s.get("ai_model_anomaly_c")),
+                        "ai_model_confidence": s.get("ai_model_confidence"),
+                        "ai_model_in_use": s.get("ai_model_variant")})
+        if s.get("cloud_model_status") == "active":
+            out.update({"cloud_model_predicted": s.get("cloud_model_predicted"),
+                        "cloud_model_confidence": r(s.get("cloud_model_confidence"), 3)})
+        gates = {"daynight": ("daynight_enabled", "daynight_pass"), "rain": ("rain_enabled", "rain_pass"),
+                 "mlx": ("mlx_gate_enabled", "mlx_cloud_pass"), "ml_cloud": ("ml_cloud_enabled", "ml_cloud_pass"),
+                 "ai_model": ("ai_model_enabled", "ai_model_pass"),
+                 "cloud_model": ("cloud_model_enabled", "cloud_model_pass")}
+        out["checks_passed"] = {g: s.get(k) for g, (en, k) in gates.items() if checks.get(en) and s.get(k) is not None}
+        if dome_feature_enabled():
+            try:
+                out["dome_state"] = dome.snapshot()["state"]
+            except Exception:
+                out["dome_state"] = None
+        return out
+    except Exception as e:
+        print(f"[sensor] full snapshot failed: {e}")
+        return {}
 
 
 def _format_sky_line(s, loc):
@@ -1477,6 +1560,16 @@ def _ai_training_sensor_features():
     snapshot["mlx_sky_c"] = s["mlx_sky_c"] if mlx_fresh else None
     snapshot["mlx_ambient_ref_c"] = s["mlx_ambient_ref_c"] if mlx_fresh else None
     snapshot["mlx_delta_c"] = s["mlx_delta_c"] if mlx_fresh else None
+    # Sensors that are turned off are left out (see _full_sensor_snapshot).
+    if not RAIN_INSTALLED:
+        snapshot.pop("rain", None)
+    if not DHT11_INSTALLED:
+        snapshot.pop("box_temp_c", None)
+        snapshot.pop("box_humidity", None)
+    if not get_setting("safety_checks").get("ml_cloud_enabled"):
+        snapshot.pop("ml_cloud", None)
+    for k, v in _full_sensor_snapshot().items():
+        snapshot.setdefault(k, v)
     return snapshot
 
 
@@ -1751,15 +1844,17 @@ def _fit_corrected_delta_thresholds(by_class, slope, intercept):
     # score(i1, i2) = correctly-placed count if everything before i1 is
     # called Overcast, everything from i1 up to i2 is called Cloudy, and
     # everything from i2 on is called Clear (i1 <= i2).
+    # score = (prefix_overcast[i1] - prefix_cloudy[i1]) + (prefix_cloudy[i2] + total_clear - prefix_clear[i2]),
+    # so for each i2 only the best i1 <= i2 seen so far matters - one pass, O(n).
     best_score, best_i1, best_i2 = -1, 0, n
-    for i1 in range(0, n + 1):
-        overcast_correct = prefix_overcast[i1]
-        for i2 in range(i1, n + 1):
-            cloudy_correct = prefix_cloudy[i2] - prefix_cloudy[i1]
-            clear_correct = total_clear - prefix_clear[i2]
-            score = overcast_correct + cloudy_correct + clear_correct
-            if score > best_score:
-                best_score, best_i1, best_i2 = score, i1, i2
+    run_best, run_i1 = None, 0
+    for i2 in range(0, n + 1):
+        left = prefix_overcast[i2] - prefix_cloudy[i2]
+        if run_best is None or left > run_best:
+            run_best, run_i1 = left, i2
+        score = run_best + prefix_cloudy[i2] + total_clear - prefix_clear[i2]
+        if score > best_score:
+            best_score, best_i1, best_i2 = score, run_i1, i2
 
     def _cut_value(i):
         if i <= 0:
@@ -1811,27 +1906,162 @@ def _train_ai_sky_model():
         return None, (f"These labels have fewer than {AI_MODEL_MIN_SAMPLES_PER_CLASS} classified samples so far: "
                        f"{', '.join(too_few)}. Classify more of those before training.")
 
-    mlx_correction_slope, mlx_correction_intercept = _fit_mlx_delta_correction(by_class)
-    threshold_clear_c, threshold_overcast_c = _fit_corrected_delta_thresholds(
-        by_class, mlx_correction_slope, mlx_correction_intercept)
+    # Three models from the same samples: Day + Night (all), Day only, Night
+    # only (sensors.daynight at capture). Settings -> Safety Checks picks
+    # which one is used by day and which by night.
+    variants, variant_errors = {"all": _fit_sky_variant(by_class)}, {}
+    for key, period in (("day", "Day"), ("night", "Night")):
+        sub = {}
+        for cls, samples in by_class.items():
+            keep = [x for x in samples if (x.get("sensors") or {}).get("daynight") == period]
+            if len(keep) >= AI_MODEL_MIN_SAMPLES_PER_CLASS:
+                sub[cls] = keep
+        if len(sub) < 2:
+            variants[key] = None
+            variant_errors[key] = f"not enough classified {period.lower()} samples (need 2+ labels with {AI_MODEL_MIN_SAMPLES_PER_CLASS}+ each)"
+        else:
+            variants[key] = _fit_sky_variant(sub)
 
-    total = sum(len(samples) for samples in by_class.values())
-    class_counts = {cls: len(samples) for cls, samples in by_class.items()}
-
-    model = {
-        "trained_at": time.time(),
-        "sample_count": total,
-        "classes": sorted(by_class.keys()),
-        "class_counts": class_counts,
-        "mlx_correction_slope": mlx_correction_slope,
-        "mlx_correction_intercept": mlx_correction_intercept,
-        "threshold_clear_c": threshold_clear_c,
-        "threshold_overcast_c": threshold_overcast_c,
-        "method": "corrected_delta",
-    }
+    model = dict(variants["all"])     # top level = Day + Night model, so older code still reads it
+    model["variants"] = variants
+    model["variant_errors"] = variant_errors
+    model["accuracy"] = _ai_variant_accuracy(by_class, variants)
     _save_ai_sky_model(model)
     _ai_index_copy("sensor-train")
     return model, None
+
+
+def _fit_sky_variant(by_class):
+    """One corrected-delta model (correction line + 2 cutoffs) from by_class."""
+    slope, intercept = _fit_mlx_delta_correction(by_class)
+    threshold_clear_c, threshold_overcast_c = _fit_corrected_delta_thresholds(by_class, slope, intercept)
+    return {
+        "trained_at": time.time(),
+        "sample_count": sum(len(v) for v in by_class.values()),
+        "classes": sorted(by_class.keys()),
+        "class_counts": {cls: len(v) for cls, v in by_class.items()},
+        "mlx_correction_slope": slope,
+        "mlx_correction_intercept": intercept,
+        "threshold_clear_c": threshold_clear_c,
+        "threshold_overcast_c": threshold_overcast_c,
+        "method": "corrected_delta",
+        "confidence": _fit_ai_confidence(by_class, slope, intercept),
+    }
+
+
+AI_FAMILIES = ["Clear", "Cloudy", "Overcast"]
+
+
+def _fit_ai_confidence(by_class, slope, intercept):
+    """How sure the sensor model is: a small softmax (multinomial logistic)
+    fit of Clear/Cloudy/Overcast against the corrected value, from this
+    site's own classified samples - so "72%" means past samples with this
+    value were that class about 72% of the time. Pure Python (samples are
+    grouped into 0.1 C bins, so it's quick on a Pi). None if too little data."""
+    counts = {}
+    for label, samples in by_class.items():
+        fam = AI_MODEL_FAMILY_MAP.get(label.strip().lower())
+        if fam is None:
+            continue
+        k = AI_FAMILIES.index(fam)
+        for x in samples:
+            a = _mlx_delta_anomaly(x, slope, intercept)
+            if a is not None:
+                key = (round(a, 1), k)
+                counts[key] = counts.get(key, 0) + 1
+    n = sum(counts.values())
+    if n < AI_MODEL_MIN_THRESHOLD_SAMPLES or len({k for _, k in counts}) < 2:
+        return None
+    mean = sum(a * c for (a, _), c in counts.items()) / n
+    sd = (sum((a - mean) ** 2 * c for (a, _), c in counts.items()) / n) ** 0.5 or 1.0
+    bins = {}
+    for (a, k), c in counts.items():
+        bins.setdefault((a - mean) / sd, [0, 0, 0])[k] += c
+    items = list(bins.items())
+    w, b = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    for _ in range(600):
+        gw, gb = [0.0] * 3, [0.0] * 3
+        for z, cnt in items:
+            e = [math.exp(w[k] * z + b[k]) for k in range(3)]
+            tot = sum(e)
+            tc = sum(cnt)
+            for k in range(3):
+                d = e[k] / tot * tc - cnt[k]
+                gw[k] += d * z
+                gb[k] += d
+        for k in range(3):
+            w[k] -= 1.0 * (gw[k] / n + 1e-3 * w[k])
+            b[k] -= 1.0 * gb[k] / n
+    return {"mean": mean, "sd": sd, "w": w, "b": b}
+
+
+def _ai_confidence(model, value, predicted):
+    """% (0-100) that `predicted` is right at this corrected value, or None."""
+    conf = (model or {}).get("confidence")
+    if not conf or value is None or predicted not in AI_FAMILIES:
+        return None
+    z = (value - conf["mean"]) / conf["sd"]
+    e = [math.exp(conf["w"][k] * z + conf["b"][k]) for k in range(3)]
+    return round(100.0 * e[AI_FAMILIES.index(predicted)] / sum(e))
+
+
+AI_WARM_NIGHT_C = 10.0   # "warm clear night" accuracy: clear night samples at ambient >= this
+
+
+def _ai_variant_accuracy(by_class, variants):
+    """For each trained model: % of day samples and of night samples whose
+    Clear/Cloudy/Overcast family it gets right (single readings, no
+    smoothing), plus % of clear nights at ambient >= AI_WARM_NIGHT_C it
+    calls Clear. Measured on the same samples it was trained from."""
+    rows = []
+    for label, samples in by_class.items():
+        fam = AI_MODEL_FAMILY_MAP.get(label.strip().lower())
+        if fam is None:
+            continue
+        for x in samples:
+            sn = x.get("sensors") or {}
+            if sn.get("mlx_delta_c") is None or sn.get("mlx_ambient_ref_c") is None:
+                continue
+            rows.append((fam, sn.get("daynight"), x))
+    out = {}
+    for key, m in variants.items():
+        if not m:
+            continue
+        hit = {"Day": [0, 0], "Night": [0, 0], "warm": [0, 0], "all": [0, 0]}
+        for fam, dn, x in rows:
+            a = _mlx_delta_anomaly(x, m["mlx_correction_slope"], m["mlx_correction_intercept"])
+            pred = _ai_zone(a, m["threshold_clear_c"], m["threshold_overcast_c"])
+            if dn in ("Day", "Night"):
+                hit[dn][0] += pred == fam
+                hit[dn][1] += 1
+            hit["all"][0] += pred == fam
+            hit["all"][1] += 1
+            if dn == "Night" and fam == "Clear" and x["sensors"]["mlx_ambient_ref_c"] >= AI_WARM_NIGHT_C:
+                hit["warm"][0] += pred == "Clear"
+                hit["warm"][1] += 1
+        pct = lambda h: round(100.0 * h[0] / h[1]) if h[1] else None
+        out[key] = {"day": pct(hit["Day"]), "night": pct(hit["Night"]), "all": pct(hit["all"]),
+                    "warm_clear_night": pct(hit["warm"]),
+                    "n_day": hit["Day"][1], "n_night": hit["Night"][1], "n_warm": hit["warm"][1]}
+    return out
+
+
+AI_MODEL_VARIANT_NAMES = {"all": "Day + Night model", "day": "Day model", "night": "Night model"}
+
+
+def _ai_pick_model(model, is_day, checks):
+    """The model to use right now: Settings -> ai_model_day / ai_model_night
+    pick a variant; an older single-model file or a variant that couldn't be
+    trained falls back to the Day + Night model. Returns (model, key, fell_back)."""
+    if not model:
+        return None, None, False
+    want = checks.get("ai_model_day", "all") if is_day else checks.get("ai_model_night", "night")
+    variants = model.get("variants")
+    if not variants:
+        return model, "all", want != "all"
+    if variants.get(want):
+        return variants[want], want, False
+    return variants.get("all") or model, "all", want != "all"
 
 
 def _predict_ai_sky_class(model, features):
@@ -2088,6 +2318,22 @@ def _format_size_general(n):
     if n < 1024 ** 3:
         return f"{n / 1024 ** 2:.1f} MB"
     return f"{n / 1024 ** 3:.2f} GB"
+
+
+def _ai_images_on_disk():
+    """Set of file names currently in the training images folder."""
+    try:
+        return set(os.listdir(AI_TRAINING_IMAGES_DIR))
+    except OSError:
+        return set()
+
+
+def _cloud_pending(sample, on_disk):
+    """True if this sample can still go to the next cloud (All Sky) training:
+    classified, not yet learned, and its image is still on disk. Records
+    whose image was deleted can never be uploaded, so they are not pending."""
+    return bool(sample.get("label") and not sample.get("cloud_trained_at")
+                and sample.get("image") and sample["image"] in on_disk)
 
 
 def _absorb_cloud_training_success(sample_ids):
@@ -2903,7 +3149,8 @@ def maybe_auto_train():
         return  # a job (manual or auto) is already running - don't pile another on top
 
     idx = _load_ai_training_index()
-    new_count = sum(1 for s in idx["samples"] if s.get("label") and not s.get("cloud_trained_at"))
+    on_disk = _ai_images_on_disk()
+    new_count = sum(1 for s in idx["samples"] if _cloud_pending(s, on_disk))
     min_new = max(1, int(ai_cfg.get("auto_train_min_new_samples", 20)))
     if new_count < min_new:
         return
@@ -3281,6 +3528,8 @@ sensor_state = {
     # of a confidence percentage (this method doesn't have one - see
     # _predict_ai_sky_class()'s docstring).
     "ai_model_anomaly_c": None, "ai_model_margin_c": None, "ai_model_margin_to": None, "ai_model_smooth_n": 0,
+    "ai_model_variant": None, "ai_model_variant_fallback": False,
+    "ai_model_camera_decided": False, "mlx_spike_since": None,
     # Phase 5 - cloud-trained image model gate status (see poll_cloud_model()
     # for the full set of status values), independent of cloud_model_enabled.
     "cloud_model_status": "untrained", "cloud_model_predicted": None, "cloud_model_confidence": None,
@@ -3558,8 +3807,83 @@ def refresh_daynight():
         sensor_state["dusk_local_str"] = _format_ampm(dusk_utc.astimezone(tz).strftime("%I:%M %p"))
 
 
+_mlx_spike = {"acc": None, "pending_since": None, "last_poll": None}
+
+
+def _mlx_spike_filter(raw, poll_ts, now, checks):
+    """Spike filter on the MLX sky reading (Settings -> Safety Checks ->
+    Ignore short sky jumps). Returns the sky value to use: the raw reading,
+    or - while a jump of more than ai_spike_jump_c hasn't yet lasted
+    ai_spike_hold_min minutes - the last accepted value. Raw readings are
+    still what is saved and trained on."""
+    st = _mlx_spike
+    if not checks.get("ai_spike_enabled") or not MLX_INSTALLED or raw is None:
+        st.update(acc=None, pending_since=None, last_poll=None)
+        sensor_state["mlx_spike_since"] = None
+        return raw
+    jump = max(0.5, float(checks.get("ai_spike_jump_c", 5.0) or 5.0))
+    hold = max(0.0, float(checks.get("ai_spike_hold_min", 2) or 0)) * 60
+    if poll_ts != st["last_poll"]:          # a new MLX reading
+        st["last_poll"] = poll_ts
+        if st["acc"] is None or abs(raw - st["acc"]) <= jump:
+            st.update(acc=raw, pending_since=None)
+        elif st["pending_since"] is None:
+            st["pending_since"] = now
+        if st["pending_since"] is not None and now - st["pending_since"] >= hold:
+            st.update(acc=raw, pending_since=None)   # lasted long enough: a real change
+    sensor_state["mlx_spike_since"] = st["pending_since"]
+    return st["acc"]
+
+
 _raw_safe_since = None  # timestamp since the raw fused safety check last became continuously True
 _prev_delayed_safe = False  # edge detection for the safe-report hold timer actually completing
+
+# ---- Keep the last SAFE/UNSAFE state across a restart ----------------------
+# The reported state is saved every few seconds. On start, if the saved state
+# is at most RESTORE_MAX_AGE_SEC old (a restart, or a crash + auto-restart),
+# it is reported again until every safety check in use has a real reading;
+# then the normal checks take over (UNSAFE straight away if they say so, and
+# UNSAFE -> SAFE always waits out the hold delay). Older than that (service
+# was stopped, Pi was off) -> start UNSAFE as before.
+SAFETY_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety_state.json")
+RESTORE_MAX_AGE_SEC = 60
+RESTORE_WAIT_MAX_SEC = 120    # stop waiting for first readings after this - a check still without data then counts as failing
+SAFETY_STATE_SAVE_SEC = 10
+_safety_state_saved = {"t": 0.0, "safe": None}
+
+
+def _load_restored_safety(now=None):
+    """{'safe': bool, 'age': sec, 'until': ts} when the saved state is recent
+    enough to restore, else None (start UNSAFE)."""
+    now = time.time() if now is None else now
+    try:
+        with open(SAFETY_STATE_PATH) as f:
+            saved = json.load(f)
+        age = now - float(saved["t"])
+        if 0 <= age <= RESTORE_MAX_AGE_SEC and isinstance(saved.get("safe"), bool):
+            return {"safe": saved["safe"], "age": age, "until": now + RESTORE_WAIT_MAX_SEC}
+    except Exception:
+        pass
+    return None
+
+
+def _save_safety_state(safe, now=None):
+    """Atomic save of the reported state - on every change and every
+    SAFETY_STATE_SAVE_SEC. Never raises."""
+    now = time.time() if now is None else now
+    if safe == _safety_state_saved["safe"] and now - _safety_state_saved["t"] < SAFETY_STATE_SAVE_SEC:
+        return
+    try:
+        tmp = SAFETY_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"t": now, "safe": bool(safe)}, f)
+        os.replace(tmp, SAFETY_STATE_PATH)
+        _safety_state_saved.update(t=now, safe=bool(safe))
+    except Exception as e:
+        print(f"[safety] could not save safety state: {e}")
+
+
+_restored_safety = _load_restored_safety()
 
 # Tiny per-check change history, purely for the light-gray "previous status"
 # line shown next to each safety-affecting reading on the page - lets you
@@ -3744,6 +4068,15 @@ def _build_safety_history_record(now=None):
             rec["d"] = dome.snapshot()["state"]
         except Exception:
             pass
+    # Every active sensor's reading this minute (see _full_sensor_snapshot),
+    # for the download - the graph itself only uses the short keys above.
+    full = _full_sensor_snapshot()
+    full.update({k: v for k, v in _log_sensor_snapshot().items()
+                 if k in ("environment_temp_c", "environment_humidity", "box_temp_c", "box_humidity")})
+    with sensor_lock:
+        full.update({"mlx_sky_c": sensor_state.get("mlx_sky_c"), "mlx_delta_c": sensor_state.get("mlx_delta_c"),
+                     "mlx_ambient_ref_c": sensor_state.get("mlx_ambient_ref_c")})
+    rec["s"] = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in full.items()}
     return rec
 
 
@@ -3761,6 +4094,9 @@ def _record_safety_history():
 
 
 _load_safety_history()
+if _restored_safety and _restored_safety["safe"]:
+    sensor_state["overall_safe"] = True
+    print(f"[safety] restart: restored SAFE (saved {_restored_safety['age']:.0f} s ago) until sensors report")
 
 # Dome open/close actions for the graph's Dome lane: one line per command
 # actually issued (action open|close + the trigger string DomeController
@@ -3880,12 +4216,173 @@ def _track_status_change(key, current_value, now):
 # readings, and a dead band means the class only changes once the value is
 # past a cutoff by more than `ai_deadband_c`.
 _ai_smooth_buf = deque()          # (poll_ts, anomaly)
-_ai_smooth_state = {"last_poll": None, "prev": None}
+_ai_smooth_state = {"last_poll": None, "prev": None, "variant": None}
 AI_ZONE_ORDER = ["Overcast", "Cloudy", "Clear"]
 
 
 def _ai_zone(value, tc, to):
     return "Clear" if value >= tc else ("Cloudy" if value >= to else "Overcast")
+
+
+def _ai_variant_summary(model, plain=False):
+    """'Day + Night model 4717 · Day model 2752 · Night model 1965' (sample counts)."""
+    variants = model.get("variants") or {"all": model}
+    parts = []
+    for k, n in AI_MODEL_VARIANT_NAMES.items():
+        m = variants.get(k)
+        parts.append(f"{n}: {m['sample_count']} samples" if m else f"{n}: not trained")
+    txt = " · ".join(parts)
+    return txt if plain else f'<span class="muted">{_html_escape(txt)} — choose which is used by day and by night under <a href="/settings#ai-model-choice">Settings → Safety Checks</a>.</span>'
+
+
+def _ai_own_accuracy(model):
+    """{variant: % right on its own data} - Day model on day samples, Night
+    model on night samples, Day + Night model on all - plus warm-clear-night
+    % for the Day + Night and Night models. Empty if no accuracy stored."""
+    acc = (model or {}).get("accuracy") or {}
+    out = {}
+    if acc.get("day"):
+        out["day"] = acc["day"].get("day")
+    if acc.get("night"):
+        out["night"] = acc["night"].get("night")
+    a = acc.get("all")
+    if a:
+        if a.get("all") is not None:
+            out["all"] = a["all"]
+        elif a.get("n_day") or a.get("n_night"):   # older model file: weight day/night results
+            nd, nn = a.get("n_day", 0), a.get("n_night", 0)
+            out["all"] = round(((a.get("day") or 0) * nd + (a.get("night") or 0) * nn) / (nd + nn))
+    return out
+
+
+def _ai_accuracy_row_html(model, checks):
+    """Classify page: 'Accuracy' row under Last trained."""
+    own = _ai_own_accuracy(model)
+    if not own:
+        return ""
+    acc = model.get("accuracy") or {}
+    day_sel, night_sel = checks.get("ai_model_day", "all"), checks.get("ai_model_night", "night")
+    pills = ""
+    for k in ("day", "night", "all"):
+        v = own.get(k)
+        if v is None:
+            continue
+        cls = "g" if v >= 75 else ("y" if v >= 65 else "r")
+        use = ("in use day &amp; night" if k == day_sel == night_sel else
+               "in use by day" if k == day_sel else "in use at night" if k == night_sel else "")
+        pills += (f'<span class="acc-p {cls}">{AI_MODEL_VARIANT_NAMES[k]} {v}%'
+                  + (f' <span class="acc-use">{use}</span>' if use else "") + "</span>")
+    warm = ", ".join(f"{AI_MODEL_VARIANT_NAMES[k]} {acc[k]['warm_clear_night']}%"
+                    for k in ("night", "all") if acc.get(k) and acc[k].get("warm_clear_night") is not None)
+    tip = ("Share of classified samples each model gets right (Clear / Cloudy / Overcast), checked on its own data "
+           "at the last training: Day model on day samples, Night model on night samples, Day + Night model on all."
+           + (f" Warm clear nights (&ge;{AI_WARM_NIGHT_C:.0f}&nbsp;&deg;C): {warm}." if warm else "")
+           + " Full table under Settings &rarr; Safety Checks.")
+    return (f'<tr><th>Accuracy</th><td>{pills}<span class="help acc-help" tabindex="0" aria-label="Help">?'
+            f'<span class="help-tip">{tip}</span></span></td></tr>')
+
+
+def _ai_sky_settings_open_html():
+    """Start of the AI Sky Prediction settings group - greyed out (values
+    kept) while the MLX90614 is turned off under Hardware Pins."""
+    if MLX_INSTALLED:
+        return '<fieldset class="ai-sky-fs">'
+    return ('<fieldset class="ai-sky-fs" disabled><p class="hint ai-sky-off">⚠️ The MLX90614 sky sensor is turned off '
+            'under <a href="#hardware-pins">Hardware Pins</a>, so AI Sky Prediction can&#39;t run. These settings keep '
+            'their values and become active again when it&#39;s turned back on.</p>')
+
+
+def _ai_spike_camera_html(checks):
+    """Settings: Ignore short sky jumps + Combine with AI Cloud Detect."""
+    has_cam = bool(_load_cloud_model_meta())
+    cam_dis = "" if has_cam else " disabled"
+    cam_note = ("" if has_cam else '<p class="hint ai-sky-off">Greyed out until AI Cloud Detect has a downloaded '
+                'model — train it on the <a href="/ai-classify">Classify page</a> first.</p>')
+    return f"""<div class="ai-steady">
+        <p class="ai-steady-title"><label style="margin:0"><input type="checkbox" name="aiSpikeEnable" {"checked" if checks.get("ai_spike_enabled") else ""}> Ignore short sky jumps (spike filter)</label></p>
+        <div class="ai-steady-row">
+          <div><label>Jump bigger than (°C)</label>
+          <input type="number" name="aiSpikeJump" min="1" max="20" step="0.5" value="{checks.get('ai_spike_jump_c', 5.0)}" class="narrow-number"></div>
+          <div><label>Must last (minutes)</label>
+          <input type="number" name="aiSpikeHold" min="1" max="15" step="1" value="{checks.get('ai_spike_hold_min', 2)}" class="narrow-number"></div>
+        </div>
+        <p class="hint">A sky reading that jumps more than this from the recent readings is ignored until it has lasted
+        this long — then it's accepted (a real cloud stays). AI Sky Prediction and the MLX sky check both use the
+        filtered value; rain and Day/Night are not affected, and the raw readings are still saved and trained on.
+        Real cloud is reported up to this many minutes later. Unticked = no filter.</p>
+      </div>
+      <div class="ai-steady"{' style="opacity:.6"' if not has_cam else ''}>
+        <p class="ai-steady-title"><label style="margin:0"><input type="checkbox" name="aiCameraEnable" {"checked" if checks.get("ai_camera_combine_enabled") else ""}{cam_dis}> Combine with AI Cloud Detect (camera)</label></p>
+        <div class="ai-steady-row">
+          <div><label>Camera decides when the sensor is less sure than (%)</label>
+          <input type="number" name="aiCameraBelow" min="50" max="95" step="5" value="{checks.get('ai_camera_below_pct', 75)}" class="narrow-number"{cam_dis}></div>
+        </div>
+        <p class="hint">When AI Sky Prediction's confidence is below this, the camera's answer is used: Clear → Clear, any
+        cloud → Cloudy. At or above it, the sensor decides. Camera on Ignore, or no current frame = sensor decides.
+        Unticked = sensor only.</p>
+        {cam_note}
+      </div>"""
+
+
+def _ai_model_choice_html(checks):
+    """Settings block: which sensor model to use by day / by night, with the
+    accuracy of each (stored at training, see _ai_variant_accuracy())."""
+    model = _load_ai_sky_model() or {}
+    acc = model.get("accuracy") or {}
+    variants = model.get("variants") or {}
+    errs = model.get("variant_errors") or {}
+    day_sel, night_sel = checks.get("ai_model_day", "all"), checks.get("ai_model_night", "night")
+
+    def opts(sel):
+        return "".join(f'<option value="{k}"{" selected" if k == sel else ""}>{n}</option>'
+                       for k, n in AI_MODEL_VARIANT_NAMES.items())
+
+    def pct(v):
+        return "—" if v is None else f"{v}%"
+
+    rows = ""
+    for k, n in AI_MODEL_VARIANT_NAMES.items():
+        a = acc.get(k)
+        sel = ' class="sel"' if k in (day_sel, night_sel) else ""
+        if a:
+            cnt = (variants.get(k) or {}).get("sample_count", "")
+            rows += (f"<tr{sel}><td>{n}</td><td>{cnt}</td><td>{pct(a['day'])}</td><td>{pct(a['night'])}</td>"
+                     f"<td>{pct(a['warm_clear_night'])}</td></tr>")
+        else:
+            why = errs.get(k, "train on the Classify page")
+            rows += f'<tr{sel}><td>{n}</td><td colspan="4" class="muted">not trained — {_html_escape(why)}</td></tr>'
+    data = json.dumps({k: acc.get(k) for k in AI_MODEL_VARIANT_NAMES})
+    return f"""<div class="ai-steady" id="ai-model-choice">
+        <p class="ai-steady-title">Model per period</p>
+        <div class="ai-steady-row">
+          <div><label>Model used during day</label>
+          <select name="aiModelDay" onchange="aiAccUpd()">{opts(day_sel)}</select> <span id="aiAccDay"></span></div>
+          <div><label>Model used during night</label>
+          <select name="aiModelNight" onchange="aiAccUpd()">{opts(night_sel)}</select> <span id="aiAccNight"></span></div>
+        </div>
+        <table class="ai-acc-tbl"><thead><tr><th>Model</th><th>Samples</th><th>Day data</th><th>Night data</th>
+        <th>Warm clear nights (&ge;{AI_WARM_NIGHT_C:.0f}&deg;C)</th></tr></thead><tbody>{rows}</tbody></table>
+        <p class="hint">Day/night follows the Daytime check. Accuracy = share of classified samples the model gets right
+        (Clear / Cloudy / Overcast), measured at the last training; highlighted rows are in use. "Train model now" on
+        the Classify page trains all three. A model that isn't trained falls back to Day + Night.</p>
+        <script>
+        (function(){{
+          const A = {data};
+          const c = v => v == null ? "" : (v >= 75 ? "g" : v >= 65 ? "y" : "r");
+          const pill = (v, t) => v == null ? "" : `<span class="ai-acc ${{c(v)}}">${{v}}% ${{t}}</span>`;
+          window.aiAccUpd = function() {{
+            const d = document.querySelector('select[name=aiModelDay]').value;
+            const n = document.querySelector('select[name=aiModelNight]').value;
+            document.getElementById('aiAccDay').innerHTML = A[d] ? pill(A[d].day, "on day data") : '<span class="muted">not trained</span>';
+            document.getElementById('aiAccNight').innerHTML = A[n] ? pill(A[n].night, "on night data") + pill(A[n].warm_clear_night, "warm clear") : '<span class="muted">not trained</span>';
+            document.querySelectorAll('#ai-model-choice tbody tr').forEach((tr, i) => {{
+              const k = Object.keys(A)[i]; tr.className = (k === d || k === n) ? "sel" : "";
+            }});
+          }};
+          aiAccUpd();
+        }})();
+        </script>
+      </div>"""
 
 
 def _ai_steady_classify(model, anomaly, poll_ts, now, checks):
@@ -4032,10 +4529,13 @@ def recompute_overall_safe():
         ambient_ref_source = ambient_source if ambient_ref_c is not None else None
 
         if mlx_fresh and ambient_ref_c is not None:
-            delta = ambient_ref_c - sensor_state["mlx_sky_c"]
-            gate_mlx_cloud = delta >= loc["clear_sky_delta_threshold_c"]
+            delta = ambient_ref_c - sensor_state["mlx_sky_c"]      # raw: shown, saved, trained on
+            sky_used = _mlx_spike_filter(sensor_state["mlx_sky_c"], sensor_state.get("mlx_last_poll"), now, checks)
+            delta_used = ambient_ref_c - sky_used                  # after the spike filter: used for decisions
+            gate_mlx_cloud = delta_used >= loc["clear_sky_delta_threshold_c"]
         else:
-            delta = None
+            delta = delta_used = None
+            _mlx_spike_filter(None, None, now, checks)
             gate_mlx_cloud = False
         sensor_state["gate_mlx_cloud"] = gate_mlx_cloud
         sensor_state["mlx_ambient_ref_c"] = ambient_ref_c
@@ -4142,7 +4642,15 @@ def recompute_overall_safe():
         # source of truth for the live gate above it.
         ai_cfg = get_setting("ai_learning")
         ai_model_wanted = checks.get("ai_model_enabled", False)
-        ai_model = _load_ai_sky_model()
+        ai_model_file = _load_ai_sky_model()
+        ai_model, ai_variant, ai_variant_fallback = _ai_pick_model(
+            ai_model_file, sensor_state["daytime_now"], checks)
+        sensor_state["ai_model_variant"] = ai_variant
+        sensor_state["ai_model_variant_fallback"] = ai_variant_fallback
+        if ai_variant != _ai_smooth_state.get("variant"):
+            # different model = different anomaly scale: never mix readings across a switch
+            _ai_smooth_buf.clear()
+            _ai_smooth_state.update(last_poll=None, prev=None, variant=ai_variant)
         # An old (pre-corrected-delta) model file on disk has "classes"/
         # "class_stats" but no thresholds - treated as untrained here until
         # the next retrain overwrites it with the new format, same as "no
@@ -4152,6 +4660,7 @@ def recompute_overall_safe():
         ai_predicted = None
         ai_confidence = None
         ai_anomaly_c = None
+        ai_camera_decided = False
         if ai_model_valid:
             # mlx_delta_anomaly_c reproduces, at prediction time, the exact
             # same site-calibrated correction _train_ai_sky_model() fit from
@@ -4162,8 +4671,8 @@ def recompute_overall_safe():
             mlx_correction_slope = ai_model.get("mlx_correction_slope", 0.0)
             mlx_correction_intercept = ai_model.get("mlx_correction_intercept", 0.0)
             mlx_delta_anomaly_c = (
-                delta - (mlx_correction_slope * ambient_ref_c + mlx_correction_intercept)
-                if (delta is not None and ambient_ref_c is not None) else None
+                delta_used - (mlx_correction_slope * ambient_ref_c + mlx_correction_intercept)
+                if (delta_used is not None and ambient_ref_c is not None) else None
             )
             # Steadier prediction (Settings -> Safety Checks): combine the
             # last N readings (median/average) and apply a dead band around
@@ -4171,7 +4680,18 @@ def recompute_overall_safe():
             ai_predicted, ai_anomaly_c, ai_margin = _ai_steady_classify(
                 ai_model, mlx_delta_anomaly_c, sensor_state.get("mlx_last_poll"), now, checks)
             sensor_state["ai_model_margin_c"], sensor_state["ai_model_margin_to"] = ai_margin
+            ai_confidence = _ai_confidence(ai_model, ai_anomaly_c, ai_predicted)
             sensor_state["ai_model_smooth_n"] = len(_ai_smooth_buf)
+            # Combine with AI Cloud Detect: the camera decides while the sensor is unsure.
+            cam = sensor_state.get("cloud_model_predicted")
+            if (ai_predicted is not None and ai_confidence is not None and MLX_INSTALLED
+                    and checks.get("ai_camera_combine_enabled")
+                    and ai_confidence < float(checks.get("ai_camera_below_pct", 75) or 0)
+                    and sensor_state.get("cloud_model_status") == "active"
+                    and not sensor_state.get("cloud_model_ignored")
+                    and cam and cam.strip().lower() != "ignore"):
+                ai_predicted = "Clear" if AI_MODEL_FAMILY_MAP.get(cam.strip().lower()) == "Clear" else "Cloudy"
+                ai_camera_decided = True
 
         # Unlike simpleCloudDetect and the Cloud Image Model below - both of
         # which classify a photo, where "Ignore" (a bad/unreliable frame) is
@@ -4189,6 +4709,7 @@ def recompute_overall_safe():
         sensor_state["ai_model_status"] = ai_model_status
         sensor_state["ai_model_predicted"] = ai_predicted
         sensor_state["ai_model_confidence"] = ai_confidence
+        sensor_state["ai_model_camera_decided"] = ai_camera_decided and ai_model_status == "active"
         sensor_state["ai_model_anomaly_c"] = ai_anomaly_c if ai_model_status == "active" else None
         sensor_state["ai_model_sample_count"] = ai_model.get("sample_count") if ai_model_valid else None
         # "Previous status" history for the dashboard's light-gray line under
@@ -4264,10 +4785,14 @@ def recompute_overall_safe():
         sensor_state["gate_cloud_model"] = gate_cloud_model
         cloud_model_pass = gate_cloud_model
         sensor_state["cloud_model_pass"] = cloud_model_pass
-        # Same "previous status" history as the AI Model gate above.
+        # Same "previous status" history as the AI Model gate above. An Ignore
+        # frame counts as its own state here ("Ignore(<held>)"), so the
+        # "Previously" line shows what it was right before the Ignore started.
         if cloud_predicted is not None:
+            cloud_shown = (f"Ignore({cloud_predicted})" if sensor_state.get("cloud_model_ignored")
+                           else cloud_predicted)
             sensor_state["cloud_model_prev_state"], sensor_state["cloud_model_prev_since"] = \
-                _track_status_change("cloud_model", cloud_predicted, now)
+                _track_status_change("cloud_model", cloud_shown, now)
 
         # Prediction-change log line, same shape and same independence from
         # the gate toggle as the AI Model prediction-change line above.
@@ -4324,6 +4849,37 @@ def recompute_overall_safe():
                      and dew_pass and ai_model_pass and cloud_model_pass)
         sensor_state["raw_safe"] = auto_safe
 
+        # After a restart: keep reporting the restored state until every
+        # safety check in use has a real reading (see _load_restored_safety).
+        restore_hold = False
+        if _restored_safety is not None:
+            # (has a real reading yet, passes) for each safety check in use
+            in_use = [
+                (bool(sensor_state.get("time_synced")), daynight_pass) if checks["daynight_enabled"] else None,
+                (rain_fresh, rain_pass) if checks["rain_enabled"] else None,
+                (sensor_state.get("mlx_delta_c") is not None, mlx_cloud_pass) if checks["mlx_gate_enabled"] else None,
+                (cloud_fresh, ml_cloud_pass) if checks["ml_cloud_enabled"] else None,
+                (env_dew_fresh, dew_pass) if checks.get("dew_check_enabled", False) else None,
+                (sensor_state.get("ai_model_status") != "no_data", ai_model_pass)
+                if checks.get("ai_model_enabled", False) else None,
+                (sensor_state.get("cloud_model_status") is not None, cloud_model_pass)
+                if checks.get("cloud_model_enabled", False) else None,
+            ]
+            in_use = [c for c in in_use if c is not None]
+            inputs_ready = all(ready for ready, _ in in_use)
+            # A check that already has a real reading and fails ends the wait: UNSAFE straight away.
+            real_fail = any(ready and not ok for ready, ok in in_use)
+            if real_fail:
+                inputs_ready = True
+            if not inputs_ready and now < _restored_safety["until"]:
+                restore_hold = True
+            else:
+                if _restored_safety["safe"] and auto_safe and inputs_ready:
+                    # Was SAFE and still is: no UNSAFE -> SAFE change, so no new hold delay.
+                    _raw_safe_since = now - (safe_delay["delay_minutes"] * 60 if safe_delay["enabled"] else 0)
+                    _prev_delayed_safe = True
+                globals()["_restored_safety"] = None
+
         # Fail-safe immediately on any UNSAFE transition, but require the raw
         # fused result to stay continuously SAFE for a configurable hold time
         # before we'll actually report SAFE (to ASCOM and on the page) - a
@@ -4364,10 +4920,15 @@ def recompute_overall_safe():
             sensor_state["overall_safe"] = True
         elif override_mode == "FORCE_UNSAFE":
             sensor_state["overall_safe"] = False
+        elif restore_hold:
+            sensor_state["overall_safe"] = _restored_safety["safe"]
+            sensor_state["safe_hold_active"] = False
+            sensor_state["safe_hold_remaining_sec"] = 0
         else:
             sensor_state["overall_safe"] = delayed_safe
 
         new_overall_safe = sensor_state["overall_safe"]
+        _save_safety_state(new_overall_safe, now)
         overall_flip = (new_overall_safe != old_overall_safe)
         if overall_flip:
             pending_logs.append((
@@ -4874,6 +5435,29 @@ def heater_feature_enabled():
     return get_setting("features")["heater_enabled"]
 
 
+# Dome state kept across a restart (like the SAFE/UNSAFE state): saved on
+# every change and every DOME_STATE_SAVE_SEC; restored on start if at most
+# DOME_RESTORE_MAX_AGE_SEC old, then checked against the reed switch once
+# its reading has settled.
+DOME_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dome_state.json")
+DOME_RESTORE_MAX_AGE_SEC = 60
+DOME_STATE_SAVE_SEC = 10
+
+
+def _load_restored_dome(now=None):
+    """Saved {'state', 'move_direction', 'move_start_time'} if recent, else None."""
+    now = time.time() if now is None else now
+    try:
+        with open(DOME_STATE_PATH) as f:
+            saved = json.load(f)
+        if (0 <= now - float(saved["t"]) <= DOME_RESTORE_MAX_AGE_SEC
+                and saved.get("state") in (STATE_OPEN, STATE_CLOSED, STATE_OPENING, STATE_CLOSING)):
+            return saved
+    except Exception:
+        pass
+    return None
+
+
 class DomeController:
     def __init__(self):
         self.lock = threading.RLock()
@@ -4883,9 +5467,37 @@ class DomeController:
         self.last_raw_reading = None
         self.last_sensor_change_time = 0.0
         self.dome_open_raw = False
+        self.reed_ready = False          # True once the reed reading has settled at least once
+        self.restore_check = False       # restored OPEN/CLOSED still to be checked against the reed
         self.idle_mismatch_active = False
         self.idle_mismatch_since = 0.0
         self.relay_timer = None
+        self._saved = {"t": 0.0, "key": None}
+        saved = _load_restored_dome()
+        if saved:
+            self.state = saved["state"]
+            if saved["state"] in (STATE_OPENING, STATE_CLOSING):
+                self.move_direction = MOVE_OPENING if saved["state"] == STATE_OPENING else MOVE_CLOSING
+                self.move_start_time = float(saved.get("move_start_time") or time.time())
+            else:
+                self.restore_check = True
+            print(f"[dome] restart: restored {self.state} until the reed switch reports")
+
+    def _save_state(self, now=None):
+        """Atomic save, on change or every DOME_STATE_SAVE_SEC. Never raises."""
+        now = time.time() if now is None else now
+        key = (self.state, self.move_direction, self.move_start_time)
+        if key == self._saved["key"] and now - self._saved["t"] < DOME_STATE_SAVE_SEC:
+            return
+        try:
+            tmp = DOME_STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"t": now, "state": self.state, "move_direction": self.move_direction,
+                           "move_start_time": self.move_start_time}, f)
+            os.replace(tmp, DOME_STATE_PATH)
+            self._saved.update(t=now, key=key)
+        except Exception as e:
+            print(f"[dome] could not save dome state: {e}")
 
     def _trigger_relay(self):
         if self.relay_timer is not None:
@@ -4913,11 +5525,14 @@ class DomeController:
             self.last_sensor_change_time = now
         if now - self.last_sensor_change_time >= SENSOR_DEBOUNCE_SEC:
             self.dome_open_raw = (raw != GPIO.LOW)
+            self.reed_ready = True
 
     def update(self):
         pending_logs = []  # (message, severity) - fired in the `finally` below, lock released first
         try:
             self._update_locked(pending_logs)
+            with self.lock:
+                self._save_state()
         finally:
             for message, severity in pending_logs:
                 _log_event("Dome", message, severity)
@@ -4950,6 +5565,10 @@ class DomeController:
 
             self._read_reed_debounced()
             now = time.time()
+            if not self.reed_ready:
+                # Reed reading hasn't settled yet (just started): keep the
+                # restored state (or Unknown) instead of guessing "closed".
+                return
 
             if self.move_direction != MOVE_NONE:
                 self.idle_mismatch_active = False
@@ -5011,6 +5630,18 @@ class DomeController:
                 return
 
             sensor_says_open = self.dome_open_raw
+
+            if self.restore_check:
+                # First settled reading after a restart: does the restored
+                # position still hold?
+                self.restore_check = False
+                if self.state in (STATE_OPEN, STATE_CLOSED) and sensor_says_open != (self.state == STATE_OPEN):
+                    was = self.state
+                    self.state = STATE_OPEN if sensor_says_open else STATE_CLOSED
+                    self.idle_mismatch_active = False
+                    pending_logs.append((f"Dome position changed during restart: was {was}, "
+                                         f"reed switch now says {self.state}", "warn"))
+                    return
 
             if self.state not in (STATE_OPEN, STATE_CLOSED):
                 self.state = STATE_OPEN if sensor_says_open else STATE_CLOSED
@@ -6428,6 +7059,22 @@ def save_checks():
                 s["safety_checks"]["ai_deadband_c"] = max(0.0, min(3.0, float(request.args["aiDeadband"])))
         except ValueError:
             pass
+        for arg, key in (("aiModelDay", "ai_model_day"), ("aiModelNight", "ai_model_night")):
+            if request.args.get(arg) in AI_MODEL_VARIANT_NAMES:
+                s["safety_checks"][key] = request.args[arg]
+        if MLX_INSTALLED:
+            s["safety_checks"]["ai_spike_enabled"] = "aiSpikeEnable" in request.args
+            try:
+                if "aiSpikeJump" in request.args:
+                    s["safety_checks"]["ai_spike_jump_c"] = max(1.0, min(20.0, float(request.args["aiSpikeJump"])))
+                if "aiSpikeHold" in request.args:
+                    s["safety_checks"]["ai_spike_hold_min"] = max(1, min(15, int(float(request.args["aiSpikeHold"]))))
+                if "aiCameraBelow" in request.args:
+                    s["safety_checks"]["ai_camera_below_pct"] = max(50, min(95, int(float(request.args["aiCameraBelow"]))))
+            except ValueError:
+                pass
+            if _load_cloud_model_meta():
+                s["safety_checks"]["ai_camera_combine_enabled"] = "aiCameraEnable" in request.args
         if request.args.get("aiSmoothMethod") in ("median", "average"):
             s["safety_checks"]["ai_smooth_method"] = request.args["aiSmoothMethod"]
         s["safety_checks"]["ml_cloud_enabled"] = "mlcloud" in request.args
@@ -7018,6 +7665,18 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         if smooth_n > 1:
             method = "average" if checks.get("ai_smooth_method") == "average" else "median"
             ai_anomaly_str += f' <span class="tag">{method} of {smooth_n}</span>'
+        if s.get("ai_model_camera_decided"):
+            ai_anomaly_str += ' <span class="tag tag-blue">camera decided</span>'
+        spike_since = s.get("mlx_spike_since")
+        if spike_since:
+            el = max(0, time.time() - spike_since)
+            ai_anomaly_str += (f' <span class="tag tag-blue">sky jump ignored '
+                               f'({int(el // 60)} min)</span>' if el >= 60 else
+                               f' <span class="tag tag-blue">sky jump ignored ({int(el)} s)</span>')
+        variant = s.get("ai_model_variant")
+        if variant:
+            fb = " (chosen model not trained - using this)" if s.get("ai_model_variant_fallback") else ""
+            ai_anomaly_str += f' <span class="tag">{AI_MODEL_VARIANT_NAMES.get(variant, variant)}{fb}</span>'
         ai_dot = _status_dot(
             s.get("ai_model_pass", True), ai_model_wanted,
             f"AI Model check: not currently used in the SAFE/UNSAFE decision (model currently predicts "
@@ -7028,7 +7687,9 @@ def render_env_readings_html(s, checks, clouddetect_link, sensor_names, tz_name=
         )
         using_note = ("actively contributing to the SAFE/UNSAFE decision" if ai_model_wanted
                       else "informational only, not used in the SAFE/UNSAFE decision")
-        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>{ai_anomaly_str}
+        ai_conf = s.get("ai_model_confidence")
+        ai_conf_str = f" ({ai_conf}%)" if ai_conf is not None else ""
+        ai_model_row = _field_row(ai_dot, "🤖", f"""AI Sky Prediction(Sensor Based): <b>{ai_display}</b>{ai_conf_str}{ai_anomaly_str}
   <span class="muted">(correction fit from {s.get('ai_model_sample_count')} classified samples on the
   <a href="/ai-classify">Classify page</a> - {using_note})</span>""")
     elif ai_model_wanted and ai_status == "untrained":
@@ -8086,8 +8747,8 @@ def web_index():
     # Settings -> Logging) empties.
     log_images_count, log_images_bytes = _log_images_folder_stats()
     log_images_size_str = _format_size_general(log_images_bytes)
-    ai_new_since_cloud_train = sum(1 for smp in _ai_idx_for_stats["samples"]
-                                    if smp.get("label") and not smp.get("cloud_trained_at"))
+    _on_disk = _ai_images_on_disk()
+    ai_new_since_cloud_train = sum(1 for smp in _ai_idx_for_stats["samples"] if _cloud_pending(smp, _on_disk))
     dome_snap = dome.snapshot()
     with sensor_lock:
         s = dict(sensor_state)
@@ -8340,6 +9001,11 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .sub-opt{{margin-left:26px;padding-left:12px;border-left:3px solid #bcd9f2;}}
 .sub-opt.sub-off{{opacity:.5;}}
 .settings-group h3{{font-size:13.5px;margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}}
+/* Settings -> Safety Checks: related settings grouped into bordered blocks */
+.sc-block{{border:1px solid #e3e6ea;border-radius:12px;padding:10px 14px 4px;margin:0 0 14px;background:#fff;}}
+.sc-title{{font-weight:700;font-size:14.5px;margin:0 0 2px;color:#1f2937;}}
+.sc-sub{{font-size:12px;color:#6b7280;margin:0 0 6px;}}
+.sc-block > label:first-of-type{{margin-top:4px;}}
 .card h2{{margin:0 0 14px;font-size:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}}
 .card h2 .title{{display:flex;align-items:center;gap:8px;}}
 .badge{{display:inline-block;padding:4px 13px;border-radius:20px;font-weight:700;font-size:13px;letter-spacing:.3px;}}
@@ -8383,6 +9049,7 @@ fieldset:disabled{{opacity:.5;}}
 .tag{{display:inline-block;font-size:11px;color:var(--muted);border:1px solid #ddd;border-radius:4px;
      padding:1px 6px;margin-left:4px;vertical-align:middle;}}
 .tag-warn{{color:var(--unsafe);border-color:var(--unsafe);}}
+.tag-blue{{color:#2563eb;border-color:#2563eb;}}
 .warn-text{{color:var(--unsafe);}}
 .status-dot{{display:inline-block;width:15px;height:15px;border-radius:50%;
      vertical-align:middle;cursor:help;box-shadow:0 0 0 1px rgba(0,0,0,.08);flex-shrink:0;}}
@@ -8416,8 +9083,16 @@ input[type=number],input[type=time]{{font-size:14px;padding:5px 7px;border-radiu
 .narrow-number{{width:80px;}}
 .ai-steady{{border:1px solid #e3e6ea;border-radius:10px;padding:8px 12px;margin:8px 0 12px;background:#fafbfc;}}
 .ai-steady-title{{font-weight:700;font-size:13.5px;margin:0 0 2px;}}
+.ai-sky-fs{{border:0;margin:0;padding:0;min-width:0;}}
+.ai-sky-fs[disabled]{{opacity:.55;}}
+.ai-sky-off{{color:#8a5300;}}
 .ai-steady-row{{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;}}
 .ai-steady-row label{{margin:6px 0 4px;}}
+.ai-acc{{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;margin:0 4px 0 0;}}
+.ai-acc.g{{background:#e3f5e8;color:#1a7f37;}}.ai-acc.y{{background:#fff4d6;color:#8a6100;}}.ai-acc.r{{background:#fde7e7;color:#b42318;}}
+.ai-acc-tbl{{border-collapse:collapse;font-size:12.5px;margin:8px 0 4px;}}
+.ai-acc-tbl th,.ai-acc-tbl td{{border-bottom:1px solid #e3e6ea;padding:4px 10px 4px 0;text-align:left;}}
+.ai-acc-tbl th{{color:#6b7280;font-weight:500;}}.ai-acc-tbl tr.sel td{{background:#eef5ff;}}
 .sensor-name-input{{width:180px;max-width:100%;}}
 .pin-row{{display:flex;flex-direction:column;gap:6px;margin:14px 0;}}
 .pin-row .pin-name{{display:flex;align-items:center;gap:6px;margin:0;font-weight:600;}}
@@ -8609,9 +9284,12 @@ a{{color:var(--accent-safety);}}
     readings without letting the sensor's own simple threshold check veto SAFE by itself, or the reverse.
     Use either one, both, or neither.</p>
     <form action="/save-checks" method="get">
+      <div class="sc-block"><p class="sc-title">🌙 Day / Night</p><p class="sc-sub">Reports UNSAFE in daylight.</p>
       <label><input type="checkbox" name="daynight" {"checked" if checks['daynight_enabled'] else ""}> Day/Night check</label>
       <label>Night threshold (sun elevation, deg)</label><input type="text" name="thresh" value="{loc['night_threshold_deg']}">
       <p class="hint">0 = horizon &bull; -6 = civil twilight &bull; -12 = nautical (default) &bull; -18 = astronomical</p>
+      </div>
+      <div class="sc-block"><p class="sc-title">🌡️ Sky sensor (MLX90614)</p><p class="sc-sub">The raw sky-vs-air temperature check.</p>
       <label><input type="checkbox" name="mlxGateEnable" {"checked" if checks['mlx_gate_enabled'] else ""}> Sky Sensor (MLX90614) clear-sky check</label>
       <p class="hint">Include the {sensor_names['mlx90614']}'s ambient-vs-sky delta reading in the
       SAFE/UNSAFE decision. Requires the sensor itself to be enabled and wired under
@@ -8630,23 +9308,14 @@ a{{color:var(--accent-safety);}}
       inside the enclosure and reads warmer box air, not true outside air. If the selected sensor is
       unavailable, this check reports Unknown rather than silently substituting a different one. Enable/disable
       the check itself under <a href="#hardware-pins">Hardware Pins</a>.</p>
-      <label><input type="checkbox" name="dewEnable" {"checked" if checks.get('dew_check_enabled') else ""}> Dew risk check counts toward SAFE/UNSAFE</label>
-      <p class="hint">Off (default): the dew reading and its seasonal rules are still evaluated and shown on the dashboard,
-      but never affect SAFE/UNSAFE. On: a dew trip makes the monitor UNSAFE, and a Dew Risk lane appears in the Safety Checks
-      History graph. Uses the outside temperature and humidity already read for the heater (no extra sensor); if
-      either reading is missing the check is Unknown, which counts as UNSAFE while it's included.</p>
-      <label><input type="checkbox" name="mlcloud" {"checked" if checks['ml_cloud_enabled'] else ""}> Simple Cloud Detect ML check</label>
-      <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
-      <input type="text" name="mlcloudignore" value="{checks['ml_cloud_ignore_classes']}" placeholder="e.g. Glare, Fogged Lens">
-      <p class="hint">If simpleCloudDetect's latest frame is classified as one of these, it's skipped entirely —
-      the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
-      classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
-      (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
+      </div>
+      <div class="sc-block"><p class="sc-title">🤖 AI Sky Prediction (Sensor Based)</p><p class="sc-sub">The trained sensor model and everything that tunes it.</p>
       <label><input type="checkbox" name="aiModelEnable" {"checked" if checks.get('ai_model_enabled') else ""}> AI Model check</label>
       <p class="hint">Include the trained AI model's prediction in the SAFE/UNSAFE decision. Falls back to
       the other enabled checks above whenever there's no trained model yet, or no fresh sensor data to
       predict from. Train the model and set which predicted labels count as SAFE on the
       <a href="#ai-learning-settings">AI Learning</a> settings below.</p>
+      {_ai_sky_settings_open_html()}
       <div class="ai-steady">
         <p class="ai-steady-title">Steadier AI Sky Prediction</p>
         <div class="ai-steady-row">
@@ -8662,12 +9331,41 @@ a{{color:var(--accent-safety);}}
         (e.g. Clear → Cloudy below the cutoff − 0.5 °C, back to Clear above the cutoff + 0.5 °C); 0 = off. Training
         is not affected — it always uses the stored readings.</p>
       </div>
+      {_ai_model_choice_html(checks)}
+      {_ai_spike_camera_html(checks)}
+      </fieldset>
+      </div>
+      <div class="sc-block"><p class="sc-title">📷 AI Cloud Detect (All Sky)</p>
       <label><input type="checkbox" name="cloudModelEnable" {"checked" if checks.get('cloud_model_enabled') else ""}> Cloud Image Model check</label>
       <p class="hint">Include the cloud-trained image model's prediction in the SAFE/UNSAFE decision. Falls
       back to the other enabled checks above whenever no model has been downloaded yet, tflite-runtime isn't
       installed on this Pi, or there's no current All Sky frame to classify. Train it via the cloud training
       server and set which predicted labels count as SAFE on the <a href="#ai-learning-settings">AI
       Learning</a> settings below (shares the same SAFE-labels list as the AI Model check above).</p>
+      </div>
+      <div class="sc-block"><p class="sc-title">📷 Simple Cloud Detect</p>
+      <label><input type="checkbox" name="mlcloud" {"checked" if checks['ml_cloud_enabled'] else ""}> Simple Cloud Detect ML check</label>
+      <label>Ignore these AI classes (comma-separated, case-insensitive)</label>
+      <input type="text" name="mlcloudignore" value="{checks['ml_cloud_ignore_classes']}" placeholder="e.g. Glare, Fogged Lens">
+      <p class="hint">If simpleCloudDetect's latest frame is classified as one of these, it's skipped entirely —
+      the SAFE/UNSAFE decision and the displayed reading both keep showing the last trusted (non-ignored)
+      classification instead. Useful for a custom Teachable Machine class trained on bad/unreliable frames
+      (e.g. glare, condensation on the lens, a bug on the camera). Leave blank to disable (off by default).</p>
+      </div>
+      <div class="sc-block"><p class="sc-title">💦 Dew risk</p>
+      <label><input type="checkbox" name="dewEnable" {"checked" if checks.get('dew_check_enabled') else ""}> Dew risk check counts toward SAFE/UNSAFE</label>
+      <p class="hint">Off (default): the dew reading and its seasonal rules are still evaluated and shown on the dashboard,
+      but never affect SAFE/UNSAFE. On: a dew trip makes the monitor UNSAFE, and a Dew Risk lane appears in the Safety Checks
+      History graph. Uses the outside temperature and humidity already read for the heater (no extra sensor); if
+      either reading is missing the check is Unknown, which counts as UNSAFE while it's included.</p>
+      </div>
+      <div class="sc-block"><p class="sc-title">⏳ Reporting SAFE</p>
+      <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
+      <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
+      <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
+      reported immediately — this delay only applies to a transition back to SAFE.</p>
+      </div>
+      <div class="sc-block"><p class="sc-title">📈 Graph</p><p class="sc-sub">Display only.</p>
       <label>AI graph style (Safety Checks History)</label>
       <select name="aiGraphStyle">
         <option value="chart" {"selected" if checks.get('ai_graph_style', 'chart') != 'lanes' else ""}>Line chart - AI Sky Pred. and AI Cloud Detect over the Overcast / Cloudy / Clear bands</option>
@@ -8675,10 +9373,7 @@ a{{color:var(--accent-safety);}}
       </select>
       <p class="hint">Display only - changes how the two AI checks are drawn in the Safety Checks History graph, never
       the SAFE/UNSAFE decision.</p>
-      <label><input type="checkbox" name="safedelay" {"checked" if safe_delay['enabled'] else ""}> Hold before reporting SAFE</label>
-      <input type="text" name="safedelaymin" value="{safe_delay['delay_minutes']}">
-      <p class="hint">Minutes of continuous SAFE required before SAFE is reported to ASCOM/the page. UNSAFE is always
-      reported immediately — this delay only applies to a transition back to SAFE.</p>
+      </div>
       <button type="submit" class="btn btn-safety">Save checks</button>
     </form>
   </div>
@@ -9377,6 +10072,58 @@ def _render_log_entry_html(e):
 </div>"""
 
 
+def _file_lines_and_size(path):
+    """(line_count, bytes) of a text file, (0, 0) if missing."""
+    try:
+        with open(path, "rb") as f:
+            n = sum(1 for _ in f)
+        return n, os.path.getsize(path)
+    except OSError:
+        return 0, 0
+
+
+@app.route("/logs/download", methods=["GET"])
+def logs_download():
+    """Logs page "Download log file": one week's file, or all weeks as a zip."""
+    week = request.args.get("week", "")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if week == "all":
+        buf = io.BytesIO()
+        count = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for w in list_log_weeks():
+                path = _log_file_path(w)
+                if os.path.isfile(path):
+                    zf.write(path, arcname=os.path.basename(path))
+                    count += 1
+        if not count:
+            return ("No log files yet.", 404)
+        buf.seek(0)
+        return send_file(buf, mimetype="application/zip", as_attachment=True,
+                         download_name=f"observatory_logs_{stamp}.zip")
+    if week not in list_log_weeks():
+        return ("Unknown week.", 404)
+    path = _log_file_path(week)
+    if not os.path.isfile(path):
+        return ("Nothing has been logged in that week yet.", 404)
+    return send_file(path, mimetype="application/x-ndjson", as_attachment=True,
+                     download_name=f"observatory_log_{week}.jsonl")
+
+
+@app.route("/download-safety-history", methods=["GET"])
+def download_safety_history():
+    """Classify -> Export: the last 48 h of Safety Checks History data."""
+    try:
+        with _safety_history_lock:
+            with open(SAFETY_HISTORY_PATH, "rb") as f:
+                data = f.read()
+    except OSError:
+        return ("No safety history recorded yet.", 404)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    return send_file(io.BytesIO(data), mimetype="application/x-ndjson", as_attachment=True,
+                     download_name=f"safety_history_{stamp}.jsonl")
+
+
 @app.route("/logs", methods=["GET"])
 def web_logs():
     weeks = list_log_weeks()
@@ -9400,6 +10147,18 @@ def web_logs():
     category_options = "".join(
         f"<option value='{c}'{' selected' if c == category else ''}>{c}</option>"
         for c in ["All"] + LOG_CATEGORIES)
+    dl_opts, dl_files, dl_bytes = [], 0, 0
+    for w in weeks:
+        n, b = _file_lines_and_size(_log_file_path(w))
+        if n:
+            dl_files += 1
+            dl_bytes += b
+        dl_opts.append(f"<option value='{w}'{' selected' if w == week else ''}>{_week_label(w, current_week)}"
+                       f" &middot; {n:,} {'entry' if n == 1 else 'entries'} &middot; {_format_size_general(b)}</option>")
+    if dl_files:
+        dl_opts.append(f"<option value='all'>All weeks (.zip) &middot; {dl_files} file(s) &middot; "
+                       f"{_format_size_general(dl_bytes)}</option>")
+    download_options = "".join(dl_opts)
 
     entries_html = ("".join(_render_log_entry_html(e) for e in entries) if entries else
                      "<p class='hint'>No log entries match this week/category/search.</p>")
@@ -9426,6 +10185,10 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .filters label{{display:flex;flex-direction:column;font-size:12.5px;color:var(--muted);gap:3px;}}
 .filters select,.filters input[type=text]{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
 .filters input[type=text]{{min-width:200px;}}
+.dl-box{{border-top:1px solid #eee;margin-top:12px;padding-top:12px;}}
+.dl-row{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}}
+.dl-row select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;max-width:100%;}}
+.dl-row a.btn{{text-decoration:none;}}
 .btn{{padding:7px 14px;border-radius:8px;border:none;font-size:14px;font-weight:600;cursor:pointer;
       background:var(--accent);color:#fff;}}
 .hint{{color:var(--muted);font-size:12.5px;}}
@@ -9449,14 +10212,29 @@ a{{color:var(--accent);}}
   <form class="filters" action="/logs" method="get">
     <label>Week<select name="week" onchange="this.form.submit()">{week_options}</select></label>
     <label>Category<select name="category" onchange="this.form.submit()">{category_options}</select></label>
-    <label>Search<input type="text" name="q" value="{q}" placeholder="text in message or sensor data"></label>
+    <label>Search<input type="text" name="q" value="{_html_escape(q)}" placeholder="text in message or sensor data"></label>
     <button type="submit" class="btn">Filter</button>
   </form>
   <p class="hint">Log text rotates to a new file every week; old weeks stay pickable above until they age out.
   All Sky snapshot images and old weekly files are cleaned up automatically after the day counts set under
   <a href="/settings#logging-settings">Settings &rarr; Logging</a> (currently {logging_cfg['image_retention_days']} days
   for images, {logging_cfg['log_retention_days']} days for log files).</p>
+  <div class="dl-box">
+    <div class="dl-row"><b>⬇ Download log file</b>
+      <select id="logPick">{download_options}</select>
+      <a class="btn" id="logDl" href="/logs/download?week={week}">Download</a></div>
+    <p class="hint">Each week's file holds every entry on this page (safety changes, dome open/close, settings
+    changes, errors and security events) with the sensor readings at that moment, as one JSON line per entry.
+    Downloads the whole week, not just what the filters above show.</p>
+  </div>
 </div>
+<script>
+(function() {{
+  const pick = document.getElementById('logPick'), dl = document.getElementById('logDl');
+  const upd = () => {{ dl.href = '/logs/download?week=' + encodeURIComponent(pick.value); }};
+  pick.addEventListener('change', upd); upd();
+}})();
+</script>
 
 <div id="logEntries">
 {entries_html}
@@ -9786,7 +10564,8 @@ def ai_train_model():
     _log_event("Settings", f"AI Learning model trained on {model['sample_count']} classified samples "
                             f"({', '.join(f'{c}: {n}' for c, n in sorted(model['class_counts'].items()))})")
     return jsonify({"ok": True, "trained_at": model["trained_at"], "sample_count": model["sample_count"],
-                     "classes": model["classes"], "class_counts": model["class_counts"]})
+                     "classes": model["classes"], "class_counts": model["class_counts"],
+                     "variants": _ai_variant_summary(model, plain=True)})
 
 
 @app.route("/ai-reset-model", methods=["GET"])
@@ -10340,6 +11119,16 @@ def _ai_recovery_card_html(idx):
             + "<p class=\"hint\" id=\"aiRecoverStatus\"></p></div>")
 
 
+def _ai_recovery_inner_html(idx):
+    """Recovery section body for the Classify page: the repair boxes when
+    something needs fixing (same as _ai_recovery_card_html), else ''."""
+    card = _ai_recovery_card_html(idx)
+    if not card:
+        return ""
+    head = "<div class=\"card\"><p class=\"card-title\">🛟 Recovery</p>"
+    return card[len(head):-len("</div>")]
+
+
 def _ai_classify_resized_images_backup_zip():
     """In-memory .zip of every currently-compressed ('image_compressed')
     sample's resized image, one folder per label like the main export -
@@ -10709,6 +11498,64 @@ def _render_ai_classify_card(sample, tz, label_classes):
 </div>"""
 
 
+AI_SENSOR_FIELD_LABELS = [
+    ("MLX90614 (sky sensor)", [("mlx_sky_c", "Sky temperature", "°C"), ("mlx_body_c", "MLX body temperature", "°C"),
+                               ("mlx_ambient_ref_c", "Reference air temperature", "°C"),
+                               ("mlx_ambient_source", "Reference source", ""), ("mlx_delta_c", "Sky vs air (delta)", "°C"),
+                               ("sky_mlx", "MLX sky check", "")]),
+    ("Outside air", [("environment_temp_c", "Temperature", "°C"), ("environment_humidity", "Humidity", "%"),
+                     ("bme_temp_c", "BME280 temperature", "°C"), ("bme_humidity", "BME280 humidity", "%"),
+                     ("bme_pressure_hpa", "Pressure", "hPa"), ("dew_point_c", "Dew point", "°C"),
+                     ("dew_spread_c", "Dew point spread", "°C")]),
+    ("Box", [("box_temp_c", "Temperature", "°C"), ("box_humidity", "Humidity", "%"),
+             ("dht_temp_c", "DHT11 temperature", "°C"), ("dht_humidity", "DHT11 humidity", "%")]),
+    ("Heater", [("heater_on", "On", ""), ("heater_power_percent", "Power", "%"),
+                ("heater_auto_power_percent", "AUTO power", "%"), ("heater_freezing", "Freezing", ""),
+                ("heater_dew_risk", "Dew risk", "")]),
+    ("Sky & weather checks", [("rain", "Rain", ""), ("rain_detected", "Rain sensor wet", ""), ("dew", "Dew risk check", ""),
+                              ("ml_cloud", "Simple Cloud Detect", ""), ("ml_cloud_class", "Simple Cloud Detect class", ""),
+                              ("ml_cloud_confidence", "Simple Cloud Detect confidence", ""),
+                              ("ai_model_predicted", "AI Sky Prediction", ""), ("ai_model_value_c", "AI Sky Prediction value", "°C"), ("ai_model_confidence", "AI Sky Prediction confidence", "%"),
+                              ("ai_model_in_use", "AI Sky model in use", ""),
+                              ("cloud_model_predicted", "AI Cloud Detect", ""),
+                              ("cloud_model_confidence", "AI Cloud Detect confidence", "")]),
+    ("Sun, safety, dome", [("daynight", "Day/Night", ""), ("sun_elevation_deg", "Sun elevation", "°"),
+                           ("overall_safe", "Overall SAFE", ""), ("raw_safe", "SAFE before hold delay", ""),
+                           ("checks_passed", "Checks passed", ""), ("dome_state", "Dome", "")]),
+]
+
+
+def _ai_sensor_details_html(sample):
+    """One-by-one view: every sensor value saved with this image, grouped."""
+    sn = sample.get("sensors") or {}
+    if not sn:
+        return ""
+    known, rows = set(), ""
+    def fmt(v, unit):
+        if v is None:
+            return '<span class="ai-sd-none">no reading</span>'
+        if isinstance(v, bool):
+            return "Yes" if v else "No"
+        if isinstance(v, dict):
+            return " · ".join(f"{_html_escape(k)} {'✓' if ok else '✗'}" for k, ok in v.items()) or "—"
+        if isinstance(v, float):
+            v = f"{v:.2f}".rstrip("0").rstrip(".")
+        return _html_escape(f"{v} {unit}".strip())
+    for group, fields in AI_SENSOR_FIELD_LABELS:
+        present = [(k, l, u) for k, l, u in fields if k in sn]
+        known.update(k for k, _, _ in fields)
+        if not present:
+            continue
+        rows += f'<tr><th colspan="2">{group}</th></tr>' + "".join(
+            f'<tr><td>{l}</td><td class="v">{fmt(sn[k], u)}</td></tr>' for k, l, u in present)
+    other = [k for k in sn if k not in known]
+    if other:
+        rows += '<tr><th colspan="2">Other</th></tr>' + "".join(
+            f'<tr><td>{_html_escape(k)}</td><td class="v">{fmt(sn[k], "")}</td></tr>' for k in sorted(other))
+    return (f'<details class="ai-sd"><summary>All sensor data saved with this image ({len(sn)} values)</summary>'
+            f'<table>{rows}</table></details>')
+
+
 def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
     """The one-by-one view's card - the same info as a grid card, but one
     at a time and at full size, since the whole point of this view is
@@ -10741,11 +11588,49 @@ def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
   <div class="ai-card-time">{time_str}</div>
   <div class="ai-card-chips">{chips_html}</div>
   {sensor_row_html}
+  {_ai_sensor_details_html(sample)}
   <div class="ai-single-actions">
     {'<button type="button" class="btn ai-unclassify-btn" onclick="unclassifySingle()">↩ Unclassify</button>' if label else ''}
     <button type="button" class="btn ai-delete-btn" onclick="deleteSingle()">🗑 Delete this image</button>
   </div>
 </div>"""
+
+
+def _ai_cursor_key(sample):
+    """Sort/cursor key for the Classify lists (newest first)."""
+    return (float(sample.get("ts", 0) or 0), sample.get("id") or "")
+
+
+def _ai_cursor(sample):
+    k = _ai_cursor_key(sample)
+    return f"{k[0]!r}~{k[1]}"
+
+
+def _ai_parse_cursor(value):
+    """'<ts>~<id>' -> key tuple, or None if missing/garbled."""
+    if not value:
+        return None
+    ts, sep, sid = value.partition("~")
+    try:
+        return (float(ts), sid) if sep else None
+    except ValueError:
+        return None
+
+
+def _ai_cursor_page(filtered, after, before, page, size):
+    """One page of `filtered` (already sorted newest first). Next/Prev use a
+    cursor (the last/first sample shown) instead of a page number, so
+    classifying images - which drops them out of "Unclassified only" -
+    never makes Next skip the images that moved up. Returns
+    (page_samples, start_index)."""
+    if after is not None:
+        start = next((i for i, x in enumerate(filtered) if _ai_cursor_key(x) < after), len(filtered))
+    elif before is not None:
+        end = next((i for i, x in enumerate(filtered) if _ai_cursor_key(x) <= before), len(filtered))
+        start = max(0, end - size) if end >= size else 0
+    else:
+        start = page * size
+    return filtered[start:start + size], start
 
 
 @app.route("/ai-classify", methods=["GET"])
@@ -10788,12 +11673,23 @@ def ai_classify_page():
     # Visually-similar consecutive frames from the same night still end up
     # next to each other either way, so the "select a run, label them
     # together" flow is unaffected by which end you start from.
-    filtered.sort(key=lambda s: s.get("ts", 0), reverse=True)
+    filtered.sort(key=_ai_cursor_key, reverse=True)
 
-    start = page * AI_CLASSIFY_PAGE_SIZE
-    page_samples = filtered[start:start + AI_CLASSIFY_PAGE_SIZE]
-    has_prev = page > 0
-    has_next = start + AI_CLASSIFY_PAGE_SIZE < len(filtered)
+    cur_after = _ai_parse_cursor(request.args.get("after"))
+    cur_before = _ai_parse_cursor(request.args.get("before"))
+    page_samples, start = _ai_cursor_page(filtered, cur_after, cur_before, page, AI_CLASSIFY_PAGE_SIZE)
+    has_prev = start > 0
+    has_next = start + len(page_samples) < len(filtered)
+    show_q = urllib.parse.quote(show)
+    next_url = (f"/ai-classify?show={show_q}&view=grid&after={urllib.parse.quote(_ai_cursor(page_samples[-1]))}"
+                if has_next and page_samples else None)
+    if page_samples:
+        prev_url = f"/ai-classify?show={show_q}&view=grid&before={urllib.parse.quote(_ai_cursor(page_samples[0]))}"
+    elif filtered and cur_after is not None:
+        prev_url = f"/ai-classify?show={show_q}&view=grid&before={urllib.parse.quote(request.args['after'])}"
+        has_prev = True
+    else:
+        prev_url = None
 
     loc = get_setting("location")
     try:
@@ -10802,23 +11698,40 @@ def ai_classify_page():
         tz = timezone.utc
 
     cards_html = ("".join(_render_ai_classify_card(s, tz, label_classes) for s in page_samples) if page_samples else
-                  "<p class='hint'>Nothing to classify right now — samples build up over time once AI "
-                  "Learning capture is enabled under <a href='/settings#ai-learning-settings'>Settings</a>.</p>")
+                  ("<p class='hint'>No more images after this point — use <b>&larr; Prev</b> to go back.</p>"
+                   if filtered else
+                   "<p class='hint'>Nothing to classify right now — samples build up over time once AI "
+                   "Learning capture is enabled under <a href='/settings#ai-learning-settings'>Settings</a>.</p>"))
 
     # One-by-one view: same filtered/sorted list as the grid, but indexed to
     # a single position instead of paged - clamped so a stale idx (e.g. from
     # deleting/classifying the last item on the list) never 404s or crashes.
     total_filtered = len(filtered)
-    sidx = max(0, min(sidx, total_filtered - 1)) if total_filtered else 0
-    if total_filtered == 0:
+    single_end = False
+    if view == "single" and cur_after is not None:
+        sidx = next((i for i, x in enumerate(filtered) if _ai_cursor_key(x) < cur_after), None)
+        if sidx is None:
+            single_end, sidx = True, total_filtered
+    elif view == "single" and cur_before is not None:
+        sidx = max(0, next((i for i, x in enumerate(filtered) if _ai_cursor_key(x) <= cur_before), total_filtered) - 1)
+    elif not single_end:
+        sidx = max(0, min(sidx, total_filtered - 1)) if total_filtered else 0
+    single_cursor = _ai_cursor(filtered[sidx]) if total_filtered and not single_end else None
+    if single_end:
+        single_card_html = "<p class='hint'>You've reached the end of this list — use <b>&larr; Prev</b> to go back.</p>"
+    elif total_filtered == 0:
         single_card_html = ("<p class='hint'>Nothing to classify right now — samples build up over time once "
                              "AI Learning capture is enabled under <a href='/settings#ai-learning-settings'>Settings</a>.</p>")
     else:
         single_card_html = _render_ai_classify_single_card(filtered[sidx], tz, sidx, total_filtered, label_classes)
-    prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx - 1}">&larr; Prev</a>'
-                         if sidx > 0 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
-    next_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;view=single&amp;idx={sidx + 1}">Next &rarr;</a>'
-                         if sidx < total_filtered - 1 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
+    if single_end:
+        single_prev_q = "before=" + urllib.parse.quote(request.args["after"])
+    else:
+        single_prev_q = "before=" + urllib.parse.quote(single_cursor) if single_cursor else ""
+    prev_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={urllib.parse.quote(show)}&amp;view=single&amp;{single_prev_q}">&larr; Prev</a>'
+                         if total_filtered and (single_end or sidx > 0) else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
+    next_single_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={urllib.parse.quote(show)}&amp;view=single&amp;after={urllib.parse.quote(single_cursor)}">Next &rarr;</a>'
+                         if single_cursor and sidx < total_filtered - 1 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
 
     label_fn = "applyLabel" if view == "grid" else "applyLabelSingle"
     label_buttons_html = "".join(
@@ -10872,18 +11785,19 @@ def ai_classify_page():
         'shown" picks just this page; <b>Select ALL</b> spans every page matching the current filter), '
         'then click the label — it applies to every image you\'ve selected at once. '
         '<b>Unclassify selected</b> sends already-labeled images back to unclassified, '
-        'and <b>Delete selected</b> removes them. Sorted oldest-first so a run of '
-        'near-identical overnight frames sits together and can be classified in one go.'
+        'and <b>Delete selected</b> removes them. Sorted newest-first so a run of '
+        'near-identical overnight frames sits together and can be classified in one go. '
+        '<b>Next</b> always continues right after the last image shown, so nothing is skipped after you classify.'
         if view == "grid" else
         'Viewing one image at a time — clicking a label classifies it and automatically moves on to the '
         'next; use Prev/Next below to browse without classifying, and <b>Delete this image</b> on the '
         'card to remove just this one.'
     )
 
-    prev_link_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;page={page - 1}">&larr; Prev</a>'
-                       if has_prev else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
-    next_link_html = (f'<a class="btn ai-nav-btn" href="/ai-classify?show={show}&amp;page={page + 1}">Next &rarr;</a>'
-                       if has_next else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
+    prev_link_html = (f'<a class="btn ai-nav-btn" href="{_html_escape(prev_url)}">&larr; Prev</a>'
+                       if has_prev and prev_url else '<span class="btn ai-nav-btn ai-nav-btn-disabled">&larr; Prev</span>')
+    next_link_html = (f'<a class="btn ai-nav-btn" href="{_html_escape(next_url)}">Next &rarr;</a>'
+                       if next_url else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
 
     # Model status card - how close the classified set is to trainable
     # (per AI_MODEL_MIN_SAMPLES_PER_CLASS), and whether a model already
@@ -11029,6 +11943,7 @@ def ai_classify_page():
         model_breakdown = ", ".join(f"{c}: {n}" for c, n in sorted(ai_model["class_counts"].items()))
         model_status_html = (f"Model trained <b>{trained_tz_str}</b> on <b>{ai_model['sample_count']}</b> "
                               f"classified samples ({model_breakdown}). {usage_note}")
+        model_status_html += "<br>" + _ai_variant_summary(ai_model)
     elif ai_model_wanted:
         model_status_html = ("<b>⚠️ No model has been trained yet</b>, but the AI Model gate is turned on "
                               "under Settings — it's currently falling back to the standard safety checks "
@@ -11059,7 +11974,11 @@ def ai_classify_page():
     # training run - needed above (folded into cloud_model_status_html, so
     # trained-on/total/new all read together on one line) as well as by the
     # "Train via cloud server" button's enabled state below.
-    cloud_new_count = sum(1 for s in all_samples if s.get("label") and not s.get("cloud_trained_at"))
+    on_disk = _ai_images_on_disk()
+    cloud_new_count = sum(1 for s in all_samples if _cloud_pending(s, on_disk))
+    # Classified, never learned, and the image is gone: sensor model only.
+    cloud_no_image = sum(1 for s in all_samples if s.get("label") and not s.get("cloud_trained_at")
+                         and not _cloud_pending(s, on_disk))
     if cloud_meta:
         try:
             cloud_trained_tz_str = _format_ampm(datetime.fromtimestamp(cloud_meta["trained_at"], tz).strftime(
@@ -11114,6 +12033,161 @@ def ai_classify_page():
         f'cancelCloudJob()">Cancel job</button>'
     )
 
+
+    # ---- Classify page layout (Settings-style menu) - data for each section ----
+    def _num(v):
+        return f'<td class="num">{v:,}</td>' if v else '<td class="num zero">0</td>'
+
+    def _pend(v):
+        return f'<td class="num pend">{v:,}</td>' if v else '<td class="num zero">0</td>'
+
+    def _when(ts):
+        try:
+            return _format_ampm(datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %I:%M %p"))
+        except Exception:
+            return "unknown time"
+
+    def _totals_line(when, d, n, t, pend):
+        sep = ' <span class="lt-sep">&middot;</span> '
+        head = when if when else "Not trained yet"
+        if when:
+            head += f"{sep}Day <b>{d:,}</b>{sep}Night <b>{n:,}</b>{sep}Total <b>{t:,}</b>"
+        return head + f"{sep}Pending <b class=\"{'lt-pend' if pend else ''}\">{pend:,}</b>"
+
+    def _help(inner, wide=False):
+        return (f'<span class="help" tabindex="0" aria-label="Help">?<span class="help-tip{" tip-table" if wide else ""}">'
+                f'{inner}</span></span>')
+
+    tbl_head = ('<table class="cnt"><thead><tr><th>Label</th><th class="num">Day</th><th class="num">Night</th>'
+                '<th class="num">Total</th><th class="num">Pending</th></tr></thead><tbody>')
+
+    # Sensor model: what each trained model used, and what's classified since.
+    variants = (ai_model or {}).get("variants") or ({"all": ai_model} if ai_model else {})
+    tr_all = (variants.get("all") or {}).get("class_counts") or {}
+    tr_day = (variants.get("day") or {}).get("class_counts") or {}
+    tr_night = (variants.get("night") or {}).get("class_counts") or {}
+    sensor_labels = [c for c in label_classes if c.strip().lower() != "ignore"]
+    sensor_labels += [c for c in list(tr_all) + list(effective_counts) if c not in sensor_labels]
+    s_rows, s_pend_total = "", 0
+    for c in sensor_labels:
+        cur, t = effective_counts.get(c, 0), tr_all.get(c, 0)
+        pend = max(0, cur - t)
+        s_pend_total += pend
+        tcell = (f'<td class="num low">{cur}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</td>'
+                 if cur < AI_MODEL_MIN_SAMPLES_PER_CLASS else _num(t))
+        s_rows += f"<tr><td>{_html_escape(c)}</td>{_num(tr_day.get(c, 0))}{_num(tr_night.get(c, 0))}{tcell}{_pend(pend)}</tr>"
+    s_d = (variants.get("day") or {}).get("sample_count", 0) if ai_model else 0
+    s_n = (variants.get("night") or {}).get("sample_count", 0) if ai_model else 0
+    s_t = (variants.get("all") or {}).get("sample_count", 0) if ai_model else 0
+    s_rows += (f'<tr class="tot"><td>Total</td><td class="num">{s_d:,}</td><td class="num">{s_n:,}</td>'
+               f'<td class="num">{s_t:,}</td>{_pend(s_pend_total)}</tr>')
+    sensor_tip = (tbl_head + s_rows + "</tbody></table>"
+                  f'<p class="tip-note">Total = samples used in the last training (Day + Night model; the Day and '
+                  f'Night columns are the Day and Night models). Pending = classified since then; press '
+                  f'<b>Train model now</b> to include them. A label needs {AI_MODEL_MIN_SAMPLES_PER_CLASS}+ (shown as '
+                  f'x/{AI_MODEL_MIN_SAMPLES_PER_CLASS} until it has them). Imported images are never counted here '
+                  f'(no sensor data).</p>')
+    sensor_line = _totals_line(_when(ai_model["trained_at"]) if ai_model else None, s_d, s_n, s_t, s_pend_total)
+    if ai_model_wanted and not ai_model:
+        sensor_used = "<b>Yes</b> — but no model is trained yet, so the other checks decide"
+    elif ai_model_wanted:
+        sensor_used = "<b>Yes</b> — actively used"
+    else:
+        sensor_used = "No — dashboard comparison only"
+    sensor_rows = (f'<tr><th>In SAFE/UNSAFE decision</th><td>{sensor_used} &middot; '
+                   f'<a href="/settings#safety-checks">change</a></td></tr>')
+    if ai_model:
+        sensor_rows += (f'<tr><th>Model by day / by night</th><td>'
+                        f'{AI_MODEL_VARIANT_NAMES.get(checks.get("ai_model_day", "all"), "Day + Night model")} / '
+                        f'{AI_MODEL_VARIANT_NAMES.get(checks.get("ai_model_night", "night"), "Night model")} &middot; '
+                        f'<a href="/settings#ai-model-choice">change</a></td></tr>')
+    if ignore_label_name:
+        sensor_rows += (f'<tr><th>&ldquo;{_html_escape(ignore_label_name)}&rdquo; not counted</th><td>'
+                        f'{ignore_unassigned_count:,} &middot; <a href="/ai-classify?show=label:'
+                        f'{urllib.parse.quote(ignore_label_name)}">review them</a></td></tr>')
+
+    # Cloud image model: images it has learned from vs classified since.
+    cloud_labels = list(label_classes) + [c for c in classified_counts if c not in label_classes]
+    c_tr = {c: [0, 0, 0] for c in cloud_labels}   # day, night, total
+    c_pend = {c: 0 for c in cloud_labels}
+    for smp in all_samples:
+        lbl = smp.get("label")
+        if not lbl:
+            continue
+        if smp.get("cloud_trained_at"):
+            row = c_tr.setdefault(lbl, [0, 0, 0])
+            dn = (smp.get("sensors") or {}).get("daynight")
+            row[0] += dn == "Day"
+            row[1] += dn == "Night"
+            row[2] += 1
+        elif _cloud_pending(smp, on_disk):
+            c_pend[lbl] = c_pend.get(lbl, 0) + 1
+    c_rows = ""
+    for c in cloud_labels:
+        d, n, t = c_tr.get(c, [0, 0, 0])
+        c_rows += f"<tr><td>{_html_escape(c)}</td>{_num(d)}{_num(n)}{_num(t)}{_pend(c_pend.get(c, 0))}</tr>"
+    c_d, c_n, c_t = (sum(v[i] for v in c_tr.values()) for i in range(3))
+    c_rows += (f'<tr class="tot"><td>Total</td><td class="num">{c_d:,}</td><td class="num">{c_n:,}</td>'
+               f'<td class="num">{c_t:,}</td>{_pend(cloud_new_count)}</tr>')
+    cloud_tip = (tbl_head + c_rows + "</tbody></table>"
+                 '<p class="tip-note">Total = images the cloud model has learned from. Pending = classified since '
+                 'the last cloud training that still have their image; press <b>Train via cloud server</b> to send them. '
+                 'Classified records whose image was deleted are not pending (they can only train the sensor model). '
+                 'Unlike the sensor model, '
+                 '&ldquo;Ignore&rdquo; is a class here (it learns to spot bad frames). Imported images are included; '
+                 'they have no Day/Night, so they only count in Total.</p>')
+    cloud_line = _totals_line(_when(cloud_meta["trained_at"]) if cloud_meta and cloud_meta.get("trained_at") else None,
+                              c_d, c_n, c_t, cloud_new_count)
+    if cloud_model_wanted and not cloud_meta:
+        cloud_used = "<b>Yes</b> — but no model is downloaded yet, so the other checks decide"
+    elif cloud_model_wanted:
+        cloud_used = "<b>Yes</b> — actively used"
+    else:
+        cloud_used = "No — dashboard comparison only"
+    cloud_rows = (f'<tr><th>In SAFE/UNSAFE decision</th><td>{cloud_used} &middot; '
+                  f'<a href="/settings#safety-checks">change</a></td></tr>'
+                  + (f'<tr><th>No image (sensor only)</th><td>{cloud_no_image:,} &middot; classified, but the '
+                     f'image was deleted, so the All Sky model can&#39;t learn from them</td></tr>' if cloud_no_image else '')
+                  + f'<tr><th>Last run</th><td id="cloudTrainStatus">{_cloud_job_status_line(cloud_job) or "No cloud training run yet"}</td></tr>'
+                  f'<tr><th>Training server / auto-train</th><td>'
+                  f'{"Set up" if cloud_server_configured else "Not set up"} / {"On" if auto_train_enabled else "Off"}'
+                  f' &middot; <a href="/settings#ai-learning-settings">change</a></td></tr>')
+
+    # Top strip: what each AI trains on.
+    sensor_sample_total = sum(effective_counts.values())
+    with_img = [x for x in all_samples if x.get("label") and x.get("image") in on_disk]
+    allsky_imported = sum(1 for x in with_img if _is_imported_sample(x))
+    allsky_captured = len(with_img) - allsky_imported
+
+    h_lines, h_bytes = _file_lines_and_size(SAFETY_HISTORY_PATH)
+    history_dl_html = (f'<a class="btn" href="/download-safety-history">Download safety history (.jsonl)</a>'
+                       f'<span class="hint">{h_lines:,} lines &middot; {_format_size_general(h_bytes)}</span>'
+                       if h_lines else
+                       '<span class="btn ai-nav-btn-disabled">Download safety history (.jsonl)</span>'
+                       '<span class="hint">Nothing recorded yet.</span>')
+    recovery_inner = _ai_recovery_inner_html(idx)
+    copies = _ai_index_copies()
+    recovery_body = recovery_inner or (
+        f'<p class="hint">✓ Training list OK — {total_count:,} samples, no missing or orphan images. '
+        f'Training copies kept: {len(copies)}'
+        + (f' (latest {_when(copies[0][2])})' if copies else '') + '.</p>'
+        '<p class="hint">Repair buttons (restore orphan images, recover from the AllSky archive, restore a '
+        'training copy) appear here only when something needs fixing.</p>')
+    recovery_badge = '<span class="nav-warn">⚠</span>' if recovery_inner else '<span class="nav-ok">✓</span>'
+    cls_sections = [("classify", f'🏷️ Classify samples <span class="nav-n">{unlabeled_count}</span>'),
+                    ("ai", "🤖 AI Models"), ("export", "📦 Export &amp; bulk actions"),
+                    ("recovery", f"🛟 Recovery {recovery_badge}")]
+    cls_nav_html = "".join(f'<a href="#{k}" data-g="{k}">{t}</a>' for k, t in cls_sections)
+    unclassify_html = ('' if view != "grid" else
+                       '<span class="btn ai-nav-btn-disabled" title="Nothing here is classified">↩ Unclassify selected</span>'
+                       if show == "unclassified" else
+                       '<button type="button" class="btn ai-unclassify-btn" onclick="unclassifySelected()">↩ Unclassify selected</button>')
+    select_row_html = ('' if view != "grid" else
+                       '<div class="cls-row"><button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>'
+                       f'{select_all_matching_html}'
+                       '<button type="button" class="btn" onclick="selectAll(false)">Clear selection</button>'
+                       '<button type="button" class="btn ai-delete-btn" onclick="deleteSelected()">Delete selected</button></div>')
+
     _safe_now = _overall_safe_now()
     html = f"""<!DOCTYPE html><html><head><title>AI Learning — Classify</title>
 {_page_favicon_link(_safe_now)}
@@ -11139,7 +12213,8 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .ai-label-btn{{background:var(--info);}}
 .ai-upload-btn{{background:var(--info);}}
 .ai-nav-btn-disabled{{background:#c7cdd2;cursor:default;}}
-#classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}}
+#classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{{font-size:13px;color:var(--muted);margin:4px 0 0;}}
+#classifyStatus{{min-height:16px;}}
 .ai-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}}
 .ai-card{{background:#fafbfc;border-radius:10px;padding:8px;position:relative;}}
 .ai-card-select{{display:block;cursor:pointer;}}
@@ -11174,6 +12249,13 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .ai-sensor-clear{{margin-left:6px;color:#c0392b;font-size:11px;}}
 .ai-unclassify-btn{{background:#b26a00;}}
 .ai-single-actions{{display:flex;gap:8px;justify-content:center;margin-top:10px;}}
+.ai-sd{{margin-top:10px;text-align:left;font-size:13px;}}
+.ai-sd summary{{cursor:pointer;color:var(--accent);font-weight:600;}}
+.ai-sd table{{border-collapse:collapse;width:100%;margin-top:6px;}}
+.ai-sd th{{text-align:left;color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;padding:8px 0 3px;border-bottom:1px solid #e3e6ea;}}
+.ai-sd td{{padding:3px 8px 3px 0;border-bottom:1px solid #f0f2f4;}}
+.ai-sd td.v{{text-align:right;font-variant-numeric:tabular-nums;}}
+.ai-sd-none{{color:#a0a7ae;font-style:italic;}}
 .ai-single-actions .ai-delete-btn{{margin-top:0;}}
 .ai-chip-imported{{background:#e3f2fd;color:#1565c0;font-weight:700;}}
 .rec-box{{border-radius:10px;padding:10px 14px;margin:10px 0;}}
@@ -11196,83 +12278,168 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .ai-import-note{{background:#f5f7fa;border-radius:8px;padding:8px 10px;font-size:13px;color:var(--muted);}}
 .ai-progress{{height:8px;background:#e2e5ea;border-radius:4px;margin:12px 0 4px;display:none;}}
 .ai-progress > div{{height:8px;width:0;background:var(--accent);border-radius:4px;}}
+/* Classify page: Settings-style left menu, one section at a time */
+.cls-h2{{font-size:17px;margin:0 0 12px;}}
+.cls-strip{{background:#f6f7f9;border-radius:12px;padding:10px 14px;margin:0 0 16px;font-size:13px;color:#374151;}}
+.cls-alert{{background:#fff4e0;color:#8a5300;border:1px solid #f1d39b;border-radius:10px;padding:8px 12px;margin:0 0 14px;font-size:13px;}}
+.cls-shell{{display:flex;gap:18px;align-items:flex-start;}}
+.cls-nav{{flex:0 0 220px;display:flex;flex-direction:column;gap:2px;background:#f6f7f9;border-radius:12px;padding:8px;position:sticky;top:8px;}}
+.cls-nav a{{display:block;padding:8px 10px;border-radius:8px;color:#2c3e50;text-decoration:none;font-size:13.5px;}}
+.cls-nav a:hover{{background:#eceff2;}}
+.cls-nav a.on{{background:#dcefec;color:#0f766e;font-weight:700;}}
+.nav-n{{display:inline-block;margin-left:6px;background:#e5e7eb;border-radius:9px;padding:0 7px;font-size:11.5px;color:#374151;}}
+.cls-nav a.on .nav-n{{background:#0f766e;color:#fff;}}
+.nav-ok{{margin-left:6px;color:#1a7f37;font-size:12px;}}
+.nav-warn{{margin-left:6px;color:#b45309;font-size:12px;font-weight:700;}}
+.cls-panes{{flex:1;min-width:0;}}
+.cls-pane{{display:none;}}
+.cls-pane.on{{display:block;}}
+.cls-title{{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13.5px;font-weight:700;
+            margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}}
+.cls-title.sub{{font-size:14px;color:#1f2937;}}
+.cls-row{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px;}}
+.cls-row .btn,.cls-row select,.cls-row label.btn{{margin:0;}}
+.cls-row select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
+.cls-sp{{flex:1;}}
+.cls-sep{{border:0;border-top:1px solid #e3e6ea;margin:4px 0 12px;}}
+.ai-block{{border:1px solid #e3e6ea;border-radius:12px;padding:12px 14px;margin:0 0 14px;background:#fff;}}
+.btn-groups{{margin:10px 0 6px;}}
+.btn-groups .cls-row{{margin:0 0 8px;}}
+.btn-lbl{{flex:0 0 52px;font-size:12px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:.4px;}}
+.kv{{border-collapse:collapse;font-size:13px;margin:0 0 6px;}}
+.kv th{{text-align:left;font-weight:500;color:#6b7280;padding:5px 18px 5px 0;white-space:nowrap;vertical-align:top;width:170px;}}
+.kv td{{padding:5px 0;color:#1f2937;}}
+.kv tr+tr th,.kv tr+tr td{{border-top:1px solid #eef0f2;}}
+.lt-sep{{color:#9ca3af;margin:0 4px;}}
+.lt-pend{{color:#b45309;}}
+.help{{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:0 0 20px;width:20px;height:20px;
+       border-radius:50%;background:#e5e7eb;color:#374151;font-size:12px;font-weight:700;cursor:help;
+       text-transform:none;letter-spacing:0;}}
+.help:hover,.help:focus{{background:#0f766e;color:#fff;outline:none;}}
+.help-tip{{display:none;position:absolute;right:0;top:26px;width:min(420px,80vw);background:#1f2937;color:#f9fafb;
+           font-size:12.5px;font-weight:400;line-height:1.5;padding:10px 12px;border-radius:8px;
+           box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:20;text-align:left;}}
+.help-tip b{{color:#fff;}}
+.help:hover .help-tip,.help:focus .help-tip{{display:block;}}
+.tip-table{{width:auto;max-width:92vw;padding:12px 14px;}}
+.cnt{{border-collapse:collapse;font-size:13px;margin:0 0 8px;white-space:nowrap;}}
+.cnt th{{color:#9ca3af;font-weight:500;text-align:left;padding:5px 16px 5px 0;border-bottom:1px solid #374151;}}
+.cnt td{{padding:5px 16px 5px 0;border-bottom:1px solid #2d3748;}}
+.cnt .num{{text-align:right;}}
+.cnt td.zero{{color:#6b7280;}}
+.cnt td.pend{{color:#fbbf24;font-weight:600;}}
+.cnt td.low{{color:#f87171;}}
+.cnt tr.tot td{{font-weight:700;border-bottom:0;}}
+.tip-note{{margin:0;color:#d1d5db;font-size:12px;max-width:380px;white-space:normal;}}
+.acc-p{{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px;font-weight:600;margin:0 4px 4px 0;}}
+.acc-p.g{{background:#e3f5e8;color:#1a7f37;}}.acc-p.y{{background:#fff4d6;color:#8a6100;}}.acc-p.r{{background:#fde7e7;color:#b42318;}}
+.acc-use{{font-weight:400;opacity:.8;margin-left:4px;}}
+.acc-help{{vertical-align:middle;}}
+.acc-help .help-tip{{left:0;right:auto;}}
+@media (max-width:760px){{
+  .cls-shell{{flex-direction:column;}}
+  .cls-nav{{flex:none;width:100%;flex-direction:row;flex-wrap:wrap;position:static;}}
+  .cls-nav a{{flex:0 0 auto;}}
+  .ai-block{{position:relative;}}
+  .acc-help{{position:static;}}
+  .acc-help .help-tip{{left:0;right:0;width:auto;top:auto;margin-top:6px;}}
+}}
 a{{color:var(--accent);}}
 </style></head><body>
 
 {_page_header_html("classify", unlabeled_count)}
 
-{_ai_recovery_card_html(idx)}
-<div class="card">
-  <p class="card-title">📊 Training data overview</p>
-  <p class="hint" style="margin:0;">Samples collected so far: <b>{total_count}</b>{source_split_html}
-  ({unlabeled_count} not yet classified) — training images folder: <b>{ai_images_size_str}</b>
-  across {ai_images_count} image(s).</p>
-</div>
+<div class="card cls-card">
+  <h2 class="cls-h2">🏷️ Classify</h2>
+  <div class="cls-strip">Sensor Samples: <b>{sensor_sample_total:,}</b>, AllSky Samples: <b>{allsky_captured:,}</b> captured
+  &middot; <b>{allsky_imported:,}</b> imported (<b>{unlabeled_count:,}</b> not yet classified) — training images folder:
+  <b>{ai_images_size_str}</b> across <b>{ai_images_count:,}</b> image(s).</div>
+  {'<div class="cls-alert">⚠️ Something in the training data needs fixing — open <a href="#recovery" onclick="clsShow(&#39;recovery&#39;);return false;">🛟 Recovery</a>.</div>' if recovery_inner else ''}
+  <div class="cls-shell">
+    <nav class="cls-nav" id="clsNav">{cls_nav_html}</nav>
+    <div class="cls-panes">
 
-<div class="card">
-  <p class="card-title">🤖 AI Sky Prediction(Sensor Based)</p>
-  <p class="hint" id="modelStatus">{model_status_html}</p>
-  <p class="hint">Classified so far, per label (need at least {AI_MODEL_MIN_SAMPLES_PER_CLASS} of each to
-  train): {eligibility_html}{ignore_unassigned_note_html}{" <span class='hint'>Imported images are never counted here (no sensor data).</span>" if imported_count else ""}</p>
-  <button type="button" class="btn" onclick="trainModel()">Train model now</button>
-  {reset_model_html}
-  {sensor_data_delete_html}
-  {sensor_data_download_html}
-  <label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor records (.zip)</label>
-  <input type="file" id="sensorDataUploadInput" accept=".zip,.json" style="display:none" onchange="uploadSensorData(this)">
-  <p id="trainStatus" class="hint"></p>
-  <p id="sensorDataStatus" class="hint"></p>
-</div>
+      <div class="cls-pane" id="sec-classify">
+        <div class="cls-title"><span>🏷️ Classify samples</span>{_help(instructions_html)}</div>
+        <p class="hint">Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
+        <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
+        <form class="cls-row" action="/ai-classify" method="get">
+          <select name="show" onchange="this.form.submit()">{show_options}</select>
+          <input type="hidden" name="view" value="{view}">
+          <button type="submit" class="btn">Filter</button>
+          {view_toggle_html}
+          <span class="cls-sp"></span>
+          {import_button_html}
+        </form>
+        {select_row_html}
+        <hr class="cls-sep">
+        <div class="cls-row">{label_buttons_html}{unclassify_html}</div>
+        <p id="classifyStatus"></p>
+        {'<div class="ai-grid" id="aiGrid">' + cards_html + '</div><div class="pager">' + prev_link_html + next_link_html + '</div>'
+         if view == "grid" else
+         '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
+      </div>
 
-<div class="card">
-  <p class="card-title">📷 AI Cloud Detect(All Sky)</p>
-  <p class="hint" id="cloudModelStatus">{cloud_model_status_html}</p>
-  <p class="hint">Classified so far, per label: {cloud_eligibility_html}</p>
-  {"" if cloud_server_configured else
-   '<p class="hint">Set a cloud training server URL and API key under '
-   '<a href="/settings#ai-learning-settings">Settings → AI Learning</a> first '
-   '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
-  {cloud_train_button_html}
-  {cloud_reset_button_html}
-  {resized_images_delete_html}
-  {resized_images_download_html}
-  <label class="btn ai-upload-btn" for="resizedImagesUploadInput">Upload resized images (.zip)</label>
-  <input type="file" id="resizedImagesUploadInput" accept=".zip" style="display:none" onchange="uploadResizedImages(this)">
-  {cloud_cancel_button_html}
-  <p id="cloudTrainStatus" class="hint">{_cloud_job_status_line(cloud_job)}</p>
-  <p class="hint">{"Auto-train is on — see " if auto_train_enabled else "Auto-train is off — see "}
-  <a href="/settings#ai-learning-settings">Settings → AI Learning</a> to change it.</p>
-  <p id="resizedImagesStatus" class="hint"></p>
-</div>
+      <div class="cls-pane" id="sec-ai">
+        <div class="cls-title"><span>🤖 AI Models</span></div>
+        <div class="ai-block">
+          <div class="cls-title sub"><span>🤖 AI Sky Prediction (Sensor)</span>{_help(sensor_tip, wide=True)}</div>
+          <table class="kv"><tr><th>Last trained</th><td>{sensor_line}</td></tr>{_ai_accuracy_row_html(ai_model, checks) if ai_model else ""}</table>
+          <div class="btn-groups">
+            <div class="cls-row"><span class="btn-lbl">Model</span>
+              <button type="button" class="btn" onclick="trainModel()">Train model now</button>{reset_model_html}</div>
+            <div class="cls-row"><span class="btn-lbl">Data</span>{sensor_data_download_html}
+              <label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor records (.zip)</label>
+              {sensor_data_delete_html}</div>
+          </div>
+          <input type="file" id="sensorDataUploadInput" accept=".zip,.json" style="display:none" onchange="uploadSensorData(this)">
+          <table class="kv">{sensor_rows}</table>
+          <p id="trainStatus" class="hint"></p>
+          <p id="sensorDataStatus" class="hint"></p>
+        </div>
+        <div class="ai-block">
+          <div class="cls-title sub"><span>📷 AI Cloud Detect (All Sky)</span>{_help(cloud_tip, wide=True)}</div>
+          <table class="kv"><tr><th>Last trained</th><td>{cloud_line}</td></tr></table>
+          <div class="btn-groups">
+            <div class="cls-row"><span class="btn-lbl">Model</span>{cloud_train_button_html}{cloud_reset_button_html}{cloud_cancel_button_html}</div>
+            <div class="cls-row"><span class="btn-lbl">Data</span>{resized_images_download_html}
+              <label class="btn ai-upload-btn" for="resizedImagesUploadInput">Upload resized images (.zip)</label>
+              {resized_images_delete_html}</div>
+          </div>
+          <input type="file" id="resizedImagesUploadInput" accept=".zip" style="display:none" onchange="uploadResizedImages(this)">
+          <table class="kv">{cloud_rows}</table>
+          {"" if cloud_server_configured else
+           '<p class="hint">Set a cloud training server URL and API key under '
+           '<a href="/settings#ai-learning-settings">Settings → AI Learning</a> first '
+           '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
+          <p id="resizedImagesStatus" class="hint"></p>
+        </div>
+      </div>
 
-<div class="card">
-  <p class="card-title">📦 Export &amp; bulk image actions</p>
-  <p class="hint">{total_labeled} labeled sample(s) total, across {len(classified_counts)} label(s). Bundles
-  as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
-  your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
-  <div class="toolbar">{export_html}{compress_html}{delete_all_html}</div>
-</div>
+      <div class="cls-pane" id="sec-export">
+        <div class="cls-title"><span>📦 Export &amp; bulk actions</span></div>
+        <p class="hint">{total_labeled} labeled sample(s) total, across {len(classified_counts)} label(s). Bundles
+        as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
+        your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
+        <div class="cls-row">{export_html}{compress_html}{delete_all_html}</div>
+        <hr class="cls-sep">
+        <div class="cls-title sub"><span>📈 Safety history (last 48 h)</span></div>
+        <p class="hint">The data behind the dashboard's <b>Safety Checks History</b> graph: one line per minute with
+        SAFE/UNSAFE, Day/Night, rain, MLX sky, Simple Cloud Detect, <b>AI Sky Prediction</b> (class + how far from the
+        cutoff), AI Cloud Detect, dew risk and dome state. Kept for 48 hours, then the oldest lines drop off.
+        Download it to check why a prediction changed, or to send it for troubleshooting.</p>
+        <div class="cls-row">{history_dl_html}</div>
+      </div>
 
-<div class="card">
-  <p class="card-title">🏷️ Classify samples</p>
-  <p class="hint">{instructions_html}
-  Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
-  <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
-  <form class="toolbar" action="/ai-classify" method="get">
-    <select name="show" onchange="this.form.submit()">{show_options}</select>
-    <input type="hidden" name="view" value="{view}">
-    <button type="submit" class="btn">Filter</button>
-    {view_toggle_html}
-    {grid_controls_html}
-    {import_button_html}
-  </form>
-  <div class="toolbar">{label_buttons_html}</div>
-  <p id="classifyStatus"></p>
-</div>
+      <div class="cls-pane" id="sec-recovery">
+        <div class="cls-title"><span>🛟 Recovery</span></div>
+        {recovery_body}
+        {'' if recovery_inner else '<p class="hint" id="aiRecoverStatus"></p>'}
+      </div>
 
-{'<div class="ai-grid" id="aiGrid">' + cards_html + '</div><div class="pager">' + prev_link_html + next_link_html + '</div>'
- if view == "grid" else
- '<div class="ai-single-wrap">' + single_card_html + '</div><div class="pager">' + prev_single_html + next_single_html + '</div>'}
+    </div>
+  </div>
+</div>
 
 
 <div class="ai-modal-back" id="unclassifyModal" onclick="if(event.target===this)closeModal('unclassifyModal')">
@@ -11304,6 +12471,27 @@ a{{color:var(--accent);}}
   </div>
 </div>
 
+<script>
+// Classify page menu: one section at a time; remembers the last one.
+function clsShow(id) {{
+  if (!document.getElementById('sec-' + id)) id = 'classify';
+  document.querySelectorAll('.cls-pane').forEach(p => p.classList.toggle('on', p.id === 'sec-' + id));
+  document.querySelectorAll('#clsNav a').forEach(a => a.classList.toggle('on', a.dataset.g === id));
+  try {{ localStorage.setItem('clsSection', id); }} catch (e) {{}}
+}}
+(function() {{
+  const nav = document.getElementById('clsNav');
+  nav.addEventListener('click', e => {{
+    const a = e.target.closest('a'); if (!a) return;
+    e.preventDefault(); clsShow(a.dataset.g); history.replaceState(null, '', '#' + a.dataset.g);
+  }});
+  let id = location.hash.slice(1);
+  // A link to a filtered/paged image list always opens the images.
+  if (!id && /[?&](show|view|after|before|page|idx)=/.test(location.search)) id = 'classify';
+  if (!id) {{ try {{ id = localStorage.getItem('clsSection') || ''; }} catch (e) {{}} }}
+  clsShow(id || 'classify');
+}})();
+</script>
 <script>
 const aiShowFilter = {json.dumps(show)};
 function aiRecover(action, source) {{
@@ -11455,7 +12643,8 @@ async function runImport() {{
 // URL of the next page, or null if this is already the last one - used to
 // auto-advance once every card visible on THIS page has been classified
 // or deleted, instead of leaving an empty grid until Next is clicked.
-const aiNextPageUrl = {(f"'/ai-classify?show={show}&view=grid&page={page + 1}'" if has_next else "null")};
+const aiNextPageUrl = {json.dumps(next_url) if view == "grid" else "null"};
+const aiSingleCursor = {json.dumps(single_cursor)};
 function maybeAutoAdvance() {{
   const grid = document.getElementById('aiGrid');
   if (!grid || !aiNextPageUrl) return;
@@ -11738,8 +12927,8 @@ function applyLabelSingle(label) {{
       // relabeled), so move forward or the same image would show forever.
       // "unclassified only": it drops OUT of the list, so staying at the
       // same index naturally shows whatever shifted into that slot next.
-      const nextIdx = ('{show}' === 'all') ? {sidx} + 1 : {sidx};
-      window.location = '/ai-classify?show={show}&view=single&idx=' + nextIdx;
+      // Always the image right after this one, whichever filter is on.
+      window.location = '/ai-classify?show={urllib.parse.quote(show)}&view=single&after=' + encodeURIComponent(aiSingleCursor);
     }})
     .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
 }}
@@ -11759,7 +12948,7 @@ function deleteSingle() {{
       }}
       // A deleted image always drops out of every list, so staying at the
       // same index shows whatever shifted into that slot next.
-      window.location = '/ai-classify?show={show}&view=single&idx={sidx}';
+      window.location = '/ai-classify?show={urllib.parse.quote(show)}&view=single&after=' + encodeURIComponent(aiSingleCursor);
     }})
     .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
 }}
@@ -11773,7 +12962,7 @@ function trainModel() {{
         status.textContent = data.error || 'Failed to train: unknown error';
         return;
       }}
-      status.textContent = 'Trained on ' + data.sample_count + ' classified samples. Reload this page ' +
+      status.textContent = 'Trained ' + data.variants + '. Reload this page ' +
         'to see the updated breakdown, or check the dashboard for its live prediction.';
     }})
     .catch(err => {{ status.textContent = 'Failed to train: ' + err; }});

@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+
+<html><head><title>AI Learning — Classify</title>
+<link href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M21%2020%20L43%2044%20M43%2020%20L21%2044%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E" id="safetyFavicon" rel="icon"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<style>
+:root{
+  --page-bg:#f2f4f7; --card-bg:#ffffff; --text:#1f2328; --muted:#6a7178;
+  --accent:#0f766e; --info:#2563eb; --warn:#9a6300; --warn-bg:#fff4e0;
+}
+*{box-sizing:border-box;}
+body{background:var(--page-bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      max-width:1040px;margin:0 auto;padding:18px 16px 48px;}
+
+h1{font-size:21px;margin:2px 0 2px;}
+.subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
+.topnav{display:flex;align-items:center;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
+.topnav a{padding:9px 14px;text-decoration:none;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px;}
+.topnav a:hover{color:#2563eb;}
+.topnav a.on{color:#2563eb;border-bottom-color:#2563eb;}
+.topnav .nav-sp{flex:1;}
+.nav-restart-msg{font-size:12px;color:#6a7178;margin-right:8px;}
+.nav-restart{width:24px;height:24px;border:1px solid #a71d1d;border-radius:6px;background:#c62828;color:#fff;font-size:14px;font-weight:700;line-height:1;cursor:pointer;padding:0;margin-bottom:3px;}
+.nav-restart:hover{background:#a71d1d;}
+.nav-remote{background:#e8f0fe;color:#1a56c4;border-radius:10px;padding:2px 9px;font-size:12px;font-weight:700;margin-right:4px;}
+.topnav a.nav-signout{padding:4px 8px;font-size:13px;font-weight:600;border-bottom:0;margin:0 6px 0 0;}
+
+.subtitle a{color:var(--accent);text-decoration:none;}
+.card{background:var(--card-bg);border-radius:14px;padding:16px 18px;margin:0 0 16px;
+       box-shadow:0 1px 4px rgba(0,0,0,.08);}
+.card-title{font-size:15px;font-weight:700;margin:0 0 10px;color:var(--text);}
+.hint{color:var(--muted);font-size:12.5px;}
+.btn{padding:7px 14px;border-radius:8px;border:none;font-size:14px;font-weight:600;cursor:pointer;
+      background:var(--accent);color:#fff;text-decoration:none;display:inline-block;}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}
+.toolbar select{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}
+.ai-label-btn{background:var(--info);}
+.ai-upload-btn{background:var(--info);}
+.ai-nav-btn-disabled{background:#c7cdd2;cursor:default;}
+#classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{font-size:13px;color:var(--muted);min-height:16px;margin:4px 0 0;}
+.ai-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}
+.ai-card{background:#fafbfc;border-radius:10px;padding:8px;position:relative;}
+.ai-card-select{display:block;cursor:pointer;}
+.ai-card-select img{width:100%;border-radius:6px;display:block;background:#14161a;}
+.ai-card-select input[type=checkbox]{position:absolute;top:12px;left:12px;width:18px;height:18px;}
+.ai-card-noimg{width:100%;min-height:120px;border-radius:6px;background:#eceff1;color:var(--muted);
+                 font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;
+                 padding:10px;box-sizing:border-box;}
+.ai-single-noimg{max-height:none;min-height:160px;}
+.ai-label-badge{position:absolute;top:12px;right:12px;background:var(--accent);color:#fff;
+                  border-radius:10px;padding:1px 9px;font-size:11.5px;font-weight:600;}
+.ai-card-time{font-size:11.5px;color:var(--muted);margin-top:6px;}
+.ai-card-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}
+.ai-chip{background:#eceff1;border-radius:6px;padding:2px 6px;font-size:11px;color:var(--muted);}
+.ai-fullsize-link{display:inline-block;margin-top:6px;font-size:12px;}
+.pager{display:flex;justify-content:space-between;margin-top:16px;}
+.ai-delete-btn{background:#c0392b;}
+.ai-single-wrap{display:flex;justify-content:center;}
+.ai-single-card{background:#fafbfc;border-radius:10px;padding:14px;position:relative;max-width:640px;width:100%;text-align:center;}
+.ai-single-img{width:100%;max-height:65vh;object-fit:contain;border-radius:8px;background:#14161a;display:block;margin:0 auto;}
+.ai-single-position{font-size:12px;color:var(--muted);margin-bottom:6px;}
+.ai-single-card .ai-card-chips{justify-content:center;}
+.ai-single-card .ai-delete-btn{margin-top:10px;}
+.ai-sensor-row{margin-top:8px;padding-top:8px;border-top:1px dashed #d3d8dc;text-align:left;}
+.ai-sensor-caption{font-size:11px;color:var(--muted);margin-bottom:6px;}
+.ai-sensor-btns{display:flex;flex-wrap:wrap;gap:4px;}
+.ai-sensor-btn{background:#eceff1;color:var(--muted);padding:3px 8px;font-size:11.5px;font-weight:600;}
+.ai-sensor-btn.active{background:#1f7a3f;color:#fff;}
+.ai-sensor-note-wrap{margin-top:6px;font-size:11.5px;}
+.ai-sensor-note{color:var(--muted);font-style:italic;}
+.ai-sensor-note-set{color:#1f7a3f;font-style:normal;font-weight:600;}
+.ai-sensor-clear{margin-left:6px;color:#c0392b;font-size:11px;}
+.ai-unclassify-btn{background:#b26a00;}
+.ai-single-actions{display:flex;gap:8px;justify-content:center;margin-top:10px;}
+.ai-single-actions .ai-delete-btn{margin-top:0;}
+.ai-chip-imported{background:#e3f2fd;color:#1565c0;font-weight:700;}
+.rec-box{border-radius:10px;padding:10px 14px;margin:10px 0;}
+.rec-red{border:2px solid #c62828;background:#fdecea;}
+.rec-amber-box{border:2px solid #b26a00;background:#fff8ec;}
+.rec-blue-box{border:2px solid #1f6feb;background:#eef4ff;}
+.rec-amber{background:#b26a00;}
+.rec-blue{background:#1f6feb;}
+.ai-modal-back{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:50;padding:16px;}
+.ai-modal-back.open{display:flex;}
+.ai-modal{background:#fff;border-radius:14px;padding:16px 20px;max-width:540px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.3);max-height:90vh;overflow:auto;}
+.ai-modal-head{display:flex;align-items:center;}
+.ai-modal-head h3{flex:1;margin:0;font-size:16px;}
+.ai-modal-x{background:none;border:none;font-size:22px;color:var(--muted);cursor:pointer;}
+.ai-modal ul{margin:8px 0 12px;padding-left:20px;font-size:13.5px;line-height:1.5;}
+.ai-modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px;}
+.btn-sec{background:#fff;color:#333;border:1px solid #c9ced6;}
+.ai-drop{border:2px dashed #9aa5b1;border-radius:12px;padding:20px;text-align:center;color:var(--muted);background:#fafbfc;margin:12px 0;}
+.ai-drop.over{border-color:var(--accent);background:#eef6f2;}
+.ai-import-note{background:#f5f7fa;border-radius:8px;padding:8px 10px;font-size:13px;color:var(--muted);}
+.ai-progress{height:8px;background:#e2e5ea;border-radius:4px;margin:12px 0 4px;display:none;}
+.ai-progress > div{height:8px;width:0;background:var(--accent);border-radius:4px;}
+a{color:var(--accent);}
+.settings-group{margin-bottom:6px;}
+.settings-group + .settings-group{border-top:1px solid #eee;margin-top:16px;padding-top:16px;}
+.settings-group h3{font-size:13.5px;margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}
+.ai-steady{border:1px solid #e3e6ea;border-radius:10px;padding:8px 12px;margin:8px 0 12px;background:#fafbfc;}
+.ai-steady-title{font-weight:700;font-size:13.5px;margin:0 0 2px;}
+.ai-steady-row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;}
+.ai-steady-row label{margin:6px 0 4px;}
+.ai-acc{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600;margin:0 4px 0 0;}
+.ai-acc.g{background:#e3f5e8;color:#1a7f37;}.ai-acc.y{background:#fff4d6;color:#8a6100;}.ai-acc.r{background:#fde7e7;color:#b42318;}
+.ai-acc-tbl{border-collapse:collapse;font-size:12.5px;margin:8px 0 4px;}
+.ai-acc-tbl th,.ai-acc-tbl td{border-bottom:1px solid #e3e6ea;padding:4px 10px 4px 0;text-align:left;}
+.ai-acc-tbl th{color:#6b7280;font-weight:500;}.ai-acc-tbl tr.sel td{background:#eef5ff;}
+.settings-shell{display:flex;gap:18px;align-items:flex-start;}
+.settings-nav{flex:0 0 210px;display:flex;flex-direction:column;gap:2px;background:#f6f7f9;border-radius:12px;padding:8px;position:sticky;top:8px;}
+.settings-nav a{display:block;padding:8px 10px;border-radius:8px;color:#2c3e50;text-decoration:none;font-size:13.5px;}
+.settings-nav a:hover{background:#eceff2;}
+.settings-nav a.on{background:#dcefec;color:#0f766e;font-weight:700;}
+@media (max-width:760px){.settings-shell{flex-direction:column;}.settings-nav{flex:none;width:100%;flex-direction:row;flex-wrap:wrap;position:static;}}
+.view-cls .settings-group{display:none;border-top:0!important;margin-top:0!important;padding-top:0!important;}
+.view-cls .settings-group.sg-on{display:block;}
+.pane-title{font-size:13.5px;margin:0 0 8px;color:#333;text-transform:uppercase;letter-spacing:.4px;}
+.nav-n{float:none;display:inline-block;margin-left:6px;background:#e5e7eb;border-radius:9px;padding:0 7px;font-size:11.5px;color:#374151}
+.nav-ok{float:none;margin-left:6px;color:#1a7f37;font-size:12px}
+.settings-nav a.on .nav-n{background:#0f766e;color:#fff}
+#ai-model-choice .ai-steady-row>div{flex:1;min-width:220px;}
+#ai-model-choice label{display:block;font-size:14px;color:#374151;margin:6px 0 6px;}
+#ai-model-choice select{width:100%;padding:8px 10px;font-size:14px;border:1px solid #d0d5dd;border-radius:8px;background:#f3f4f6;margin-bottom:6px;}
+.view-cls>h2{font-size:17px;margin:0 0 14px}.saved{font-size:12px;font-weight:600;color:#1a7f37;margin-left:8px;opacity:0;transition:opacity .3s}
+#clsNav{flex:0 0 240px}
+@media (max-width:760px){#clsNav{flex:none;width:100%;box-sizing:border-box}#clsNav a{flex:0 0 auto}}
+.mock-banner{background:#fff4d6;color:#8a6100;padding:6px 12px;font:13px system-ui;border-radius:6px;margin-bottom:10px}
+
+.kv,.cnt{border-collapse:collapse;font-size:13px;margin:0 0 12px;}
+.kv th{text-align:left;font-weight:500;color:#6b7280;padding:5px 18px 5px 0;white-space:nowrap;vertical-align:top}
+.kv td{padding:5px 0;color:#1f2937}
+.kv tr+tr th,.kv tr+tr td{border-top:1px solid #eef0f2}
+.cnt th{color:#6b7280;font-weight:500;text-align:left;padding:5px 18px 5px 0;border-bottom:1px solid #e3e6ea}
+.cnt td{padding:5px 18px 5px 0;border-bottom:1px solid #eef0f2}
+.cnt .num{text-align:right}
+.cnt .low{color:#b42318}.cnt .low span{font-size:11px;color:#9ca3af}
+.cnt tr.tot td{font-weight:700;border-bottom:0}
+
+.ov{display:block;background:#f6f7f9;border-radius:12px;padding:10px 14px;margin:0 0 16px;font-size:13px;color:#374151}
+.ov-t{font-weight:700;margin-right:6px}
+.ov-i{background:#fff;border:1px solid #e3e6ea;border-radius:8px;padding:3px 10px}
+.ov-i b{color:#111827}
+.btn-row{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 4px;align-items:center}.btn-row .btn{margin:0!important}.btn-groups{margin:12px 0 4px}.btn-groups .btn-row{margin:0 0 8px}.btn-lbl{flex:0 0 52px;font-size:12px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.pane-title-help{display:flex;align-items:center;justify-content:space-between}
+.help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:#e5e7eb;color:#374151;font-size:12px;font-weight:700;cursor:help;text-transform:none;letter-spacing:0}
+.help:hover,.help:focus{background:#0f766e;color:#fff;outline:none}
+.help-tip{display:none;position:absolute;right:0;top:26px;width:min(420px,80vw);background:#1f2937;color:#f9fafb;font-size:12.5px;font-weight:400;line-height:1.5;padding:10px 12px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:20;text-align:left}
+.help-tip b{color:#fff}
+.help:hover .help-tip,.help:focus .help-tip{display:block}
+.cls-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}.cls-row .btn,.cls-row select{margin:0!important}.cls-sp{flex:1}.cls-sep{border:0;border-top:1px solid #e3e6ea;margin:4px 0 12px}.cnt td.pend{color:#b45309;font-weight:600}.cnt td.zero{color:#9ca3af}.kv th{width:170px}#sensor .btn-groups{margin:4px 0 14px}.lt-sep{color:#9ca3af;margin:0 4px}.lt-pend{color:#b45309}.cnt th.th-help{padding-right:0;width:24px}.th-help .help-tip{left:0;right:auto;width:min(360px,70vw)}@media (max-width:760px){.th-help .help-tip{left:auto;right:0}}.cnt .help{vertical-align:middle}
+.tip-table{width:auto!important;max-width:92vw;padding:12px 14px!important}
+.tip-table .cnt{margin:0 0 8px;color:#f9fafb;white-space:nowrap}
+.tip-table .cnt th{color:#9ca3af;border-bottom-color:#374151}
+.tip-table .cnt td{border-bottom-color:#2d3748}
+.tip-table .cnt td.zero{color:#6b7280}.tip-table .cnt td.pend{color:#fbbf24}.tip-table .cnt td.low{color:#f87171}
+.tip-note{margin:0;color:#d1d5db;font-size:12px;max-width:380px;white-space:normal}
+
+.ai-block{border:1px solid #e3e6ea;border-radius:12px;padding:12px 14px;margin:0 0 14px;background:#fff}
+.sub-title{font-size:14px;margin:0 0 10px;color:#1f2937;font-weight:700}
+.sub-title.pane-title-help{display:flex;align-items:center;justify-content:space-between}
+</style></head><body><div class="mock-banner">MOCKUP — Classify page. Sensor numbers from your 20 Oct screenshot (Day/Night split per label is estimated). Thumbnails are placeholders.</div>
+<h1>🔭 Observatory Control</h1>
+<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p>
+<nav class="topnav"><a href="/">🏠 Dashboard</a><a href="/settings">⚙ Settings</a><a class="on" href="/ai-classify">🏷️ Classify (<span id="classifyCount">0</span>)</a><a href="/logs">🗒 Logs</a><span class="nav-sp"></span><span class="nav-restart-msg" id="hdrRestartMsg"></span><button aria-label="Restart service" class="nav-restart" onclick="hdrRestart()" title="Restart service" type="button">↻</button></nav>
+<div class="card settings view-cls"><h2><span class="title">🏷️ Classify</span></h2><div class="ov">Sensor Samples: <b>4,717</b>, AllSky Samples: <b>4,412</b> captured · <b>75</b> imported (<b>7</b> not yet classified) — training images folder: <b>1.63 GB</b> across <b>4,494</b> image(s).</div>
+<div class="settings-shell"><nav class="settings-nav" id="clsNav"><a class="on" data-g="classify" href="#classify">🏷️ Classify samples <span class="nav-n">0</span></a><a data-g="ai" href="#ai">🤖 AI Models</a><a data-g="export" href="#export">📦 Export &amp; bulk actions</a><a data-g="recovery" href="#recovery">🛟 Recovery <span class="nav-ok">✓</span></a></nav><div class="cls-panes" style="flex:1;min-width:0"><div class="settings-group sg-on" id="classify">
+<h3 class="pane-title pane-title-help"><span>🏷️ Classify samples</span><span aria-label="Help" class="help" tabindex="0">?<span class="help-tip">Pick a label from the row below, then click one or more images to select them ("Select all shown" picks just this page; <b>Select ALL</b> spans every page matching the current filter), then click the label — it applies to every image you've selected at once. <b>Unclassify selected</b> sends already-labeled images back to unclassified, and <b>Delete selected</b> removes them. Sorted oldest-first so a run of near-identical overnight frames sits together and can be classified in one go.</span></span></h3>
+<p class="hint">Total samples captured: <b id="aiTotalCount">4899</b>, still unclassified:
+  <b id="aiUnlabeledCount">0</b>.</p>
+<form action="/ai-classify" class="toolbar cls-row" method="get">
+<select name="show" onchange="this.form.submit()"><option selected="" value="unclassified">Unclassified only</option><option value="all">All samples</option><optgroup label="By source"><option value="source:captured">Captured only</option><option value="source:imported">Imported only</option></optgroup><optgroup label="By label"><option value="label:Clear">Clear</option><option value="label:Partly Cloudy">Partly Cloudy</option><option value="label:Mostly Cloudy">Mostly Cloudy</option><option value="label:Overcast">Overcast</option><option value="label:Rain">Rain</option><option value="label:Snow">Snow</option><option value="label:Freezing Rain">Freezing Rain</option><option value="label:Ignore">Ignore</option></optgroup></select>
+<input name="view" type="hidden" value="grid"/>
+<button class="btn" type="submit">Filter</button>
+<a class="btn" href="/ai-classify?show=unclassified&amp;view=single&amp;idx=0">👁 One by one</a>
+<span class="cls-sp"></span><button class="btn ai-upload-btn" onclick="openImport()" type="button">⇧ Import images</button></form><div class="toolbar cls-row"><button class="btn" onclick="selectAll(true)" type="button">Select all shown</button><span class="btn ai-nav-btn-disabled">Select ALL (0)</span><button class="btn" onclick="selectAll(false)" type="button">Clear selection</button><button class="btn ai-delete-btn" onclick="deleteSelected()" type="button">Delete selected</button></div><hr class="cls-sep"/>
+<div class="toolbar cls-row"><button class="btn ai-label-btn" onclick="applyLabel('Clear')" type="button">Clear</button><button class="btn ai-label-btn" onclick="applyLabel('Partly Cloudy')" type="button">Partly Cloudy</button><button class="btn ai-label-btn" onclick="applyLabel('Mostly Cloudy')" type="button">Mostly Cloudy</button><button class="btn ai-label-btn" onclick="applyLabel('Overcast')" type="button">Overcast</button><button class="btn ai-label-btn" onclick="applyLabel('Rain')" type="button">Rain</button><button class="btn ai-label-btn" onclick="applyLabel('Snow')" type="button">Snow</button><button class="btn ai-label-btn" onclick="applyLabel('Freezing Rain')" type="button">Freezing Rain</button><button class="btn ai-label-btn" onclick="applyLabel('Ignore')" type="button">Ignore</button><span class="btn ai-nav-btn-disabled" title="Nothing here is classified">↩ Unclassify selected</span></div>
+<p id="classifyStatus"></p>
+<div class="ai-grid" id="aiGrid"><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#0b1730" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="65" cy="156" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="38" cy="99" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="126" cy="165" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="21" cy="160" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="125" cy="71" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="64" cy="54" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="125" cy="143" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="126" cy="106" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="43" cy="64" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="43" cy="138" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="194" cy="8" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="21" cy="45" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="15" cy="82" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="73" cy="126" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="189" cy="104" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="114" cy="106" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="152" cy="118" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="98" cy="29" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="39" cy="131" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="71" cy="177" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="165" cy="82" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="134" cy="103" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="94" cy="141" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="109" cy="154" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="91" cy="179" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="76" cy="160" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="183" cy="46" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="88" cy="143" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="150" cy="31" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="172" cy="59" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="151" cy="73" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="36" cy="21" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="168" cy="128" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="93" cy="22" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="43" cy="10" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="114" cy="111" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="16" cy="159" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="16" cy="101" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="155" cy="89" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="76" cy="134" fill="#fff" opacity="0.9" r="0.6"></circle></svg></label>
+<span class="ai-label-badge">Clear</span><div class="ai-card-time">2026-10-19 09:12 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 28.0°C</span><span class="ai-chip">Amb 11.7°C</span><span class="ai-chip">RH 62%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#0b1730" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="14" cy="84" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="24" cy="32" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="142" cy="13" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="109" cy="79" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="72" cy="44" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="15" cy="91" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="97" cy="40" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="101" cy="122" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="103" cy="169" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="179" cy="148" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="163" cy="134" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="115" cy="167" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="188" cy="65" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="116" cy="71" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="82" cy="145" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="7" cy="111" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="85" cy="10" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="162" cy="155" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="39" cy="20" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="165" cy="90" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="95" cy="178" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="160" cy="185" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="193" cy="130" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="155" cy="20" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="10" cy="99" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="165" cy="121" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="156" cy="158" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="50" cy="98" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="85" cy="99" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="72" cy="81" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="31" cy="11" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="180" cy="193" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="84" cy="133" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="172" cy="73" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="88" cy="52" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="116" cy="171" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="29" cy="31" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="87" cy="90" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="62" cy="117" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="25" cy="91" fill="#fff" opacity="0.9" r="1.1"></circle></svg></label>
+<span class="ai-label-badge">Clear</span><div class="ai-card-time">2026-10-19 10:16 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 26.3°C</span><span class="ai-chip">Amb 11.4°C</span><span class="ai-chip">RH 63%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#26324a" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="171" cy="60" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="120" cy="74" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="35" cy="13" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="53" cy="85" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="51" cy="76" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="169" cy="26" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="93" cy="155" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="112" cy="79" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="74" cy="123" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="167" cy="111" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="112" cy="150" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="14" cy="110" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="56" cy="6" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="164" cy="135" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="148" cy="188" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="13" cy="195" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="174" cy="137" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="144" cy="92" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="22" cy="155" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="35" cy="67" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="13" cy="182" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="55" cy="115" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="17" cy="8" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="195" cy="35" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="133" cy="81" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="174" cy="10" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="142" cy="110" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="161" cy="34" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="37" cy="69" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="127" cy="20" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="61" cy="55" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="141" cy="35" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="66" cy="75" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="6" cy="129" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="151" cy="107" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="74" cy="68" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="163" cy="139" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="113" cy="18" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="87" cy="5" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="37" cy="16" fill="#fff" opacity="0.25" r="0.6"></circle></svg></label>
+<span class="ai-label-badge">Partly Cloudy</span><div class="ai-card-time">2026-10-19 11:20 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 24.6°C</span><span class="ai-chip">Amb 11.1°C</span><span class="ai-chip">RH 64%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#4e535c" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="17" cy="22" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="13" cy="187" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="136" cy="133" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="85" cy="45" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="23" cy="94" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="170" cy="104" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="82" cy="97" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="53" cy="89" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="36" cy="37" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="5" cy="188" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="102" cy="25" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="50" cy="15" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="122" cy="159" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="143" cy="102" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="16" cy="164" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="18" cy="100" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="132" cy="184" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="112" cy="182" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="122" cy="9" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="60" cy="142" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="182" cy="156" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="113" cy="62" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="38" cy="12" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="100" cy="148" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="36" cy="123" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="36" cy="192" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="140" cy="101" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="32" cy="192" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="149" cy="141" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="155" cy="188" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="126" cy="41" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="104" cy="16" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="28" cy="149" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="173" cy="101" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="11" cy="92" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="11" cy="34" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="128" cy="183" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="153" cy="81" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="14" cy="149" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="140" cy="188" fill="#fff" opacity="0.25" r="0.6"></circle></svg></label>
+<span class="ai-label-badge">Overcast</span><div class="ai-card-time">2026-10-19 09:24 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 22.9°C</span><span class="ai-chip">Amb 10.8°C</span><span class="ai-chip">RH 65%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#0b1730" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="32" cy="146" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="30" cy="146" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="145" cy="88" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="51" cy="24" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="51" cy="170" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="121" cy="162" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="105" cy="69" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="158" cy="106" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="147" cy="112" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="101" cy="133" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="110" cy="46" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="181" cy="150" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="177" cy="137" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="128" cy="44" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="107" cy="43" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="29" cy="132" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="128" cy="183" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="118" cy="155" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="52" cy="39" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="55" cy="42" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="136" cy="85" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="181" cy="142" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="176" cy="185" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="157" cy="154" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="73" cy="60" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="10" cy="73" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="102" cy="56" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="150" cy="97" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="87" cy="128" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="112" cy="183" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="184" cy="158" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="124" cy="153" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="147" cy="12" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="189" cy="23" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="192" cy="16" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="63" cy="65" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="188" cy="177" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="60" cy="70" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="53" cy="71" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="52" cy="164" fill="#fff" opacity="0.9" r="1.1"></circle></svg></label>
+<span class="ai-label-badge">Clear</span><div class="ai-card-time">2026-10-19 10:28 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 21.2°C</span><span class="ai-chip">Amb 10.5°C</span><span class="ai-chip">RH 66%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#3b4456" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="177" cy="14" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="48" cy="16" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="51" cy="113" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="191" cy="26" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="28" cy="72" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="14" cy="96" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="153" cy="192" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="91" cy="6" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="90" cy="89" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="102" cy="129" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="58" cy="169" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="195" cy="130" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="37" cy="144" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="35" cy="75" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="175" cy="115" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="117" cy="140" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="29" cy="140" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="100" cy="178" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="120" cy="80" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="178" cy="176" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="72" cy="32" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="177" cy="149" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="139" cy="34" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="131" cy="135" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="20" cy="188" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="178" cy="191" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="195" cy="51" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="170" cy="191" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="43" cy="50" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="172" cy="121" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="32" cy="148" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="89" cy="170" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="171" cy="157" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="147" cy="81" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="52" cy="122" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="84" cy="50" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="22" cy="32" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="51" cy="146" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="152" cy="194" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="96" cy="30" fill="#fff" opacity="0.25" r="0.8"></circle></svg></label>
+<span class="ai-label-badge">Mostly Cloudy</span><div class="ai-card-time">2026-10-19 11:32 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 19.5°C</span><span class="ai-chip">Amb 10.2°C</span><span class="ai-chip">RH 67%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#0b1730" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="74" cy="103" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="39" cy="15" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="134" cy="74" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="183" cy="136" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="90" cy="108" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="143" cy="22" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="132" cy="33" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="74" cy="156" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="179" cy="33" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="191" cy="33" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="183" cy="53" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="111" cy="176" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="105" cy="37" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="160" cy="42" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="54" cy="144" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="48" cy="150" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="56" cy="69" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="80" cy="12" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="109" cy="103" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="146" cy="154" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="167" cy="132" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="180" cy="185" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="175" cy="128" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="158" cy="53" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="167" cy="5" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="174" cy="64" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="49" cy="139" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="122" cy="55" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="140" cy="59" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="133" cy="170" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="33" cy="149" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="173" cy="44" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="124" cy="27" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="17" cy="11" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="163" cy="64" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="24" cy="132" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="9" cy="91" fill="#fff" opacity="0.9" r="0.8"></circle><circle cx="89" cy="93" fill="#fff" opacity="0.9" r="1.1"></circle><circle cx="182" cy="39" fill="#fff" opacity="0.9" r="0.6"></circle><circle cx="158" cy="13" fill="#fff" opacity="0.9" r="1.1"></circle></svg></label>
+<span class="ai-label-badge">Clear</span><div class="ai-card-time">2026-10-19 09:36 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 17.8°C</span><span class="ai-chip">Amb 9.9°C</span><span class="ai-chip">RH 68%</span></div></div><div class="ai-card"><label class="ai-card-select"><input type="checkbox"/><svg style="width:100%;border-radius:6px;display:block" viewbox="0 0 200 200"><rect fill="#3d434d" height="200" width="200"></rect><circle cx="100" cy="100" fill="none" opacity=".5" r="96" stroke="#000" stroke-width="10"></circle><circle cx="25" cy="194" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="57" cy="21" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="116" cy="183" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="129" cy="85" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="15" cy="109" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="56" cy="185" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="105" cy="132" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="184" cy="22" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="113" cy="58" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="130" cy="82" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="123" cy="122" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="107" cy="117" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="121" cy="14" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="70" cy="98" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="119" cy="140" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="157" cy="107" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="5" cy="58" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="99" cy="41" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="141" cy="54" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="58" cy="10" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="154" cy="108" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="48" cy="167" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="40" cy="33" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="48" cy="118" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="52" cy="20" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="108" cy="119" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="109" cy="13" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="187" cy="18" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="108" cy="15" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="131" cy="11" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="66" cy="29" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="126" cy="53" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="90" cy="164" fill="#fff" opacity="0.25" r="0.6"></circle><circle cx="93" cy="36" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="18" cy="191" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="75" cy="124" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="130" cy="68" fill="#fff" opacity="0.25" r="1.1"></circle><circle cx="73" cy="12" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="166" cy="93" fill="#fff" opacity="0.25" r="0.8"></circle><circle cx="28" cy="19" fill="#fff" opacity="0.25" r="1.1"></circle></svg></label>
+<span class="ai-label-badge">Rain</span><div class="ai-card-time">2026-10-19 10:40 PM · Night</div>
+<div class="ai-card-chips"><span class="ai-chip">Δ 16.1°C</span><span class="ai-chip">Amb 9.6°C</span><span class="ai-chip">RH 69%</span></div></div></div><div class="pager"><span class="btn ai-nav-btn ai-nav-btn-disabled">← Prev</span><span class="btn ai-nav-btn ai-nav-btn-disabled">Next →</span></div></div><div class="settings-group" id="ai"><h3 class="pane-title">🤖 AI Models</h3><div class="ai-block">
+<h3 class="pane-title-help sub-title"><span>🤖 AI Sky Prediction (Sensor)</span><span aria-label="Help" class="help" tabindex="0">?<span class="help-tip tip-table"><table class="cnt"><thead><tr><th>Label</th><th class="num">Day</th><th class="num">Night</th><th class="num">Total</th><th class="num">Pending</th></tr></thead><tbody><tr><td>Clear</td><td class="num">743</td><td class="num">884</td><td class="num">1,627</td><td class="num pend">33</td></tr><tr><td>Partly Cloudy</td><td class="num">554</td><td class="num">254</td><td class="num">808</td><td class="num zero">0</td></tr><tr><td>Mostly Cloudy</td><td class="num">462</td><td class="num">222</td><td class="num">684</td><td class="num zero">0</td></tr><tr><td>Overcast</td><td class="num">769</td><td class="num">523</td><td class="num">1,292</td><td class="num zero">0</td></tr><tr><td>Rain</td><td class="num">491</td><td class="num">374</td><td class="num">865</td><td class="num zero">0</td></tr><tr><td>Snow</td><td class="num zero">0</td><td class="num zero">0</td><td class="num low">0/5</td><td class="num zero">0</td></tr><tr><td>Freezing Rain</td><td class="num zero">0</td><td class="num zero">0</td><td class="num low">0/5</td><td class="num zero">0</td></tr><tr class="tot"><td>Total</td><td class="num">3,019</td><td class="num">2,257</td><td class="num">5,276</td><td class="num pend">33</td></tr></tbody></table><p class="tip-note">Total = samples used in the last training. Pending = classified since then; press Train model now to include them. A label needs 5+ (shown as x/5 until it has them). Imported images are never counted here (no sensor data).</p></span></span></h3>
+<table class="kv"><tr><th>Last trained</th><td>2026-10-20 11:59 AM <span class="lt-sep">·</span> Day <b>3,019</b> <span class="lt-sep">·</span> Night <b>2,257</b> <span class="lt-sep">·</span> Total <b>5,276</b> <span class="lt-sep">·</span> Pending <b class="lt-pend">33</b></td></tr></table><div class="btn-groups"><div class="btn-row"><span class="btn-lbl">Model</span><button class="btn" onclick="trainModel()" type="button">Train model now</button><button class="btn ai-delete-btn" onclick="if(confirm('Reset the trained model? Classified samples are kept - you can train a new one from them any time.')) resetModel()" type="button">Reset trained model</button></div><div class="btn-row"><span class="btn-lbl">Data</span><a class="btn" href="/ai-classify-backup-sensor-data">Download sensor records (.zip)</a><label class="btn ai-upload-btn" for="sensorDataUploadInput">Upload sensor records (.zip)</label><button class="btn ai-delete-btn" onclick="deleteSensorData(4899)" type="button">Delete sensor records</button><input accept=".zip,.json" id="sensorDataUploadInput" onchange="uploadSensorData(this)" style="display:none" type="file"/></div></div><table class="kv">
+<tr><th>In SAFE/UNSAFE decision</th><td><b>Yes</b> — actively used · <a href="/settings#ai-learning-settings">change</a></td></tr>
+<tr><th>Model by day / by night</th><td>Day + Night model / Night model · <a href="/settings#ai-model-choice">change</a></td></tr>
+<tr><th>“Ignore” not counted</th><td>132 · <a href="/ai-classify?show=label:Ignore">review them</a></td></tr>
+</table>
+</div><div class="ai-block"><h3 class="sub-title pane-title-help"><span>📷 AI Cloud Detect (All Sky)</span><span aria-label="Help" class="help" tabindex="0">?<span class="help-tip tip-table"><table class="cnt"><thead><tr><th>Label</th><th class="num">Day</th><th class="num">Night</th><th class="num">Total</th><th class="num">Pending</th></tr></thead><tbody><tr><td>Clear</td><td class="num">744</td><td class="num">883</td><td class="num">1,627</td><td class="num pend">33</td></tr><tr><td>Partly Cloudy</td><td class="num">554</td><td class="num">254</td><td class="num">808</td><td class="num zero">0</td></tr><tr><td>Mostly Cloudy</td><td class="num">462</td><td class="num">222</td><td class="num">684</td><td class="num zero">0</td></tr><tr><td>Overcast</td><td class="num">769</td><td class="num">523</td><td class="num">1,292</td><td class="num zero">0</td></tr><tr><td>Rain</td><td class="num">491</td><td class="num">374</td><td class="num">865</td><td class="num zero">0</td></tr><tr><td>Snow</td><td class="num zero">0</td><td class="num zero">0</td><td class="num low">0/5</td><td class="num zero">0</td></tr><tr><td>Freezing Rain</td><td class="num zero">0</td><td class="num zero">0</td><td class="num low">0/5</td><td class="num zero">0</td></tr><tr><td>Ignore</td><td class="num">35</td><td class="num">64</td><td class="num">99</td><td class="num zero">0</td></tr><tr class="tot"><td>Total</td><td class="num">3,055</td><td class="num">2,320</td><td class="num">5,375</td><td class="num pend">33</td></tr></tbody></table><p class="tip-note">Total = images the cloud model has learned from. Pending = classified since the last cloud training; press Train via cloud server to send them. Unlike the sensor model, “Ignore” is a class here (it learns to spot bad frames). Imported images are included.</p></span></span></h3>
+<table class="kv"><tr><th>Last trained</th><td>2026-10-20 10:42 AM <span class="lt-sep">·</span> Day <b>3,055</b> <span class="lt-sep">·</span> Night <b>2,320</b> <span class="lt-sep">·</span> Total <b>5,375</b> <span class="lt-sep">·</span> Pending <b class="lt-pend">33</b></td></tr></table>
+<div class="btn-groups"><div class="btn-row"><span class="btn-lbl">Model</span><button class="btn" title="Set a server URL and API key under Settings first">Train via cloud server</button><button class="btn ai-delete-btn">Reset cloud model</button><button class="btn ai-delete-btn" id="cloudCancelBtn" onclick="if(confirm('Cancel the in-progress cloud training job? This only stops the Pi from waiting on it - if it is genuinely still running on the server, it keeps running there.')) cancelCloudJob()" style="display:none" type="button">Cancel job</button></div><div class="btn-row"><span class="btn-lbl">Data</span><button class="btn">Download resized images (.zip)</button><label class="btn ai-upload-btn" for="resizedImagesUploadInput">Upload resized images (.zip)</label><button class="btn ai-delete-btn">Delete resized images</button><input accept=".zip" id="resizedImagesUploadInput" onchange="uploadResizedImages(this)" style="display:none" type="file"/></div></div>
+<table class="kv">
+<tr><th>In SAFE/UNSAFE decision</th><td>No — dashboard comparison only · <a href="/settings#ai-learning-settings">change</a></td></tr>
+<tr><th>Last run</th><td>312 new images sent · finished OK</td></tr>
+<tr><th>Training server / auto-train</th><td>Connected / Off · <a href="/settings#ai-learning-settings">change</a></td></tr>
+</table></div></div><div class="settings-group" id="export">
+<h3 class="pane-title">📦 Export &amp; bulk actions</h3>
+<p class="hint">4899 labeled sample(s) total, across 6 label(s). Bundles
+  as one folder per label - the layout Teachable Machine's own uploader expects - so you can feed more of
+  your own classified sky into simpleCloudDetect's retraining without starting its dataset over.</p>
+<div class="toolbar"><a class="btn" href="/ai-classify-export">Download labeled images (.zip)</a><span class="btn ai-nav-btn-disabled">Compress already-trained images</span><span class="btn ai-nav-btn-disabled">Delete classified full-size images</span></div>
+</div><div class="settings-group" id="recovery"><h3 class="pane-title">🛟 Recovery</h3>
+<p class="hint">✓ Training list OK — 4,899 samples, no missing images, no orphan images. Last training copy: 2026-10-19 07:50 PM (7 kept).</p>
+<p class="hint">This section shows repair buttons (restore orphans, recover from AllSky archive, restore a training copy) only when something needs fixing.</p></div></div></div></div>
+<div class="ai-modal-back" id="unclassifyModal" onclick="if(event.target===this)closeModal('unclassifyModal')">
+<div aria-modal="true" class="ai-modal" role="dialog">
+<div class="ai-modal-head"><h3 id="unclassifyTitle">Unclassify</h3>
+<button aria-label="Close" class="ai-modal-x" onclick="closeModal('unclassifyModal')" type="button">×</button></div>
+<ul id="unclassifyList"></ul>
+<div class="ai-modal-btns"><button class="btn btn-sec" onclick="closeModal('unclassifyModal')" type="button">Cancel</button>
+<button class="btn ai-unclassify-btn" id="unclassifyGo" type="button">Unclassify</button></div>
+</div>
+</div>
+<div class="ai-modal-back" id="importModal" onclick="if(event.target===this &amp;&amp; !importBusy)closeModal('importModal')">
+<div aria-modal="true" class="ai-modal" role="dialog">
+<div class="ai-modal-head"><h3>Import All Sky images</h3>
+<button aria-label="Close" class="ai-modal-x" onclick="if(!importBusy)closeModal('importModal')" type="button">×</button></div>
+<div class="ai-drop" id="importDrop">📁 Drop images here, or
+      <label class="btn btn-sec" for="importFiles" style="display:inline-block">Choose files…</label>
+<input accept="image/jpeg,image/png,.jpg,.jpeg,.png" id="importFiles" multiple="" onchange="setImportFiles(this.files)" style="display:none" type="file"/>
+<br/><span class="hint">JPG / PNG · many at once · max 10 MB each · duplicates skipped</span></div>
+<p class="hint" id="importSelected">No files selected.</p>
+<p style="margin:8px 0"><b>Label as:</b> <select id="importLabel"><option value="">Classify later (unclassified)</option><option value="Clear">Clear</option><option value="Partly Cloudy">Partly Cloudy</option><option value="Mostly Cloudy">Mostly Cloudy</option><option value="Overcast">Overcast</option><option value="Rain">Rain</option><option value="Snow">Snow</option><option value="Freezing Rain">Freezing Rain</option><option value="Ignore">Ignore</option></select></p>
+<p class="ai-import-note">🔒 Used for <b>AI Cloud Detect (All Sky)</b> only. Imports have no sensor readings,
+    so <b>AI Sky Prediction (Sensor Based)</b> never trains on them.</p>
+<div class="ai-progress" id="importProgress"><div></div></div>
+<p class="hint" id="importStatus" style="margin:0"></p>
+<div class="ai-modal-btns"><button class="btn btn-sec" id="importCancel" onclick="closeModal('importModal')" type="button">Cancel</button>
+<button class="btn" disabled="" id="importGo" onclick="runImport()" type="button">Import</button></div>
+</div>
+</div>
+<script>
+const aiShowFilter = "unclassified";
+function aiRecover(action, source) {
+  const el = document.getElementById('aiRecoverStatus');
+  if (el) el.textContent = 'Working...';
+  let url = '/ai-recovery/' + action + (source ? ('?source=' + encodeURIComponent(source)) : '');
+  fetch(url, {method: 'POST'}).then(r => r.json()).then(d => {
+    if (el) el.textContent = (d.ok ? '✓ ' : '✗ ') + (d.message || d.error || '') + (d.ok ? ' Reloading...' : '');
+    if (d.ok) setTimeout(() => window.location.reload(), 1200);
+  }).catch(e => { if (el) el.textContent = '✗ ' + e; });
+}
+function openModal(id) { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  closeModal('unclassifyModal');
+  if (!importBusy) closeModal('importModal');
+});
+// Unclassify: dry-run first so the popup can say how many will be skipped
+// (images already deleted after training can't be re-labeled), then commit.
+function showUnclassify(query, onDone) {
+  const status = document.getElementById('classifyStatus');
+  fetch('/ai-classify-unclassify?dry=1&' + query)
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) { status.textContent = 'Failed: ' + (d.error || 'unknown error'); return; }
+      const total = d.unclassified + d.skipped_no_image;
+      if (!total) { status.textContent = 'None of the selected images are classified.'; return; }
+      document.getElementById('unclassifyTitle').textContent = 'Unclassify ' + total + ' image(s)?';
+      let items = '';
+      if (d.unclassified) items += '<li><b>' + d.unclassified + '</b> go back to <b>Unclassified only</b> ' +
+        '(labels removed, sensor readings kept).</li>';
+      if (d.skipped_no_image) items += '<li><b>' + d.skipped_no_image + '</b> skipped: the image was already ' +
+        'deleted, so it couldn&#39;t be re-labeled. <span class="hint">(Delete it instead if the label is wrong.)</span></li>';
+      items += '<li>The trained models don&#39;t change until the next <b>Train</b>.</li>';
+      document.getElementById('unclassifyList').innerHTML = items;
+      const go = document.getElementById('unclassifyGo');
+      go.textContent = 'Unclassify ' + d.unclassified;
+      go.disabled = !d.unclassified;
+      go.onclick = () => {
+        go.disabled = true;
+        fetch('/ai-classify-unclassify?' + query)
+          .then(r => r.json())
+          .then(r2 => {
+            closeModal('unclassifyModal');
+            if (!r2.ok) { status.textContent = 'Failed: ' + (r2.error || 'unknown error'); return; }
+            onDone(r2);
+          })
+          .catch(err => { closeModal('unclassifyModal'); status.textContent = 'Failed: ' + err; });
+      };
+      openModal('unclassifyModal');
+    })
+    .catch(err => { status.textContent = 'Failed: ' + err; });
+}
+function unclassifySelected() {
+  const status = document.getElementById('classifyStatus');
+  if (selectAllMode) {
+    showUnclassify('all=' + encodeURIComponent(aiShowFilter), d => {
+      status.textContent = 'Unclassified ' + d.unclassified + ' image(s). Reloading...';
+      window.location.reload();
+    });
+    return;
+  }
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
+  if (ids.length === 0) { status.textContent = 'Select at least one image first.'; return; }
+  showUnclassify('ids=' + encodeURIComponent(ids.join(',')), d => {
+    status.textContent = 'Unclassified ' + d.unclassified + ' image(s)' +
+      (d.skipped_no_image ? (', ' + d.skipped_no_image + ' skipped (no image)') : '') + '. Reloading...';
+    window.location.reload();
+  });
+}
+function unclassifySingle() {
+  const card = document.getElementById('singleCard');
+  if (!card) return;
+  showUnclassify('ids=' + encodeURIComponent(card.dataset.id), d => { window.location.reload(); });
+}
+// Import: one file per request so the progress bar can move and one bad
+// file never sinks the whole batch.
+let importFiles = [];
+let importBusy = false;
+function openImport() {
+  importFiles = [];
+  document.getElementById('importFiles').value = '';
+  document.getElementById('importSelected').textContent = 'No files selected.';
+  document.getElementById('importStatus').textContent = '';
+  document.getElementById('importProgress').style.display = 'none';
+  document.getElementById('importGo').disabled = true;
+  document.getElementById('importGo').textContent = 'Import';
+  openModal('importModal');
+}
+function setImportFiles(list) {
+  importFiles = Array.from(list).filter(f => /[.](jpe?g|png)$/i.test(f.name) || ["image/jpeg", "image/png"].includes(f.type));
+  const mb = importFiles.reduce((a, f) => a + f.size, 0) / (1024 * 1024);
+  document.getElementById('importSelected').innerHTML = importFiles.length
+    ? ('Selected: <b>' + importFiles.length + ' file(s)</b> (' + mb.toFixed(1) + ' MB) &middot; ' +
+       '<a href="#" onclick="openImport();return false;">clear</a>')
+    : 'No JPG / PNG files selected.';
+  const go = document.getElementById('importGo');
+  go.disabled = !importFiles.length;
+  go.textContent = importFiles.length ? ('Import ' + importFiles.length + ' image(s)') : 'Import';
+}
+(function () {
+  const drop = document.getElementById('importDrop');
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => setImportFiles(e.dataTransfer.files));
+})();
+async function runImport() {
+  if (!importFiles.length || importBusy) return;
+  importBusy = true;
+  const label = document.getElementById('importLabel').value;
+  const go = document.getElementById('importGo'), cancel = document.getElementById('importCancel');
+  const bar = document.getElementById('importProgress'), status = document.getElementById('importStatus');
+  go.disabled = true; cancel.disabled = true;
+  bar.style.display = 'block';
+  const tally = { imported: 0, duplicate: 0, rejected: 0 };
+  const errors = [];
+  for (let i = 0; i < importFiles.length; i++) {
+    status.textContent = 'Importing ' + (i + 1) + ' of ' + importFiles.length + '...';
+    const fd = new FormData();
+    fd.append('files', importFiles[i]);
+    fd.append('label', label);
+    try {
+      const r = await fetch('/ai-classify-import', { method: 'POST', body: fd });
+      const d = await r.json();
+      if (d.ok) { tally.imported += d.imported; tally.duplicate += d.duplicate; tally.rejected += d.rejected;
+                  errors.push(...(d.errors || [])); }
+      else { tally.rejected++; errors.push(importFiles[i].name + ': ' + (d.error || 'failed')); }
+    } catch (err) { tally.rejected++; errors.push(importFiles[i].name + ': ' + err); }
+    bar.firstElementChild.style.width = Math.round(100 * (i + 1) / importFiles.length) + '%';
+  }
+  importBusy = false;
+  cancel.disabled = false;
+  let msg = '✓ ' + tally.imported + ' imported';
+  if (tally.duplicate) msg += ', ' + tally.duplicate + ' duplicate(s) skipped';
+  if (tally.rejected) msg += ', ' + tally.rejected + ' rejected';
+  if (errors.length || tally.duplicate) {
+    status.innerHTML = msg + '.' + (errors.length ? '<br>' : '') + errors.slice(0, 5).map(e => e.replace(/</g, '&lt;')).join('<br>');
+    cancel.textContent = 'Close';
+    cancel.onclick = () => window.location.reload();
+    return;
+  }
+  status.textContent = msg + '. Reloading...';
+  window.location.reload();
+}
+</script>
+<script>
+// Grid view only (null in single view, where #aiGrid doesn't exist): the
+// URL of the next page, or null if this is already the last one - used to
+// auto-advance once every card visible on THIS page has been classified
+// or deleted, instead of leaving an empty grid until Next is clicked.
+const aiNextPageUrl = null;
+function maybeAutoAdvance() {
+  const grid = document.getElementById('aiGrid');
+  if (!grid || !aiNextPageUrl) return;
+  if (grid.querySelectorAll('.ai-card').length > 0) return;
+  const status = document.getElementById('classifyStatus');
+  if (status) status.textContent += ' Loading the next batch...';
+  window.location = aiNextPageUrl;
+}
+
+// true once "Select ALL" (spanning every page, not just what's on screen)
+// has been clicked - cleared by either "Select all shown" or "Clear
+// selection", both of which narrow the scope back to just this page.
+var selectAllMode = false;
+function selectAll(check) {
+  selectAllMode = false;
+  document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = check);
+}
+function selectAllMatching(show, total) {
+  if (!total) return;
+  selectAllMode = true;
+  document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = true);
+  document.getElementById('classifyStatus').textContent =
+    'All ' + total + ' matching image(s) selected (not just this page) - click a label or Delete ' +
+    'selected to apply to all of them.';
+}
+function applyLabel(label) {
+  const status = document.getElementById('classifyStatus');
+  if (selectAllMode) {
+    status.textContent = 'Saving...';
+    fetch('/ai-classify-save?all=unclassified&label=' + encodeURIComponent(label))
+      .then(r => r.json())
+      .then(data => {
+        if (!data.ok) {
+          status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+          return;
+        }
+        status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '". Reloading...';
+        window.location.reload();
+      })
+      .catch(err => { status.textContent = 'Failed to save: ' + err; });
+    return;
+  }
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
+  if (ids.length === 0) {
+    status.textContent = 'Select at least one image first.';
+    return;
+  }
+  status.textContent = 'Saving...';
+  fetch('/ai-classify-save?ids=' + encodeURIComponent(ids.join(',')) + '&label=' + encodeURIComponent(label))
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+        return;
+      }
+      ids.forEach(id => {
+        const el = document.getElementById('ai-card-' + id);
+        if (el) el.remove();
+      });
+      const totalEl = document.getElementById('aiTotalCount');
+      const unlabeledEl = document.getElementById('aiUnlabeledCount');
+      if (totalEl) totalEl.textContent = data.total_count;
+      if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
+      status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
+      maybeAutoAdvance();
+    })
+    .catch(err => { status.textContent = 'Failed to save: ' + err; });
+}
+function deleteSelected() {
+  const status = document.getElementById('classifyStatus');
+  if (selectAllMode) {
+    if (!confirm('Delete ALL matching image(s)? This cannot be undone.')) return;
+    status.textContent = 'Deleting...';
+    fetch('/ai-classify-delete?all=unclassified')
+      .then(r => r.json())
+      .then(data => {
+        if (!data.ok) {
+          status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+          return;
+        }
+        status.textContent = 'Deleted ' + data.deleted + ' image(s). Reloading...';
+        window.location.reload();
+      })
+      .catch(err => { status.textContent = 'Failed to delete: ' + err; });
+    return;
+  }
+  const ids = Array.from(document.querySelectorAll('.ai-pick:checked')).map(cb => cb.value);
+  if (ids.length === 0) {
+    status.textContent = 'Select at least one image first.';
+    return;
+  }
+  if (!confirm('Delete ' + ids.length + ' selected image(s)? This cannot be undone.')) return;
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete?ids=' + encodeURIComponent(ids.join(',')))
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+        return;
+      }
+      ids.forEach(id => {
+        const el = document.getElementById('ai-card-' + id);
+        if (el) el.remove();
+      });
+      const totalEl = document.getElementById('aiTotalCount');
+      const unlabeledEl = document.getElementById('aiUnlabeledCount');
+      if (totalEl) totalEl.textContent = data.total_count;
+      if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
+      status.textContent = 'Deleted ' + data.deleted + ' image(s).';
+      maybeAutoAdvance();
+    })
+    .catch(err => { status.textContent = 'Failed to delete: ' + err; });
+}
+// Sets (label truthy) or clears (label === '') one Ignore-labeled sample's
+// separate sensor-training label - see _ai_sensor_label_row_html(). Acts on
+// just the one card/id passed in, in either the grid or single-image view;
+// updates that card's own buttons/note in place rather than reloading.
+function setSensorLabel(id, label) {
+  const status = document.getElementById('classifyStatus');
+  status.textContent = label ? 'Saving...' : 'Clearing...';
+  fetch('/ai-classify-set-sensor-label?id=' + encodeURIComponent(id) + '&label=' + encodeURIComponent(label))
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+        return;
+      }
+      let card = document.getElementById('ai-card-' + id);
+      if (!card) {
+        const single = document.getElementById('singleCard');
+        if (single && single.dataset.id === id) card = single;
+      }
+      if (card) {
+        const row = card.querySelector('.ai-sensor-row');
+        if (row) {
+          row.querySelectorAll('.ai-sensor-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.label === data.sensor_label);
+          });
+          const noteWrap = row.querySelector('.ai-sensor-note-wrap');
+          if (noteWrap) {
+            noteWrap.innerHTML = data.sensor_label
+              ? ('<span class="ai-sensor-note ai-sensor-note-set">&#10003; Sensor training label: ' +
+                 data.sensor_label + '</span> <a href="#" class="ai-sensor-clear" ' +
+                 'onclick="setSensorLabel(&#39;' + id + '&#39;, &#39;&#39;); return false;">&#10005; unset</a>')
+              : '<span class="ai-sensor-note">Not set — excluded from sensor-model training.</span>';
+          }
+        }
+      }
+      status.textContent = data.sensor_label ? ('Sensor training label set: ' + data.sensor_label + '.')
+                                              : 'Sensor training label cleared.';
+    })
+    .catch(err => { status.textContent = 'Failed to save: ' + err; });
+}
+function deleteClassifiedFullSize(count) {
+  if (!count) return;
+  if (!confirm('Delete ' + count + ' classified full-size image(s)? This only removes the image file - ' +
+               'labels and sensor readings are kept, and this cannot be undone unless you have a backup ' +
+               'zip. Tip: use "Download labeled images" above first if you have not already.')) return;
+  const status = document.getElementById('classifyStatus');
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete-classified')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+        return;
+      }
+      status.textContent = 'Deleted ' + data.deleted + ' full-size image(s). Reloading...';
+      window.location.reload();
+    })
+    .catch(err => { status.textContent = 'Failed to delete: ' + err; });
+}
+function compressTrained() {
+  const status = document.getElementById('trainStatus');
+  status.textContent = 'Compressing...';
+  fetch('/ai-classify-compress-trained')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to compress: unknown error';
+        return;
+      }
+      status.textContent = 'Compressed ' + data.compressed + ' already-trained image(s). Reload this page ' +
+        'to see the updated folder size.';
+    })
+    .catch(err => { status.textContent = 'Failed to compress: ' + err; });
+}
+function deleteSensorData(count) {
+  if (!count) return;
+  if (!confirm('Clear sensor data from ' + count + ' classified sample(s)? Labels and images are kept, ' +
+               'and this cannot be undone unless you have a backup zip. Tip: use "Download sensor ' +
+               'records" first if you have not already.')) return;
+  const status = document.getElementById('sensorDataStatus');
+  status.textContent = 'Clearing...';
+  fetch('/ai-classify-delete-sensor-data')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to clear: unknown error';
+        return;
+      }
+      status.textContent = 'Cleared sensor data from ' + data.cleared + ' sample(s). Reload this page to ' +
+        'see the updated counts.';
+    })
+    .catch(err => { status.textContent = 'Failed: ' + err; });
+}
+function uploadSensorData(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const status = document.getElementById('sensorDataStatus');
+  status.textContent = 'Uploading...';
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/ai-classify-upload-sensor-data', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to restore: unknown error';
+        return;
+      }
+      status.textContent = 'Updated ' + data.restored + ' sample(s) and re-created ' + data.created +
+        ' missing one(s) with their labels and sensor readings. Reload to see them.';
+    })
+    .catch(err => { status.textContent = 'Failed to restore: ' + err; })
+    .finally(() => { input.value = ''; });
+}
+function deleteResizedImages(count) {
+  if (!count) return;
+  if (!confirm('Delete ' + count + ' resized image(s)? Labels and sensor readings are kept, and this ' +
+               'cannot be undone unless you have a backup zip. Tip: use "Download resized images" first ' +
+               'if you have not already.')) return;
+  const status = document.getElementById('resizedImagesStatus');
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete-resized-images')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed: unknown error';
+        return;
+      }
+      status.textContent = 'Deleted ' + data.deleted + ' resized image(s). Reload this page to see the ' +
+        'updated folder size.';
+    })
+    .catch(err => { status.textContent = 'Failed: ' + err; });
+}
+function uploadResizedImages(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const status = document.getElementById('resizedImagesStatus');
+  status.textContent = 'Uploading...';
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/ai-classify-upload-resized-images', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to restore: unknown error';
+        return;
+      }
+      status.textContent = 'Restored ' + data.restored + ' resized image(s)' +
+        (data.skipped ? (', skipped ' + data.skipped) : '') + '.';
+    })
+    .catch(err => { status.textContent = 'Failed to restore: ' + err; })
+    .finally(() => { input.value = ''; });
+}
+function applyLabelSingle(label) {
+  const card = document.getElementById('singleCard');
+  if (!card) return;
+  const id = card.dataset.id;
+  const status = document.getElementById('classifyStatus');
+  status.textContent = 'Saving...';
+  fetch('/ai-classify-save?ids=' + encodeURIComponent(id) + '&label=' + encodeURIComponent(label))
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = 'Failed to save: ' + (data.error || 'unknown error');
+        return;
+      }
+      // "all samples": a classified image stays in this same list (just
+      // relabeled), so move forward or the same image would show forever.
+      // "unclassified only": it drops OUT of the list, so staying at the
+      // same index naturally shows whatever shifted into that slot next.
+      const nextIdx = ('unclassified' === 'all') ? 0 + 1 : 0;
+      window.location = '/ai-classify?show=unclassified&view=single&idx=' + nextIdx;
+    })
+    .catch(err => { status.textContent = 'Failed to save: ' + err; });
+}
+function deleteSingle() {
+  const card = document.getElementById('singleCard');
+  if (!card) return;
+  const id = card.dataset.id;
+  if (!confirm('Delete this image? This cannot be undone.')) return;
+  const status = document.getElementById('classifyStatus');
+  status.textContent = 'Deleting...';
+  fetch('/ai-classify-delete?ids=' + encodeURIComponent(id))
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = 'Failed to delete: ' + (data.error || 'unknown error');
+        return;
+      }
+      // A deleted image always drops out of every list, so staying at the
+      // same index shows whatever shifted into that slot next.
+      window.location = '/ai-classify?show=unclassified&view=single&idx=0';
+    })
+    .catch(err => { status.textContent = 'Failed to delete: ' + err; });
+}
+function trainModel() {
+  const status = document.getElementById('trainStatus');
+  status.textContent = 'Training...';
+  fetch('/ai-train-model')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to train: unknown error';
+        return;
+      }
+      status.textContent = 'Trained ' + data.variants + '. Reload this page ' +
+        'to see the updated breakdown, or check the dashboard for its live prediction.';
+    })
+    .catch(err => { status.textContent = 'Failed to train: ' + err; });
+}
+function resetModel() {
+  const status = document.getElementById('trainStatus');
+  status.textContent = 'Resetting...';
+  fetch('/ai-reset-model')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to reset: unknown error';
+        return;
+      }
+      status.textContent = 'Trained model reset - classified samples were kept. Reload this page, or ' +
+        'train a new one whenever you\'re ready.';
+    })
+    .catch(err => { status.textContent = 'Failed to reset: ' + err; });
+}
+function trainCloudModel() {
+  const status = document.getElementById('cloudTrainStatus');
+  status.textContent = 'Starting...';
+  fetch('/ai-classify-cloud-train')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to start: unknown error';
+        return;
+      }
+      status.textContent = 'Uploading labeled images to the cloud training server\u2026';
+      const cancelBtn = document.getElementById('cloudCancelBtn');
+      if (cancelBtn) cancelBtn.style.display = 'inline-block';
+      startCloudStatusPolling();
+    })
+    .catch(err => { status.textContent = 'Failed to start: ' + err; });
+}
+function _formatBytes(n) {
+  if (n === null || n === undefined) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+var cloudStatusPollTimer = null;
+function startCloudStatusPolling() {
+  if (cloudStatusPollTimer) return;
+  cloudStatusPollTimer = setInterval(pollCloudStatus, 5000);
+}
+function pollCloudStatus() {
+  fetch('/ai-classify-cloud-status')
+    .then(r => r.json())
+    .then(data => {
+      const status = document.getElementById('cloudTrainStatus');
+      const cancelBtn = document.getElementById('cloudCancelBtn');
+      const inFlight = (data.status === 'uploading' || data.status === 'training');
+      if (cancelBtn) cancelBtn.style.display = inFlight ? 'inline-block' : 'none';
+      const jobSuffix = data.job_id ? (' (job ' + data.job_id + ')') : '';
+      if (data.status === 'uploading') {
+        if (data.total_bytes) {
+          const pct = Math.min(100, Math.round(data.uploaded_bytes * 100 / data.total_bytes));
+          status.textContent = 'Uploading labeled images to the cloud training server\u2026 ' + pct +
+            '% (' + _formatBytes(data.uploaded_bytes) + ' / ' + _formatBytes(data.total_bytes) + ')';
+        } else {
+          status.textContent = 'Uploading labeled images to the cloud training server\u2026';
+        }
+      } else if (data.status === 'training') {
+        status.textContent = 'Training on the cloud server (job ' + data.job_id + ')\u2026 this can take several minutes.';
+      } else if (data.status === 'done') {
+        status.textContent = 'Training finished - model downloaded and ready' + jobSuffix +
+          '. Reload this page to see the updated details.';
+        clearInterval(cloudStatusPollTimer);
+        cloudStatusPollTimer = null;
+      } else if (data.status === 'failed') {
+        status.textContent = 'Training failed' + jobSuffix + ': ' + (data.error || 'unknown error');
+        clearInterval(cloudStatusPollTimer);
+        cloudStatusPollTimer = null;
+      }
+    })
+    .catch(() => {});
+}
+function cancelCloudJob() {
+  const status = document.getElementById('cloudTrainStatus');
+  status.textContent = 'Cancelling\u2026';
+  fetch('/ai-cancel-cloud-job')
+    .then(() => { startCloudStatusPolling(); pollCloudStatus(); })
+    .catch(err => { status.textContent = 'Failed to cancel: ' + err; });
+}
+function resetCloudModel() {
+  const status = document.getElementById('cloudTrainStatus');
+  status.textContent = 'Resetting...';
+  fetch('/ai-reset-cloud-model')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        status.textContent = data.error || 'Failed to reset: unknown error';
+        return;
+      }
+      status.textContent = 'Cloud model reset - classified samples were kept.' +
+        (data.server_error ? (' Note: ' + data.server_error) : ' Reload this page, or train a new one whenever you\'re ready.');
+    })
+    .catch(err => { status.textContent = 'Failed to reset: ' + err; });
+}
+
+</script>
+<script>
+function hdrRestart(){
+  if(!confirm('Restart the dome-safety service now?')) return;
+  var m=document.getElementById('hdrRestartMsg'); if(m) m.textContent='Restarting...';
+  fetch('/restart-service').catch(function(){});
+  var down=false, tries=0;
+  var t=setInterval(function(){
+    tries++;
+    fetch('/fragments',{cache:'no-store'}).then(function(r){
+      if(r.ok && down){ clearInterval(t); location.reload(); }
+      else if(tries>45){ clearInterval(t); if(m) m.textContent='No response yet - reload the page in a moment.'; }
+    }).catch(function(){ down=true; if(m) m.textContent='Restarting - waiting for the service...'; });
+  },2000);
+}
+</script>
+<script>(function(){var S="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%231a7f37%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%231a7f37%22%2F%3E%3Cpath%20d%3D%22M20%2033%20L27%2041%20L45%2020%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E",U="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Cpath%20d%3D%22M%2032%203%20L%2052%2011%20C%2058%2013%2060%2017%2060%2022%20C%2060%2040%2050%2054%2032%2061%20C%2014%2054%204%2040%204%2022%20C%204%2017%206%2013%2012%2011%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M%2032.00%209.00%20L%2048.00%2015.40%20C%2052.80%2017.00%2054.40%2020.20%2054.40%2024.20%20C%2054.40%2038.60%2046.40%2049.80%2032.00%2055.40%20C%2017.60%2049.80%209.60%2038.60%209.60%2024.20%20C%209.60%2020.20%2011.20%2017.00%2016.00%2015.40%20Z%22%20fill%3D%22white%22%2F%3E%3Cpath%20d%3D%22M%2032.00%2015.00%20L%2044.00%2019.80%20C%2047.60%2021.00%2048.80%2023.40%2048.80%2026.40%20C%2048.80%2037.20%2042.80%2045.60%2032.00%2049.80%20C%2021.20%2045.60%2015.20%2037.20%2015.20%2026.40%20C%2015.20%2023.40%2016.40%2021.00%2020.00%2019.80%20Z%22%20fill%3D%22%23c62828%22%2F%3E%3Cpath%20d%3D%22M21%2020%20L43%2044%20M43%2020%20L21%2044%22%20stroke%3D%22white%22%20stroke-width%3D%226%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20fill%3D%22none%22%2F%3E%3C%2Fsvg%3E",cur=false;function tick(){fetch('/fragments',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){if(typeof d.overall_safe==='boolean' && d.overall_safe!==cur){cur=d.overall_safe;var el=document.getElementById('safetyFavicon');if(el)el.href=cur?S:U;}}).catch(function(){});}setInterval(tick,3000);})();</script>
+<script>(function(){const nav=document.getElementById('clsNav');
+function show(id){document.querySelectorAll('.cls-panes .settings-group').forEach(g=>g.classList.toggle('sg-on',g.id===id));
+nav.querySelectorAll('a').forEach(a=>a.classList.toggle('on',a.dataset.g===id));}
+nav.addEventListener('click',e=>{const a=e.target.closest('a');if(!a)return;e.preventDefault();show(a.dataset.g);history.replaceState(null,'','#'+a.dataset.g);});
+if(location.hash&&document.getElementById(location.hash.slice(1)))show(location.hash.slice(1));})();</script><script>function aiSaved(){const s=document.getElementById('aiChoiceSaved');s.style.opacity=1;setTimeout(()=>s.style.opacity=0,1500)}</script></body></html>
