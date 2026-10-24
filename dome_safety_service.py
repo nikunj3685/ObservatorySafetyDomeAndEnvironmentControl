@@ -207,6 +207,11 @@ DEFAULT_SETTINGS = {
         "enabled": False,
         "sustained_rain_seconds": 0,   # 0 = close the instant rain is detected
     },
+    # Close the roof when the Pi comes back from a power loss at night with
+    # the roof not closed - NINA doesn't resume by itself after a power loss.
+    "power_loss_close": {
+        "enabled": True,
+    },
     # Timing for the Dome state machine's OPEN/CLOSE moves. There's only a
     # single reed switch, mounted at the CLOSED position (see "pins" ->
     # reed_gpio) - it can reliably confirm CLOSED, but there's no sensor at
@@ -3885,6 +3890,81 @@ def _save_safety_state(safe, now=None):
 
 _restored_safety = _load_restored_safety()
 
+# ---- Did the Pi restart, and was it a power loss? ---------------------------
+# Linux gives every boot a new id. The service saves it, and marks a clean stop
+# when systemd stops it (normal reboot/shutdown or service restart sends
+# SIGTERM). New boot id + no clean stop = the Pi lost power (or crashed).
+BOOT_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boot_state.json")
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+TIMESYNC_FLAG_PATH = "/run/systemd/timesync/synchronized"   # exists once NTP has set the clock
+POWER_LOSS_SETTLE_SEC = 30          # let the reed switch and sensors settle first
+POWER_LOSS_CLOCK_WAIT_SEC = 300     # wait this long at most for the network clock (no RTC on a Pi)
+POWER_LOSS_NOTICE_SEC = 48 * 3600   # how long the Dome card notice is offered
+
+
+def _read_boot_id():
+    try:
+        with open(BOOT_ID_PATH) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _load_boot_state():
+    try:
+        with open(BOOT_STATE_PATH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_boot_state(d):
+    try:
+        tmp = BOOT_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, BOOT_STATE_PATH)
+    except Exception as e:
+        print(f"[boot] could not save boot state: {e}")
+
+
+def _classify_start(prev, boot_id):
+    """'power_loss' | 'reboot' | 'service_restart' | 'first' | 'unknown'."""
+    if not boot_id:
+        return "unknown"
+    if not prev.get("boot_id"):
+        return "first"
+    if prev["boot_id"] == boot_id:
+        return "service_restart"
+    return "reboot" if prev.get("clean_stop") else "power_loss"
+
+
+def _boot_detect():
+    prev = _load_boot_state()
+    boot_id = _read_boot_id()
+    try:
+        with open(SAFETY_STATE_PATH) as f:
+            last_alive = float(json.load(f)["t"])     # saved every 10 s while running
+    except Exception:
+        last_alive = None
+    info = {"kind": _classify_start(prev, boot_id), "last_alive": last_alive}
+    new = dict(prev)
+    new.update(boot_id=boot_id, clean_stop=False, started=time.time())
+    _save_boot_state(new)
+    return info
+
+
+def _mark_clean_stop():
+    d = _load_boot_state()
+    d.update(clean_stop=True, stopped=time.time())
+    _save_boot_state(d)
+
+
+_boot_info = _boot_detect()
+
 # Tiny per-check change history, purely for the light-gray "previous status"
 # line shown next to each safety-affecting reading on the page - lets you
 # see at a glance what a check used to read and when it last changed,
@@ -5705,6 +5785,104 @@ class DomeController:
 
 dome = DomeController()
 
+
+def _pl_time(t):
+    try:
+        tz = ZoneInfo(get_setting("location").get("tz_name", "UTC"))
+    except Exception:
+        tz = timezone.utc
+    return _format_axis_time(datetime.fromtimestamp(t, tz))
+
+
+def _uptime_sec():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
+
+
+def _power_loss_check(info, wait=True):
+    """Runs once after start-up. Logs what kind of start this was and, after a
+    power loss with the roof not closed at night, closes it (Dome card ->
+    "Close the roof after a power loss at night"). Returns the action taken."""
+    kind = info.get("kind")
+    if kind == "service_restart":
+        _log_event("Service", "Service restarted (the Pi stayed on) - no action")
+        return "none"
+    if kind == "reboot":
+        _log_event("Service", "Pi rebooted normally (clean shutdown) - no action")
+        return "none"
+    if kind != "power_loss":
+        return "none"
+    clock_ok = True
+    if wait:
+        t0 = time.time()
+        while not os.path.exists(TIMESYNC_FLAG_PATH) and time.time() - t0 < POWER_LOSS_CLOCK_WAIT_SEC:
+            time.sleep(2)
+        clock_ok = os.path.exists(TIMESYNC_FLAG_PATH)
+        while time.time() - t0 < POWER_LOSS_SETTLE_SEC:
+            time.sleep(1)
+        t1 = time.time()
+        while REED_INSTALLED and dome_feature_enabled() and not dome.reed_ready and time.time() - t1 < 120:
+            time.sleep(1)
+    now = time.time()
+    up = _uptime_sec()
+    boot_t = now - up if up is not None else None
+    last = info.get("last_alive")
+    if last and boot_t and last <= boot_t:
+        down = f"the Pi was off from {_pl_time(last)} to {_pl_time(boot_t)} ({max(1, round((boot_t - last) / 60))} min)"
+    else:
+        down = "the Pi was off (times unknown)"
+    _log_event("Service", f"Power loss detected - {down}", "warn")
+
+    with sensor_lock:
+        daytime = sensor_state.get("daytime_now", True)
+        sun = sensor_state.get("solar_elevation_deg")
+    sun_txt = f"sun {sun:.0f}°" if isinstance(sun, (int, float)) else "sun position unknown"
+    roof_open = bool(REED_INSTALLED and dome_feature_enabled() and dome.reed_ready and dome.dome_open_raw)
+    enabled = get_setting("power_loss_close").get("enabled", True)
+    if not dome_feature_enabled():
+        action, msg = "none", None
+    elif not REED_INSTALLED:
+        action, msg = "unknown", "no reed switch, so the roof position is unknown - left as is"
+    elif not dome.reed_ready:
+        action, msg = "unknown", "the reed switch has no reading yet - left as is"
+    elif not roof_open:
+        action, msg = "closed_already", "roof already closed - no action"
+    elif daytime:
+        action, msg = "day", f"roof is open, but it is daytime ({sun_txt}) - left as is"
+    elif not enabled:
+        action, msg = "off", "roof is open at night, but \"Close the roof after a power loss\" is off - left open"
+    else:
+        action, msg = "closing", f"roof was open at night ({sun_txt}) - closing"
+    if msg:
+        if not clock_ok:
+            msg += " (clock not confirmed by the network yet)"
+        _log_event("Dome", "Power loss: " + msg, "warn" if action in ("off", "unknown", "closing") else "info")
+    if action == "closing":
+        dome.request_close(trigger="Power-loss close")
+    if action != "none":
+        notice = {"closing": f"The roof was open at night, so it was <b>closed</b> at {_pl_time(now)}.",
+                  "day": "The roof is open, but it is daytime, so it was left as it is.",
+                  "off": "The roof is open at night, but closing after a power loss is turned off.",
+                  "unknown": "The roof position couldn't be read, so it was left as it is.",
+                  "closed_already": "The roof was already closed."}[action]
+        d = _load_boot_state()
+        d["last_power_loss"] = {"t": now, "down": down, "text": notice, "action": action}
+        _save_boot_state(d)
+    return action
+
+
+def _power_loss_notice_html():
+    """Closable notice on the Dome card for the last power loss (48 h)."""
+    ev = _load_boot_state().get("last_power_loss")
+    if not ev or time.time() - float(ev.get("t", 0)) > POWER_LOSS_NOTICE_SEC:
+        return ""
+    down = _html_escape(ev.get("down", ""))
+    return (f"<div class='banner banner-warn'>⚡ <b>Power loss</b> ({_html_escape(_pl_time(float(ev['t'])))}) — "
+            f"{down}. {ev.get('text', '')} <a href='/logs'>Logs</a></div>")
+
 # ==========================================================================
 # SCHEDULE + SAFETY-AUTO-CLOSE
 # ==========================================================================
@@ -5860,7 +6038,226 @@ def heater_refresh_loop():
 # ==========================================================================
 # OLED DISPLAY
 # ==========================================================================
+OLED_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+OLED_LINE_H = 10            # 6 lines on the 64 px screen
+
+
+def _oled_font():
+    """Medium OLED font: DejaVu Sans 9 px (Raspberry Pi OS ships it); if it is
+    missing, Pillow's built-in font at 9 px; on a very old Pillow, the plain
+    default font."""
+    for make in (lambda: ImageFont.truetype(OLED_FONT_PATH, 9),
+                 lambda: ImageFont.load_default(size=9),
+                 lambda: ImageFont.load_default()):
+        try:
+            return make()
+        except Exception:
+            continue
+    return None
+
+
+# ---- 1-bit icons, each about 9-10 px tall, drawn at (x, y) = top-left ----
+def _oled_shield(d, x, y, safe):
+    pts = [(x, y), (x + 8, y), (x + 8, y + 5), (x + 4, y + 9), (x, y + 5)]
+    if safe:                                   # outline + tick
+        d.polygon(pts, outline=255)
+        d.line((x + 2, y + 4, x + 3, y + 5), fill=255)
+        d.line((x + 3, y + 5, x + 6, y + 2), fill=255)
+    else:                                      # filled + cross cut out
+        d.polygon(pts, fill=255, outline=255)
+        d.line((x + 2, y + 2, x + 6, y + 6), fill=0)
+        d.line((x + 6, y + 2, x + 2, y + 6), fill=0)
+
+
+def _oled_dome(d, x, y, state, font):
+    """Roll-off roof: walls + roof bar. Returns the width used."""
+    def walls(top):
+        d.line((x, y + 3, x, y + 8), fill=255)
+        d.line((x + 10, y + 3, x + 10, y + 8), fill=255)
+        d.line((x, y + 8, x + 10, y + 8), fill=255)
+        if top:
+            d.line((x, y + 3, x + 10, y + 3), fill=255)
+
+    def roof(rx):
+        d.rectangle((rx - 1, y, rx + 11, y + 1), fill=255)
+
+    if state == STATE_CLOSED:
+        walls(True); roof(x)
+        return 12
+    if state == STATE_OPEN:
+        walls(False); roof(x + 12)
+        return 24
+    if state in (STATE_OPENING, STATE_CLOSING):
+        walls(False); roof(x + 6)
+        ax, ay = x + 20, y + 5
+        d.line((ax, ay, ax + 5, ay), fill=255)
+        if state == STATE_OPENING:
+            d.polygon([(ax + 6, ay), (ax + 3, ay - 3), (ax + 3, ay + 3)], fill=255)
+        else:
+            d.polygon([(ax - 1, ay), (ax + 2, ay - 3), (ax + 2, ay + 3)], fill=255)
+        return 27
+    walls(True)                                 # unknown
+    d.text((x + 3, y + 1), "?", font=font, fill=255)
+    return 12
+
+
+def _oled_sun(d, x, y):
+    d.ellipse((x + 2, y + 2, x + 6, y + 6), outline=255)
+    for a, b in ((4, 0), (4, 8), (0, 4), (8, 4), (1, 1), (7, 1), (1, 7), (7, 7)):
+        d.point((x + a, y + b), fill=255)
+
+
+def _oled_moon(d, x, y):
+    d.ellipse((x, y, x + 8, y + 8), fill=255)
+    d.ellipse((x + 3, y - 1, x + 10, y + 6), fill=0)
+
+
+def _oled_drop(d, x, y, wet):
+    pts = [(x + a, y + b) for a, b in ((3, 0), (4, 0), (6, 4), (6, 6), (5, 8), (2, 8), (1, 6), (1, 4))]
+    d.polygon(pts, fill=255 if wet else 0, outline=255)
+
+
+def _oled_dew(d, x, y, risk):
+    for dx, dy in ((0, 4), (4, 1), (4, 6)):
+        d.ellipse((x + dx, y + dy, x + dx + 2, y + dy + 2), fill=255 if risk else 0, outline=255)
+
+
+def _oled_cloud(d, x, y):
+    d.ellipse((x, y + 3, x + 5, y + 8), outline=255)
+    d.ellipse((x + 3, y, x + 9, y + 6), outline=255)
+    d.ellipse((x + 6, y + 3, x + 11, y + 8), outline=255)
+    d.rectangle((x + 2, y + 4, x + 9, y + 7), fill=0)
+    d.line((x + 2, y + 8, x + 9, y + 8), fill=255)
+
+
+def _oled_thermo(d, x, y):
+    d.rectangle((x + 3, y, x + 5, y + 4), outline=255)
+    d.ellipse((x + 2, y + 4, x + 6, y + 8), fill=255)
+    d.line((x + 4, y + 2, x + 4, y + 5), fill=255)
+
+
+def _oled_chip(d, x, y):                       # AI Sky Prediction (sensor based)
+    d.rectangle((x + 2, y + 2, x + 8, y + 7), outline=255)
+    for px in (x + 3, x + 5, x + 7):
+        d.point((px, y + 1), fill=255)
+        d.point((px, y + 8), fill=255)
+    for px in (x + 1, x + 5, x + 9):
+        d.point((px, y + 4), fill=255)
+
+
+def _oled_camera(d, x, y):                     # AI Cloud Detect (All Sky camera)
+    d.rectangle((x, y + 2, x + 9, y + 8), outline=255)
+    d.rectangle((x + 3, y, x + 6, y + 2), fill=255)
+    d.ellipse((x + 3, y + 3, x + 6, y + 6), outline=255)
+
+
+def _oled_heater(d, x, y, on):
+    for hx in (x + 1, x + 4, x + 7):
+        d.line([(hx, y + 8), (hx + 1, y + 6), (hx, y + 4), (hx + 1, y + 2), (hx, y)], fill=255)
+    if not on:
+        d.line((x, y + 8, x + 8, y), fill=255)
+
+
+def _oled_lines(s, h, dome_state, snap, heater_on_feature):
+    """What the OLED shows, as plain values (also used by the tests)."""
+    ai_status = s.get("ai_model_status")
+    if ai_status == "active" and s.get("ai_model_predicted") is not None:
+        conf = s.get("ai_model_confidence")
+        ai_text = f"{s['ai_model_predicted']}" + (f" {int(conf)}%" if conf is not None else "")
+    else:
+        ai_text = {"untrained": "not trained", "no_data": "no data"}.get(ai_status, "no data")
+    cl_status = s.get("cloud_model_status")
+    pred = s.get("cloud_model_predicted")
+    if cl_status == "active" and s.get("cloud_model_ignored"):
+        cl_text = f"Ignore({pred})" if pred else "Ignore"
+    elif cl_status == "active" and pred is not None:
+        conf = s.get("cloud_model_confidence")
+        cl_text = f"{pred}" + (f" {round(float(conf) * 100)}%" if conf is not None else "")
+    else:
+        cl_text = {"untrained": "no model", "tflite_missing": "no runtime", "no_image": "no frame",
+                   "error": "error"}.get(cl_status, "no model")
+    anomaly = s.get("ai_model_anomaly_c") if ai_status == "active" else None
+    pres = s.get("bme_pressure") if s.get("env_source") == "BME280" else None
+    return {
+        "safe": bool(s.get("overall_safe")),
+        "dome": dome_state if dome_state != STATE_DISABLED else None,
+        "night": not s.get("daytime_now"),
+        "rain": {"Rain": "Wet", "Dry": "Dry"}.get(snap.get("rain")) if RAIN_INSTALLED else None,
+        "dew": {"OK": "OK", "TRIP": "RISK"}.get(snap.get("dew")),
+        "sky": s.get("mlx_sky_c"),
+        "cdelta": anomaly,
+        "out_t": snap.get("environment_temp_c"),
+        "out_rh": snap.get("environment_humidity"),
+        "out_p": pres if snap.get("environment_temp_c") is not None else None,
+        "ai": ai_text,
+        "cloud": cl_text,
+        "heater": (int(h.get("target_power_percent") or 0) if heater_on_feature else None),
+    }
+
+
+def _oled_render(v, font):
+    """Draw the 128x64 OLED screen from _oled_lines() values."""
+    image = Image.new("1", (OLED_WIDTH, OLED_HEIGHT))
+    d = ImageDraw.Draw(image)
+    tl = (lambda t: int(d.textlength(t, font=font))) if hasattr(d, "textlength") else (lambda t: 6 * len(t))
+    L = OLED_LINE_H
+    # 1: shield SAFE/UNSAFE | roof Open/Closed/...
+    _oled_shield(d, 0, 0, v["safe"])
+    t = "SAFE" if v["safe"] else "UNSAFE"
+    d.text((11, 0), t, font=font, fill=255)
+    if v["dome"]:
+        x = 11 + tl(t) + 3
+        d.text((x, 0), "|", font=font, fill=255)
+        x += 7
+        x += _oled_dome(d, x, 0, v["dome"], font) + 3
+        d.text((x, 0), {STATE_OPEN: "Open", STATE_CLOSED: "Closed", STATE_OPENING: "Opening",
+                        STATE_CLOSING: "Closing"}.get(v["dome"], "Unknown"), font=font, fill=255)
+    # 2: moon/sun Night/Day | drop Dry/Wet | dew OK/RISK (unknown parts hidden)
+    (_oled_moon if v["night"] else _oled_sun)(d, 0, L + 1)
+    t = "Night" if v["night"] else "Day"
+    d.text((11, L), t, font=font, fill=255)
+    x = 11 + tl(t) + 3
+    if v["rain"]:
+        d.text((x, L), "|", font=font, fill=255)
+        x += 5
+        _oled_drop(d, x, L + 1, v["rain"] == "Wet")
+        d.text((x + 9, L), v["rain"], font=font, fill=255)
+        x += 9 + tl(v["rain"]) + 3
+    if v["dew"]:
+        d.text((x, L), "|", font=font, fill=255)
+        x += 5
+        _oled_dew(d, x, L + 1, v["dew"] == "RISK")
+        d.text((x + 9, L), v["dew"], font=font, fill=255)
+    # 3: cloud  sky temp  corrected delta
+    if v["sky"] is not None:
+        _oled_cloud(d, 0, 2 * L + 2)
+        t = f"{v['sky']:.1f}°C" + (f"  cΔ {v['cdelta']:+.1f}" if v["cdelta"] is not None else "")
+        d.text((14, 2 * L + 1), t, font=font, fill=255)
+    # 4: thermometer  outside temp, humidity, pressure
+    if v["out_t"] is not None:
+        _oled_thermo(d, 2, 3 * L + 2)
+        t = f"{v['out_t']:.1f}°C"
+        if v["out_rh"] is not None:
+            t += f" {v['out_rh']:.0f}%"
+        if v["out_p"] is not None:
+            t += f" {v['out_p']:.0f}hPa"
+        d.text((13, 3 * L + 1), t, font=font, fill=255)
+    # 5: chip  AI Sky ... heater at the right end
+    _oled_chip(d, 0, 4 * L + 2)
+    d.text((13, 4 * L + 1), v["ai"], font=font, fill=255)
+    if v["heater"] is not None:
+        ht = f"{v['heater']}%" if v["heater"] else "Off"
+        hx = OLED_WIDTH - tl(ht) - 12
+        _oled_heater(d, hx, 4 * L + 2, bool(v["heater"]))
+        d.text((hx + 11, 4 * L + 1), ht, font=font, fill=255)
+    # 6: camera  AI Cloud Detect
+    _oled_camera(d, 0, 5 * L + 2)
+    d.text((13, 5 * L + 1), v["cloud"], font=font, fill=255)
+    return image
+
+
 def display_loop():
+    font = _oled_font()
     while True:
         if not OLED_INSTALLED:
             time.sleep(DISPLAY_UPDATE_SEC)
@@ -5870,25 +6267,9 @@ def display_loop():
                 s = dict(sensor_state)
             with heater_lock:
                 h = dict(heater_state)
-            dome_snap = dome.snapshot()
-
-            image = Image.new("1", (OLED_WIDTH, OLED_HEIGHT))
-            draw = ImageDraw.Draw(image)
-            draw.rectangle((0, 0, OLED_WIDTH, OLED_HEIGHT), outline=0, fill=0)
-
-            draw.text((0, 0), "OBSERVATORY", font=oled_font, fill=255)
-            draw.text((0, 12), f"Dome:{dome_snap['state']} Safe:{'Y' if s['overall_safe'] else 'N'}",
-                      font=oled_font, fill=255)
-            sky, amb = s["mlx_sky_c"], s["mlx_ambient_c"]
-            if sky is not None and amb is not None:
-                draw.text((0, 24), f"Sky:{sky:4.1f} Amb:{amb:4.1f}", font=oled_font, fill=255)
-            if s["env_temp_c"] is not None:
-                draw.text((0, 36), f"Out:{s['env_temp_c']:4.1f}C {s['env_humidity']:3.0f}%RH",
-                          font=oled_font, fill=255)
-            draw.text((0, 48), f"Htr:{h['target_power_percent']:3d}% "
-                                f"{'DAY' if s['daytime_now'] else 'NIGHT'}", font=oled_font, fill=255)
-
-            oled.image(image)
+            dome_state = dome.snapshot()["state"] if dome_feature_enabled() else STATE_DISABLED
+            v = _oled_lines(s, h, dome_state, _log_sensor_snapshot(), heater_feature_enabled())
+            oled.image(_oled_render(v, font))
             oled.show()
         except Exception as e:
             print(f"[display] update failed: {e}")
@@ -6891,6 +7272,7 @@ def web_save():
         if "autoCloseSeconds" in request.args:
             s["safety_auto_close"]["sustained_unsafe_seconds"] = int(request.args["autoCloseSeconds"])
         s["safety_auto_open"]["enabled"] = "autoOpenEnable" in request.args
+        s.setdefault("power_loss_close", {})["enabled"] = "powerLossClose" in request.args
         if "autoOpenSeconds" in request.args:
             s["safety_auto_open"]["sustained_safe_seconds"] = int(request.args["autoOpenSeconds"])
         if s["safety_checks"]["rain_enabled"]:
@@ -9157,6 +9539,16 @@ a{{color:var(--accent-safety);}}
 .banner .banner-x{{position:absolute;top:6px;right:8px;width:24px;height:24px;border:0;border-radius:50%;background:transparent;color:inherit;font-size:18px;line-height:22px;cursor:pointer;padding:0;opacity:.75;}}
 .banner .banner-x:hover{{background:rgba(0,0,0,.09);opacity:1;}}
 .banner.banner-dismissed{{display:none;}}
+.pl-row{{position:relative;}}
+.info-i{{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:0 0 20px;width:20px;height:20px;
+        border-radius:50%;background:#e5e7eb;color:#374151;font:italic 700 12px Georgia,serif;cursor:help;margin-left:6px;}}
+.info-i:hover,.info-i:focus{{background:#0f766e;color:#fff;outline:none;}}
+.info-tip{{display:none;position:absolute;right:0;top:26px;width:min(380px,80vw);background:#1f2937;color:#f9fafb;
+          font:400 12.5px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:10px 12px;border-radius:8px;
+          box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:20;text-align:left;}}
+.info-tip b{{color:#fff;}}
+.info-i:hover .info-tip,.info-i:focus .info-tip{{display:block;}}
+.info-i.tip-up .info-tip{{top:auto;bottom:26px;}}
 .notice-restore{{font-size:12px;color:var(--muted);margin:0 2px 10px;}}
 .notice-restore a{{cursor:pointer;}}
 /* Settings page: left menu, one group at a time */
@@ -9215,6 +9607,7 @@ a{{color:var(--accent-safety);}}
 <div class="card dome" id="dome">
   <h2><span class="title">🚪 Dome <span id="domeState" class="badge {dome_badge_class}">{dome_state}</span></span></h2>
   {dome_disabled_banner_html}
+  {_power_loss_notice_html() if dome_enabled else ""}
   {f"<div class='banner banner-warn'>⚠️ <b>No position feedback</b> - the {sensor_names['reed']} is disabled under "
    "<a href='/settings#hardware-pins'>Hardware Pins</a>, so OPEN/CLOSED here just reflects the last command sent, not a "
    "confirmed reading.</div>" if dome_enabled and not REED_INSTALLED else ""}
@@ -9266,6 +9659,17 @@ a{{color:var(--accent-safety);}}
      "wired/trusted yet.</p>" if not checks['rain_enabled'] else
      "<p class='hint'>A standing guard, separate from the sustained-UNSAFE auto-close above — this one reacts "
      "the moment rain is detected. 0 seconds = close instantly, no wait.</p>"}
+    <hr class="sep">
+    <div class="setting-row pl-row">
+      <label><input type="checkbox" name="powerLossClose" {"checked" if get_setting("power_loss_close").get("enabled", True) else ""}> Close the roof after a power loss at night</label>
+      <span class="info-i" tabindex="0" aria-label="About this setting">i<span class="info-tip"><b>Close the roof after a power loss at night</b><br>
+      When the Pi comes back after a <b>power loss</b> and the roof is <b>not closed</b>:<br>
+      &bull; <b>Night</b> (sun below your Day/Night threshold, {loc['night_threshold_deg']:g}&deg;): the roof is closed about {POWER_LOSS_SETTLE_SEC} s after start-up.<br>
+      &bull; <b>Day</b>: left as it is.<br>
+      &bull; A <b>normal reboot</b> or <b>service restart</b>: no action (your imaging software is still in charge).<br>
+      Why: your imaging software does not resume by itself after a power loss, so nothing else would close the roof.<br>
+      Every action is logged on the Logs page, and a notice shows on this card.</span></span>
+    </div>
     <p><button type="submit" class="btn btn-dome">Save schedule</button></p>
    </fieldset>
   </form>
@@ -9945,6 +10349,19 @@ setInterval(refreshSkyHistory, 60000);
 // nothing here touches any check or the SAFE/UNSAFE result. The banners in
 // #warningBanner are re-rendered by poll() every few seconds, hence the
 // MutationObserver rather than a one-off pass.
+// Info tooltips open below the (i) icon, or above it when there isn't room below.
+(function(){{
+  function place(i){{
+    var tip=i.querySelector('.info-tip'); if(!tip) return;
+    i.classList.remove('tip-up');
+    tip.style.visibility='hidden'; tip.style.display='block';
+    var r=i.getBoundingClientRect(), h=tip.offsetHeight;
+    tip.style.display=''; tip.style.visibility='';
+    if(window.innerHeight-r.bottom<h+12 && r.top>h+12) i.classList.add('tip-up');
+  }}
+  document.addEventListener('mouseover', function(e){{ var i=e.target.closest&&e.target.closest('.info-i'); if(i) place(i); }});
+  document.addEventListener('focusin', function(e){{ var i=e.target.closest&&e.target.closest('.info-i'); if(i) place(i); }});
+}})();
 (function(){{
   var KEY='dismissedNotices';
   function load(){{ try {{ return JSON.parse(localStorage.getItem(KEY)||'[]'); }} catch(e) {{ return []; }} }}
@@ -13279,5 +13696,16 @@ if __name__ == "__main__":
     threading.Thread(target=dome_tick_loop, daemon=True).start()
     threading.Thread(target=display_loop, daemon=True).start()
     threading.Thread(target=discovery_loop, daemon=True).start()
+    threading.Thread(target=_power_loss_check, args=(_boot_info,), daemon=True).start()
 
+    import signal
+
+    def _on_stop(signum, frame):
+        # systemd stop (service restart, normal reboot/shutdown) or Ctrl+C:
+        # record a clean stop so the next start isn't taken for a power loss.
+        _mark_clean_stop()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_stop)
+    signal.signal(signal.SIGINT, _on_stop)
     app.run(host="0.0.0.0", port=ALPACA_HTTP_PORT, threaded=True)
