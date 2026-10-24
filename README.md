@@ -12,7 +12,7 @@ A Raspberry Pi-native ASCOM Alpaca server for a DIY roll-off-roof observatory. O
   5. **AI Model check** (off by default) - a sky-condition model trained on your own classified All Sky images, but predicting from sensor readings; shown on the dashboard as "AI Sky Prediction". Fails open (never blocks SAFE) if it's turned on before a model exists or when it has no fresh reading to predict from
   6. **Cloud Image Model check** (off by default) - a real image-classification model, trained on your own labeled All Sky photos by the companion [cloud training server](#cloud-training-server) and run locally on the Pi against the live All Sky frame; shown on the dashboard as "AI Cloud Detect" and plotted on the Safety Checks History chart. Same fail-open behavior as gate 5 if no model has been downloaded yet or there's no current frame to classify
 
-  Either AI gate holds its last trusted prediction instead of reacting when the model itself predicts your "Ignore" label (e.g. glare, an obstruction) - the dashboard shows this as **Ignore(*last prediction*)** rather than silently voting SAFE/UNSAFE off a frame you've told it not to trust. A manual Force-SAFE / Force-UNSAFE override can bypass all six at once. A sensor's "installed/polled" toggle (Hardware Pins) is independent from whether its reading *counts toward* the decision (Safety Checks) - e.g. the MLX90614 can keep feeding an AI gate while its own simple threshold check is excluded, or the reverse.
+  Either AI gate holds its last trusted prediction instead of reacting when the model itself predicts your "Ignore" label (e.g. glare, an obstruction) - the dashboard shows this as **Ignore(*last prediction*)** rather than silently voting SAFE/UNSAFE off a frame you've told it not to trust. A manual Force-SAFE / Force-UNSAFE override can bypass all six at once. Under those buttons, **Enable automatic** runs one of them (Force SAFE / Force UNSAFE / Back to Auto) once at a set time and then unticks itself, like the dome schedule. A sensor's "installed/polled" toggle (Hardware Pins) is independent from whether its reading *counts toward* the decision (Safety Checks) - e.g. the MLX90614 can keep feeding an AI gate while its own simple threshold check is excluded, or the reverse.
 - **Dome** drives a roof relay + reed switch as a simple OPEN/CLOSED/MOVING state machine, with optional safety-auto-close/open and a rain-auto-close feature. **Close the roof after a power loss at night** (on by default): the service tells a power loss (new boot, no clean stop) from a normal reboot or a service restart, and after a power loss closes a roof that is still open at night (daytime: left as is). Every case is logged and a closable notice shows on the Dome card.
 - A dew/frost **heater** (not part of the SafetyMonitor decision - equipment protection is a separate concern from observing safety) runs AUTO ramped power based on freeze/dew-point math, or a manual power slider.
 - **ObservingConditions** exposes the raw BME280 / MLX90614 / DHT11 / simpleCloudDetect readings to any ASCOM client.
@@ -129,7 +129,7 @@ Use [Tailscale](https://tailscale.com) on the Pi and your own devices — do **n
 folder so nothing touches your config or data:
 
     cd tests
-    for t in test_*.py; do python3 "$t"; done        # all suites (~745 checks)
+    for t in test_*.py; do python3 "$t"; done        # all suites (~765 checks)
     RA_DEFAULT_PW='<default remote password>' python3 test_remote_access.py
 
 `python3 tests/shot.py` regenerates `docs/previews/preview_index.html` / `preview_settings.html`.

@@ -212,6 +212,11 @@ DEFAULT_SETTINGS = {
     "power_loss_close": {
         "enabled": True,
     },
+    # Safety Monitor card: one-time automatic override (Force SAFE / Force
+    # UNSAFE / Back to Auto) at a set time; unticks itself after it fires.
+    "override_schedule": {
+        "enabled": False, "action": "auto", "hour": 6, "minute": 0,
+    },
     # Timing for the Dome state machine's OPEN/CLOSE moves. There's only a
     # single reed switch, mounted at the CLOSED position (see "pins" ->
     # reed_gpio) - it can reliably confirm CLOSED, but there's no sensor at
@@ -5874,6 +5879,25 @@ def _power_loss_check(info, wait=True):
     return action
 
 
+def _override_schedule_html():
+    """Safety Monitor card: [x] Enable automatic [action] [time] Save (i)."""
+    o = get_setting("override_schedule")
+    opts = "".join(f'<option value="{v}"{" selected" if o.get("action", "auto") == v else ""}>{t}</option>'
+                   for v, t in OVERRIDE_ACTION_LABELS.items())
+    return f"""<form class="ov-sched" action="/save-override-schedule" method="get">
+    <label><input type="checkbox" name="ovEnable" title="Enable automatic" {"checked" if o.get("enabled") else ""}><span class="ov-lbl">Enable automatic</span></label>
+    <select name="ovAction" aria-label="Action">{opts}</select>
+    <input type="time" name="ovTime" aria-label="Time" value="{int(o.get('hour', 6)):02d}:{int(o.get('minute', 0)):02d}">
+    <button type="submit" class="btn btn-neutral">Save</button>
+    <span class="info-i" tabindex="0" aria-label="About this setting">i<span class="info-tip"><b>Automatic one-time action</b><br>
+    At the chosen time the selected action runs <b>once</b>, exactly like clicking its button:<br>
+    &bull; <b>Force SAFE</b> / <b>Force UNSAFE</b>: overrides the sensors until you change it.<br>
+    &bull; <b>Back to Auto</b>: returns to the sensor-based decision.<br>
+    After it runs, the checkbox <b>unticks itself</b> (like the dome schedule) - tick it again to arm it for another day.<br>
+    The action is logged on the Logs page.</span></span>
+  </form>"""
+
+
 def _power_loss_notice_html():
     """Closable notice on the Dome card for the last power loss (48 h)."""
     ev = _load_boot_state().get("last_power_loss")
@@ -5922,6 +5946,34 @@ def check_schedule():
             def _disable_close(s):
                 s["schedule"]["close_enabled"] = False
             update_settings(_disable_close)
+
+
+_last_override_fire = None
+
+
+def check_override_schedule(now=None):
+    """Safety Monitor one-time automatic action: at the set time run the
+    selected override once (same as clicking its button), then untick."""
+    global _last_override_fire
+    o = get_setting("override_schedule")
+    if not o.get("enabled"):
+        return False
+    now = now or datetime.now()
+    if now.hour != o.get("hour") or now.minute != o.get("minute"):
+        return False
+    key = (now.timetuple().tm_yday, now.hour, now.minute)
+    if _last_override_fire == key:
+        return False
+    _last_override_fire = key
+    action = o.get("action", "auto")
+    label = OVERRIDE_ACTION_LABELS.get(action, "Back to Auto")
+
+    def _untick(s):
+        s["override_schedule"]["enabled"] = False
+    update_settings(_untick)
+    print(f"[schedule] Automatic one-time action: {label}")
+    _apply_override(action, note=f" (automatic one-time action at {now.hour:02d}:{now.minute:02d} - checkbox cleared)")
+    return True
 
 
 def check_safety_auto_close():
@@ -6022,6 +6074,7 @@ def dome_tick_loop():
     while True:
         dome.update()
         check_schedule()
+        check_override_schedule()
         check_safety_auto_close()
         check_safety_auto_open()
         check_rain_auto_close()
@@ -7139,13 +7192,37 @@ def setup_redirect():
 
 
 # ---------- manual overrides ----------
-@app.route("/override", methods=["GET"])
-def web_override():
+OVERRIDE_ACTION_LABELS = {"safe": "Force SAFE", "unsafe": "Force UNSAFE", "auto": "Back to Auto"}
+
+
+def _apply_override(mode, note=""):
+    """Same as clicking Force SAFE / Force UNSAFE / Back to Auto."""
     global override_mode
-    mode = request.args.get("mode", "auto")
     override_mode = {"safe": "FORCE_SAFE", "unsafe": "FORCE_UNSAFE"}.get(mode, "AUTO")
     label = {"FORCE_SAFE": "Force SAFE", "FORCE_UNSAFE": "Force UNSAFE", "AUTO": "Back to Auto"}[override_mode]
-    _log_event("Safety", f"Safety override set to: {label}", sensors=_log_sensor_snapshot())
+    _log_event("Safety", f"Safety override set to: {label}{note}", sensors=_log_sensor_snapshot())
+
+
+@app.route("/override", methods=["GET"])
+def web_override():
+    _apply_override(request.args.get("mode", "auto"))
+    return "", 302, {"Location": "/"}
+
+
+@app.route("/save-override-schedule", methods=["GET"])
+def web_save_override_schedule():
+    """Safety Monitor card -> Enable automatic [action] [time] Save."""
+    def patch(s):
+        o = s.setdefault("override_schedule", {})
+        o["enabled"] = "ovEnable" in request.args
+        if request.args.get("ovAction") in OVERRIDE_ACTION_LABELS:
+            o["action"] = request.args["ovAction"]
+        try:
+            h, m = request.args.get("ovTime", "").split(":")
+            o["hour"], o["minute"] = max(0, min(23, int(h))), max(0, min(59, int(m)))
+        except ValueError:
+            pass
+    update_settings(patch)
     return "", 302, {"Location": "/"}
 
 
@@ -9378,6 +9455,9 @@ h1{{font-size:21px;margin:2px 0 2px;}}
    below. Only used when All Sky is enabled; with it off, Sky History (if it
    has anything to show) is just a normal grid item like Dome/Heater. */
 .right-col{{display:flex;flex-direction:column;gap:16px;}}
+/* the History card sits inside #historyBlock (refreshed by poll), so that wrapper has to grow too */
+#historyBlock{{flex:1 1 auto;display:flex;flex-direction:column;min-height:0;}}
+#historyBlock>.card{{flex:1 1 auto;}}
 .card.allsky{{--accent:var(--accent-allsky);flex:none;}}
 .card.history-compact{{--accent:#0f766e;padding:12px 14px 8px;flex:1 1 auto;display:flex;
   flex-direction:column;min-height:0;}}
@@ -9549,6 +9629,16 @@ a{{color:var(--accent-safety);}}
 .info-tip b{{color:#fff;}}
 .info-i:hover .info-tip,.info-i:focus .info-tip{{display:block;}}
 .info-i.tip-up .info-tip{{top:auto;bottom:26px;}}
+.ov-sched{{display:flex;flex-wrap:nowrap;align-items:center;gap:6px;margin:10px 0 4px;font-size:13.5px;position:relative;}}
+.ov-sched>*{{flex:0 0 auto;}}
+.ov-sched label{{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;margin:0;}}
+.ov-sched label input{{margin:0;}}
+.ov-sched select,.ov-sched input[type=time]{{width:auto;margin:0;font-size:13px;padding:5px 4px;border:1px solid #ccc;border-radius:6px;}}
+.ov-sched .btn{{padding:5px 10px;font-size:13px;white-space:nowrap;}}
+@media (max-width:420px){{.ov-sched{{gap:4px;}}.ov-sched .ov-lbl{{display:none;}}
+  .ov-sched select{{max-width:92px;font-size:12.5px;padding:4px 2px;}}
+  .ov-sched input[type=time]{{max-width:84px;font-size:12.5px;padding:4px 2px;}}
+  .ov-sched .btn{{padding:4px 8px;}}}}
 .notice-restore{{font-size:12px;color:var(--muted);margin:0 2px 10px;}}
 .notice-restore a{{cursor:pointer;}}
 /* Settings page: left menu, one group at a time */
@@ -9579,6 +9669,7 @@ a{{color:var(--accent-safety);}}
     <a href="/override?mode=unsafe"><button class="btn btn-unsafe">Force UNSAFE</button></a>
     <a href="/override?mode=auto"><button class="btn btn-neutral">Back to Auto</button></a>
   </div>
+  {_override_schedule_html()}
   <div id="warningBanner">{warning_html}</div>
   <hr class="sep">
   <div id="daynightBlock">{daynight_html}</div>
