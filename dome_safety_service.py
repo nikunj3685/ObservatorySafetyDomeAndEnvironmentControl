@@ -48,6 +48,7 @@ dome_config.json next to this script - edit by hand or through the web
 page at http://<pi-ip>:11112/ and http://<pi-ip>:11112/config.
 """
 
+import base64
 import bisect
 import functools
 import hashlib
@@ -103,7 +104,7 @@ import adafruit_bme280.basic as adafruit_bme280
 import adafruit_mlx90614
 import adafruit_dht
 from adafruit_extended_bus import ExtendedI2C
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 import adafruit_ssd1306
 
 # Optional - only needed for the cloud-trained image model gate (Phase 5,
@@ -768,6 +769,27 @@ CLOUD_MODEL_TFLITE_PATH = os.path.join(CLOUD_MODEL_DIR, "model.tflite")
 CLOUD_MODEL_CLASSES_PATH = os.path.join(CLOUD_MODEL_DIR, "classes.json")
 CLOUD_MODEL_META_PATH = os.path.join(CLOUD_MODEL_DIR, "meta.json")
 CLOUD_JOB_STATE_PATH = os.path.join(AI_TRAINING_DIR, "cloud_job.json")
+# AI Mask (Classify page -> AI Mask): areas of the All Sky frame turned
+# black before AI Cloud Detect sees it - overlay text, the area outside
+# the lens, trees, buildings. The editable drawing (circle, boxes, brush
+# layer) and the rendered mask live in AI_MASK_DIR. A training upload
+# blacks out its images with the saved mask and keeps a copy of that mask
+# per job (CLOUD_JOB_MASKS_DIR); when the job's model is downloaded the
+# copy moves next to it (CLOUD_MODEL_MASK_PATH). Live prediction only ever
+# uses that copy, so live frames always look like the frames the current
+# model learned from - editing the mask changes nothing live until the
+# next successful training run. The training server needs no change: it
+# just receives already-masked images.
+AI_MASK_DIR = os.path.join(AI_TRAINING_DIR, "ai_mask")
+AI_MASK_META_PATH = os.path.join(AI_MASK_DIR, "mask.json")
+AI_MASK_BRUSH_PATH = os.path.join(AI_MASK_DIR, "brush.png")
+AI_MASK_PNG_PATH = os.path.join(AI_MASK_DIR, "mask.png")
+CLOUD_JOB_MASKS_DIR = os.path.join(AI_TRAINING_DIR, "cloud_job_masks")
+CLOUD_MODEL_MASK_PATH = os.path.join(CLOUD_MODEL_DIR, "mask.png")
+AI_MASK_EDIT_MAX_DIM = 600             # long edge of the sample frame the mask is drawn on
+AI_MASK_MAX_DIM = 2000                 # largest mask size /ai-mask-save accepts
+AI_MASK_MAX_BOXES = 50
+AI_MASK_AUTO_FRAMES = 40               # recent captured frames averaged by "Find circle" / "Find overlay text"
 CLOUD_MODEL_IMG_SIZE = (224, 224)      # must match cloud-training-server/train_server.py's IMG_SIZE
 CLOUD_UPLOAD_RESIZE_MAX_DIM = 400      # long-edge cap for images going into the CLOUD TRAINING upload zip only
                                         # (see _ai_training_export_zip's resize_max_dim) - comfortably above
@@ -2496,6 +2518,311 @@ def _cloud_model_files_present():
     return os.path.isfile(CLOUD_MODEL_TFLITE_PATH) and os.path.isfile(CLOUD_MODEL_CLASSES_PATH)
 
 
+def _load_ai_mask_meta():
+    """The saved AI Mask drawing (see AI_MASK_DIR above): width/height
+    of the frame it was drawn on, enabled, use_circle, circle {x, y, r},
+    boxes [{x, y, w, h}], version and saved_at. None if nothing has been
+    saved yet or the file is unreadable."""
+    try:
+        with open(AI_MASK_META_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _render_ai_mask(meta, brush_alpha):
+    """Builds the mask image ("L", 255 = black out) from the drawing:
+    everything outside the sky circle (when use_circle), every box, and
+    every brush stroke (brush_alpha: an "L" layer at the same size, or
+    None). The page's preview draws the same three layers the same way."""
+    w, h = meta["width"], meta["height"]
+    mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask)
+    circle = meta.get("circle")
+    if meta.get("use_circle") and circle:
+        mask.paste(255, (0, 0, w, h))
+        draw.ellipse((circle["x"] - circle["r"], circle["y"] - circle["r"],
+                      circle["x"] + circle["r"], circle["y"] + circle["r"]), fill=0)
+    for box in meta.get("boxes") or []:
+        draw.rectangle((box["x"], box["y"], box["x"] + box["w"] - 1, box["y"] + box["h"] - 1), fill=255)
+    if brush_alpha is not None:
+        mask = ImageChops.lighter(mask, brush_alpha.point(lambda v: 255 if v >= 128 else 0))
+    return mask
+
+
+def _ai_mask_coverage_pct(mask, meta):
+    """How much is blacked out, as a whole percent: of the sky circle when
+    the circle is in use (the outside is always black, so counting it would
+    say nothing), else of the whole frame."""
+    circle = meta.get("circle")
+    if meta.get("use_circle") and circle:
+        area = Image.new("L", mask.size, 0)
+        ImageDraw.Draw(area).ellipse((circle["x"] - circle["r"], circle["y"] - circle["r"],
+                                      circle["x"] + circle["r"], circle["y"] + circle["r"]), fill=255)
+        inside = area.histogram()[255]
+        hidden = ImageChops.multiply(mask, area).histogram()[255]
+    else:
+        inside = mask.size[0] * mask.size[1]
+        hidden = mask.histogram()[255]
+    return round(hidden * 100 / inside) if inside else 0
+
+
+def _apply_ai_mask(img, mask):
+    """Blacks out the masked areas of an RGB image of any size - the mask
+    is stretched to the image, so one drawn on a 600px sample fits a
+    full-resolution frame or a 224px model input from the same camera."""
+    if mask.size != img.size:
+        mask = mask.resize(img.size, Image.NEAREST)
+    return Image.composite(Image.new("RGB", img.size, (0, 0, 0)), img, mask)
+
+
+def _active_ai_mask():
+    """(mask image, PNG bytes) for the saved mask when "Use the mask" is
+    on - what the next training upload uses - else (None, None)."""
+    meta = _load_ai_mask_meta()
+    if not meta or not meta.get("enabled") or not os.path.isfile(AI_MASK_PNG_PATH):
+        return None, None
+    try:
+        with open(AI_MASK_PNG_PATH, "rb") as f:
+            png = f.read()
+        mask = Image.open(io.BytesIO(png)).convert("L")
+        mask.load()
+        return mask, png
+    except Exception as e:
+        print(f"[ai-mask] Saved mask unreadable, training without it: {e}")
+        return None, None
+
+
+def _ai_mask_version(png):
+    return hashlib.sha1(png).hexdigest()[:12] if png else None
+
+
+# Mask the CURRENT model was trained with (CLOUD_MODEL_MASK_PATH), cached
+# off its mtime the same way as the Interpreter below.
+_trained_mask_cache = {"mtime": None, "mask": None}
+
+
+def _trained_ai_mask():
+    """The mask the downloaded model was trained with, or None (trained
+    without one, or no model) - what live prediction applies."""
+    try:
+        mtime = os.path.getmtime(CLOUD_MODEL_MASK_PATH)
+    except OSError:
+        return None
+    if _trained_mask_cache["mtime"] != mtime:
+        try:
+            mask = Image.open(CLOUD_MODEL_MASK_PATH).convert("L")
+            mask.load()
+        except Exception as e:
+            print(f"[ai-mask] Trained mask unreadable, predicting without it: {e}")
+            return None
+        _trained_mask_cache.update({"mtime": mtime, "mask": mask})
+    return _trained_mask_cache["mask"]
+
+
+def _ai_mask_status():
+    """Summary for the Classify page: whether the saved mask is on, how
+    much it hides, and whether it differs from the mask the downloaded
+    model was trained with (None when there's no model to compare with)."""
+    meta = _load_ai_mask_meta()
+    enabled = bool(meta and meta.get("enabled") and os.path.isfile(AI_MASK_PNG_PATH))
+    active_version = meta.get("version") if enabled else None
+    cloud_meta = _load_cloud_model_meta()
+    changed = (cloud_meta.get("mask_version") != active_version) if cloud_meta else None
+    return {"saved": bool(meta), "enabled": enabled, "coverage_pct": meta.get("coverage_pct") if meta else None,
+            "version": active_version, "changed_since_training": changed}
+
+
+def _save_ai_mask(data):
+    """Validates and saves a drawing posted by the AI Mask editor, then
+    renders the mask from it here (never trusting a client-rendered
+    image). Returns the new _ai_mask_status(); raises ValueError with a
+    readable message for bad input."""
+    try:
+        w, h = int(data["width"]), int(data["height"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Missing mask size.")
+    if not (16 <= w <= AI_MASK_MAX_DIM and 16 <= h <= AI_MASK_MAX_DIM):
+        raise ValueError(f"Mask size {w}x{h} is out of range.")
+
+    circle = None
+    if data.get("circle"):
+        try:
+            c = data["circle"]
+            circle = {"x": round(float(c["x"])), "y": round(float(c["y"])), "r": max(1, round(float(c["r"])))}
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Bad sky circle.")
+
+    boxes = []
+    for b in (data.get("boxes") or [])[:AI_MASK_MAX_BOXES]:
+        try:
+            box = {k: round(float(b[k])) for k in ("x", "y", "w", "h")}
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Bad box.")
+        if box["w"] > 0 and box["h"] > 0:
+            if b.get("auto"):
+                box["auto"] = True
+            boxes.append(box)
+
+    brush_alpha = None
+    brush_url = data.get("brush") or ""
+    if brush_url:
+        prefix = "data:image/png;base64,"
+        if not brush_url.startswith(prefix):
+            raise ValueError("Brush layer must be a PNG.")
+        try:
+            brush = Image.open(io.BytesIO(base64.b64decode(brush_url[len(prefix):])))
+            brush.load()
+        except Exception:
+            raise ValueError("Brush layer is not a readable image.")
+        if brush.size != (w, h):
+            raise ValueError("Brush layer size doesn't match the mask.")
+        brush_alpha = brush.convert("RGBA").getchannel("A")
+        if not brush_alpha.getbbox():
+            brush_alpha = None
+
+    meta = {"width": w, "height": h, "enabled": bool(data.get("enabled", True)),
+            "use_circle": bool(data.get("use_circle")) and circle is not None, "circle": circle,
+            "boxes": boxes, "saved_at": time.time()}
+    mask = _render_ai_mask(meta, brush_alpha)
+    out = io.BytesIO()
+    mask.save(out, format="PNG")
+    png = out.getvalue()
+    meta["version"] = _ai_mask_version(png)
+    meta["coverage_pct"] = _ai_mask_coverage_pct(mask, meta)
+
+    os.makedirs(AI_MASK_DIR, exist_ok=True)
+    tmp = AI_MASK_PNG_PATH + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(png)
+    os.replace(tmp, AI_MASK_PNG_PATH)
+    if brush_alpha is not None:
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        layer.putalpha(brush_alpha)
+        tmp = AI_MASK_BRUSH_PATH + ".tmp"
+        layer.save(tmp, format="PNG")
+        os.replace(tmp, AI_MASK_BRUSH_PATH)
+    elif os.path.exists(AI_MASK_BRUSH_PATH):
+        os.remove(AI_MASK_BRUSH_PATH)
+    tmp = AI_MASK_META_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(meta, f, indent=2)
+    os.replace(tmp, AI_MASK_META_PATH)
+    return _ai_mask_status()
+
+
+def _ai_mask_recent_frames(size):
+    """Up to AI_MASK_AUTO_FRAMES of the newest captured training images
+    (imported ones may come from another camera, so they're skipped),
+    each resized to `size` - what "Find circle" / "Find overlay text"
+    average over."""
+    idx = _load_ai_training_index()
+    samples = sorted((s for s in idx["samples"] if s.get("image") and not _is_imported_sample(s)),
+                     key=_ai_cursor_key, reverse=True)
+    frames = []
+    for sample in samples:
+        if len(frames) >= AI_MASK_AUTO_FRAMES:
+            break
+        try:
+            with Image.open(os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])) as img:
+                img.draft("RGB", (size[0] * 2, size[1] * 2))  # fast JPEG downscale on decode
+                frames.append(img.convert("RGB").resize(size, Image.BILINEAR))
+        except Exception:
+            continue
+    return frames
+
+
+def _ai_mask_find_circle(frames):
+    """The lens circle from the average of several frames: the inside is
+    sky (bright in the average whatever the weather), the outside is the
+    dark camera housing. Returns {x, y, r} or None."""
+    if not frames:
+        return None
+    w, h = frames[0].size
+    mean = frames[0].convert("L")
+    for n, frame in enumerate(frames[1:], start=2):
+        mean = Image.blend(mean, frame.convert("L"), 1.0 / n)
+
+    hist = mean.histogram()
+    total = w * h
+
+    def percentile(p):
+        seen = 0
+        for value, count in enumerate(hist):
+            seen += count
+            if seen >= p * total:
+                return value
+        return 255
+
+    threshold = (percentile(0.05) + percentile(0.75)) / 2
+    px = mean.point(lambda v: 1 if v > threshold else 0).load()
+
+    def longest_run(values):
+        """(length, start) of the longest unbroken stretch of bright pixels."""
+        best, start = (0, 0), None
+        for i, v in enumerate(values + [0]):
+            if v and start is None:
+                start = i
+            elif not v and start is not None:
+                best = max(best, (i - start, start))
+                start = None
+        return best
+
+    # The widest bright stretch in any row is the circle's horizontal
+    # diameter, the tallest in any column its vertical one. Overlay text,
+    # trees or a dark cloud only make shorter stretches, so they don't
+    # pull the circle around.
+    width, left = max(longest_run([px[x, y] for x in range(w)]) for y in range(h))
+    height, top = max(longest_run([px[x, y] for y in range(h)]) for x in range(w))
+    if width < min(w, h) * 0.4:
+        return None
+    right, bottom = left + width - 1, top + height - 1
+    r = width / 2
+    if left == 0 and right == w - 1:
+        r = height / 2  # wider than the frame - only the vertical diameter is whole
+    x = (left + right) / 2
+    # A fisheye often runs off the bottom (or top) of the frame - only
+    # trust an edge that's actually inside the picture.
+    if top > 0 and bottom < h - 1:
+        y = (top + bottom) / 2
+    elif bottom >= h - 1:
+        y = top + r
+    else:
+        y = bottom - r
+    return {"x": round(x), "y": round(y), "r": round(r * 0.99)}
+
+
+def _ai_mask_find_text(frames):
+    """A box around the camera software's overlay text: pixels that are
+    text-red or text-blue in at least half of the frames (the text sits in
+    the same place on every frame, while sky colours change). Returns
+    {x, y, w, h} or None."""
+    if not frames:
+        return None
+    w, h = frames[0].size
+    hits = Image.new("L", (w, h), 0)
+    for frame in frames:
+        r, g, b = frame.split()
+        red = ImageChops.multiply(ImageChops.multiply(r.point(lambda v: 255 if v > 120 else 0),
+                                                      g.point(lambda v: 255 if v < 80 else 0)),
+                                  b.point(lambda v: 255 if v < 80 else 0))
+        blue = ImageChops.multiply(ImageChops.multiply(b.point(lambda v: 255 if v > 120 else 0),
+                                                       r.point(lambda v: 255 if v < 70 else 0)),
+                                   g.point(lambda v: 255 if v < 60 else 0))
+        hits = ImageChops.add(hits, ImageChops.lighter(red, blue).point(lambda v: 1 if v else 0))
+    need = max(1, len(frames) // 2)
+    text = hits.point(lambda v: 255 if v >= need else 0).filter(ImageFilter.MaxFilter(5))
+    bbox = text.getbbox()
+    if not bbox:
+        return None
+    pad = 3
+    x0, y0 = max(0, bbox[0] - pad), max(0, bbox[1] - pad)
+    x1, y1 = min(w, bbox[2] + pad), min(h, bbox[3] + pad)
+    if (x1 - x0) * (y1 - y0) > 0.4 * w * h:
+        return None  # that's not a text block - don't black out half the sky
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
 # Cache for the loaded tflite Interpreter, keyed off model.tflite's mtime so
 # a freshly downloaded model is picked up automatically without a restart,
 # without rebuilding the (not-free) Interpreter on every single prediction.
@@ -2563,6 +2890,9 @@ def _predict_cloud_image(image_bytes):
                        else "model file unreadable")
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize(CLOUD_MODEL_IMG_SIZE)
+        mask = _trained_ai_mask()
+        if mask is not None:
+            img = _apply_ai_mask(img, mask)  # the same mask this model's training images had
         arr = np.asarray(img, dtype=np.float32)  # raw 0-255 - see docstring above
         arr = np.expand_dims(arr, axis=0)
         interpreter = cached["interpreter"]
@@ -2670,6 +3000,30 @@ def poll_cloud_model():
         sensor_state["cloud_model_last_predict"] = time.time()
 
 
+def _job_mask_path(job_id):
+    """Where _start_cloud_training() keeps the mask a job's images were
+    blacked out with (job ids come from the training server, so only
+    filename-safe characters are kept)."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(job_id))
+    return os.path.join(CLOUD_JOB_MASKS_DIR, f"{safe}.png")
+
+
+def _keep_job_mask_with_model(job_id):
+    """Called right after a job's model is downloaded: moves the mask that
+    job trained with next to the model (CLOUD_MODEL_MASK_PATH), or removes
+    any older one if the job trained without a mask, so live prediction
+    always matches the model. Returns the mask's version, or None."""
+    src = _job_mask_path(job_id)
+    if os.path.isfile(src):
+        with open(src, "rb") as f:
+            version = _ai_mask_version(f.read())
+        os.replace(src, CLOUD_MODEL_MASK_PATH)
+        return version
+    if os.path.exists(CLOUD_MODEL_MASK_PATH):
+        os.remove(CLOUD_MODEL_MASK_PATH)
+    return None
+
+
 def _start_cloud_training(triggered_by="manual"):
     """Kicks off a training job on the configured cloud-training-server:
     uploads a zip of every labeled sample NOT already absorbed into a
@@ -2698,8 +3052,9 @@ def _start_cloud_training(triggered_by="manual"):
         return False, "No cloud training server API key configured - set one under Settings → AI Learning."
 
     _ai_index_copy("cloud-train")
+    mask, mask_png = _active_ai_mask()
     zip_buf, labeled_count, sample_ids = _ai_training_export_zip(
-        only_untrained=True, resize_max_dim=CLOUD_UPLOAD_RESIZE_MAX_DIM)
+        only_untrained=True, resize_max_dim=CLOUD_UPLOAD_RESIZE_MAX_DIM, mask=mask)
     if labeled_count == 0:
         return False, ("No newly labeled samples to train on - either classify more on the Classify page, "
                         "or every classified sample has already been absorbed into a previous cloud training run.")
@@ -2720,6 +3075,19 @@ def _start_cloud_training(triggered_by="manual"):
             return False, "Cloud training server accepted the request but didn't return a job ID."
     except Exception as e:
         return False, f"Could not start a job on the cloud training server: {e}"
+
+    # Keep the mask these images were blacked out with, under this job's id,
+    # until its model is downloaded (see _keep_job_mask_with_model()) - a
+    # file rather than memory, since a job can be resumed after a restart.
+    # Older jobs' leftovers (failed/cancelled runs) are dropped first.
+    try:
+        shutil.rmtree(CLOUD_JOB_MASKS_DIR, ignore_errors=True)
+        if mask_png:
+            os.makedirs(CLOUD_JOB_MASKS_DIR, exist_ok=True)
+            with open(_job_mask_path(job_id), "wb") as f:
+                f.write(mask_png)
+    except Exception as e:
+        return False, f"Could not save the AI mask for this training run: {e}"
 
     zip_bytes = zip_buf.getvalue()
     now = time.time()
@@ -2933,9 +3301,10 @@ def _poll_cloud_job_to_completion(server_url, api_key, job_id, sample_count, sam
                 with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
                     zf.extract("model.tflite", CLOUD_MODEL_DIR)
                     zf.extract("classes.json", CLOUD_MODEL_DIR)
+                mask_version = _keep_job_mask_with_model(job_id)
                 classes = status.get("classes") or []
                 meta = {"trained_at": time.time(), "sample_count": sample_count,
-                        "job_id": job_id, "classes": classes}
+                        "job_id": job_id, "classes": classes, "mask_version": mask_version}
                 tmp = CLOUD_MODEL_META_PATH + ".tmp"
                 with open(tmp, "w") as f:
                     json.dump(meta, f, indent=2)
@@ -11201,6 +11570,95 @@ def ai_cancel_cloud_job():
     return jsonify({"ok": True, **_load_cloud_job_state()})
 
 
+@app.route("/ai-mask-sample", methods=["GET"])
+def ai_mask_sample():
+    """The frame the AI Mask editor draws on, scaled down to at most
+    AI_MASK_EDIT_MAX_DIM on its long edge: ?id=<sample id> for a captured
+    training image, otherwise the current All Sky frame (falling back to
+    the newest captured image when the camera can't be read)."""
+    image_bytes = None
+    sid = request.args.get("id", "")
+    idx = _load_ai_training_index()
+    if sid and sid != "latest":
+        sample = next((s for s in idx["samples"] if s.get("id") == sid), None)
+        if not sample or not sample.get("image"):
+            return ("That image isn't on this Pi any more.", 404)
+        path = os.path.join(AI_TRAINING_IMAGES_DIR, sample["image"])
+    else:
+        image_bytes = _fetch_current_allsky_bytes()
+        path = None
+        if image_bytes is None:
+            newest = sorted((s for s in idx["samples"] if s.get("image") and not _is_imported_sample(s)),
+                            key=_ai_cursor_key, reverse=True)
+            if not newest:
+                return ("No All Sky frame available - check Settings → All Sky Camera.", 404)
+            path = os.path.join(AI_TRAINING_IMAGES_DIR, newest[0]["image"])
+    try:
+        img = Image.open(path) if path else Image.open(io.BytesIO(image_bytes))
+        img = img.convert("RGB")
+        img.thumbnail((AI_MASK_EDIT_MAX_DIM, AI_MASK_EDIT_MAX_DIM), Image.LANCZOS)
+    except Exception as e:
+        return (f"Couldn't read that frame: {e}", 404)
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    out.seek(0)
+    resp = send_file(out, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/ai-mask-brush.png", methods=["GET"])
+def ai_mask_brush():
+    """The saved brush layer, so the editor can show and keep editing it."""
+    if not os.path.isfile(AI_MASK_BRUSH_PATH):
+        return ("No brush strokes saved.", 404)
+    resp = send_file(AI_MASK_BRUSH_PATH, mimetype="image/png")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/ai-mask-save", methods=["POST"])
+def ai_mask_save():
+    """Saves the AI Mask editor's drawing - see _save_ai_mask()."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Nothing to save."})
+    try:
+        status = _save_ai_mask(data)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Couldn't save the mask: {e}"})
+    _log_event("Settings", f"AI Mask saved ({'on' if status['enabled'] else 'off'}, "
+                            f"{status['coverage_pct']}% blacked out)")
+    return jsonify({"ok": True, **status})
+
+
+@app.route("/ai-mask-find", methods=["GET"])
+def ai_mask_find():
+    """The editor's "Find circle automatically" (?what=circle) and "Find
+    overlay text" (?what=text) buttons, worked out from recent captured
+    frames at the editor's size (?w=&h=)."""
+    try:
+        w, h = int(request.args.get("w", 0)), int(request.args.get("h", 0))
+    except ValueError:
+        w = h = 0
+    if not (16 <= w <= AI_MASK_MAX_DIM and 16 <= h <= AI_MASK_MAX_DIM):
+        return jsonify({"ok": False, "error": "Bad editor size."})
+    frames = _ai_mask_recent_frames((w, h))
+    if not frames:
+        return jsonify({"ok": False, "error": "No captured All Sky images to work from yet."})
+    if request.args.get("what") == "text":
+        box = _ai_mask_find_text(frames)
+        if not box:
+            return jsonify({"ok": False, "error": "No overlay text found - draw a box over it instead."})
+        return jsonify({"ok": True, "box": box, "frames": len(frames)})
+    circle = _ai_mask_find_circle(frames)
+    if not circle:
+        return jsonify({"ok": False, "error": "Couldn't find the lens circle - drag it into place instead."})
+    return jsonify({"ok": True, "circle": circle, "frames": len(frames)})
+
+
 def _safe_export_folder_name(label):
     """Label text is free-form (Settings -> AI Learning -> label list), so
     turn it into something safe to use as a zip folder name rather than
@@ -11210,7 +11668,7 @@ def _safe_export_folder_name(label):
     return cleaned or "Unlabeled"
 
 
-def _ai_training_export_zip(only_untrained=False, resize_max_dim=None):
+def _ai_training_export_zip(only_untrained=False, resize_max_dim=None, mask=None):
     """Builds an in-memory .zip of labeled AI Learning samples, one folder
     per label (Clear/, Cloudy/, ...) - the same folder-per-class layout
     Teachable Machine's own image uploader expects, so the export can be
@@ -11243,6 +11701,12 @@ def _ai_training_export_zip(only_untrained=False, resize_max_dim=None):
     that image at its original size rather than dropping it - the point
     is a smaller upload, never a smaller training set.
 
+    mask, when set (the cloud-training upload passes the saved AI Mask
+    while it's switched on - see _active_ai_mask()), blacks out the masked
+    areas of each zipped copy, after the resize. Unlike a resize failure,
+    an image that can't be masked is left out: sending it unmasked would
+    teach the model from exactly what the mask is there to hide.
+
     Returns (zip_bytes_io, sample_count, sample_ids) - sample_ids lists
     exactly which samples actually made it into the zip (skipping any
     with a missing/already-deleted image file), for the caller to record
@@ -11264,21 +11728,26 @@ def _ai_training_export_zip(only_untrained=False, resize_max_dim=None):
             folder = _safe_export_folder_name(sample["label"])
             arcname = f"{folder}/{sample['id']}.jpg"
             wrote_resized = False
-            if resize_max_dim:
+            if resize_max_dim or mask is not None:
                 try:
                     with Image.open(src) as img:
                         img = img.convert("RGB")
                         w, h = img.size
                         longest = max(w, h)
-                        if longest > resize_max_dim:
+                        if resize_max_dim and longest > resize_max_dim:
                             scale = resize_max_dim / float(longest)
                             img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
                                               Image.LANCZOS)
+                        if mask is not None:
+                            img = _apply_ai_mask(img, mask)
                         out = io.BytesIO()
                         img.save(out, format="JPEG", quality=85)
                         zf.writestr(arcname, out.getvalue())
                         wrote_resized = True
                 except Exception as e:
+                    if mask is not None:
+                        print(f"[ai-learning] export: failed to mask {image_name}, leaving it out - {e}")
+                        continue
                     print(f"[ai-learning] export: failed to resize {image_name} for upload, using "
                           f"the original size instead - {e}")
             if not wrote_resized:
@@ -12144,6 +12613,439 @@ def _ai_sensor_details_html(sample):
             f'<table>{rows}</table></details>')
 
 
+def _ai_mask_row_html(status):
+    """AI Models -> AI Cloud Detect's "AI Mask" row."""
+    if not status["saved"]:
+        state = "Not set up"
+    elif status["enabled"]:
+        state = f"On &middot; {status['coverage_pct']}% blacked out"
+    else:
+        state = "Off"
+    if status["changed_since_training"]:
+        state += (' &middot; <span class="msk-warn-text">differs from the trained model &mdash; '
+                  'reset and train again to use it</span>')
+    return state + ' &middot; <a href="#mask" onclick="clsShow(\'mask\');return false;">edit</a>'
+
+
+# The Classify page's "AI Mask" pane - plain (non f-string) so its CSS/JS
+# braces stay readable; __INIT__ is replaced with the page's starting data.
+_AI_MASK_PANE_TEMPLATE = """
+<style>
+.msk-editor{display:grid;grid-template-columns:minmax(0,600px) 250px;gap:18px;align-items:start;margin-top:10px;}
+@media (max-width:900px){.msk-editor{grid-template-columns:minmax(0,1fr);}}
+.msk-stage{display:grid;gap:8px;min-width:0;}
+.msk-stage canvas{width:100%;max-width:600px;height:auto;border-radius:8px;background:#000;touch-action:none;cursor:crosshair;display:block;}
+.msk-tools{display:grid;gap:12px;min-width:0;}
+.msk-toolset{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:6px;}
+.msk-tool{border:1px solid #e3e6ea;background:#fff;border-radius:8px;padding:8px 10px;text-align:left;cursor:pointer;font:inherit;color:#1f2328;display:grid;gap:2px;}
+.msk-tool b{font-size:13px;}
+.msk-tool span{font-size:11.5px;color:#6a7178;}
+.msk-tool[aria-pressed="true"]{border-color:#0f766e;background:#dcefec;}
+.msk-seg{display:inline-flex;border:1px solid #c9ced6;border-radius:8px;overflow:hidden;}
+.msk-seg button{border:0;background:#fff;padding:7px 12px;font:inherit;font-size:13px;cursor:pointer;color:#1f2328;}
+.msk-seg button[aria-pressed="true"]{background:#0f766e;color:#fff;}
+.msk-inl{display:flex;gap:8px;align-items:center;font-size:13px;}
+.msk-list{display:grid;gap:4px;font-size:12.5px;font-variant-numeric:tabular-nums;}
+.msk-list div{display:flex;justify-content:space-between;gap:8px;background:#f2f4f7;border-radius:6px;padding:5px 8px;}
+.msk-list button{border:0;background:none;color:#c62828;cursor:pointer;font:inherit;font-size:12px;}
+.msk-pill{border-radius:9px;padding:2px 9px;font-size:12px;font-weight:600;background:#eceff1;color:#5f6368;}
+.msk-pill.on{background:#e6f4ea;color:#1a7f37;}
+.msk-note{border-radius:8px;padding:8px 10px;font-size:12.5px;line-height:1.45;}
+.msk-note.warn{background:#fff4e0;color:#9a6300;}
+.msk-note.ok{background:#e6f4ea;color:#1a7f37;}
+.msk-note.err{background:#fdecea;color:#c62828;}
+.msk-warn-text{color:#9a6300;}
+</style>
+<div class="cls-title"><span>⬛ AI Mask</span></div>
+<p class="hint">Areas painted here are turned black before <b>AI Cloud Detect (All Sky)</b> looks at a frame &mdash;
+use it to hide overlay text, the area outside the lens, trees, buildings or a dew heater ring. Training uploads
+use the saved mask, and live prediction always uses the mask the current model was trained with, so a change
+here takes effect live after the next training run. Saved images, the dashboard, simpleCloudDetect and the
+Allsky gallery are not changed.</p>
+<div class="cls-row"><span class="msk-pill" id="mskPill"></span><span class="hint" id="mskSummary" style="margin:0"></span></div>
+<div class="msk-note" id="mskTrained"></div>
+<div class="msk-editor">
+  <div class="msk-stage">
+    <canvas id="mskCanvas" width="600" height="600" aria-label="All Sky frame with the mask drawn on it"></canvas>
+    <div class="cls-row" style="justify-content:space-between;margin:0">
+      <div class="msk-seg" role="group" aria-label="View">
+        <button type="button" id="mskViewEdit" aria-pressed="true">Editing view</button>
+        <button type="button" id="mskViewAi" aria-pressed="false">What the AI sees</button>
+      </div>
+      <span class="hint" id="mskSampleLabel" style="margin:0"></span>
+    </div>
+    <div class="cls-row" style="margin:0">
+      <button type="button" class="btn btn-sec" id="mskLatest">Use latest frame</button>
+      <span class="hint" style="margin:0">or open an image in 🏷️ Classify samples (one-by-one view) and press
+      <b>Use as mask sample</b>.</span>
+    </div>
+  </div>
+  <div class="msk-tools">
+    <div class="msk-toolset" role="group" aria-label="Mask tools">
+      <button type="button" class="msk-tool" data-tool="circle" aria-pressed="true"><b>Sky circle</b><span>Drag the centre or the edge</span></button>
+      <button type="button" class="msk-tool" data-tool="box" aria-pressed="false"><b>Box</b><span>Drag to black out an area</span></button>
+      <button type="button" class="msk-tool" data-tool="brush" aria-pressed="false"><b>Brush</b><span>Paint over trees or buildings</span></button>
+      <button type="button" class="msk-tool" data-tool="erase" aria-pressed="false"><b>Eraser</b><span>Paint sky back in</span></button>
+    </div>
+    <label class="msk-inl" for="mskBrushSize">Brush size <input type="range" id="mskBrushSize" min="4" max="60" value="16">
+      <span class="hint" id="mskBrushVal" style="margin:0">16 px</span></label>
+    <label class="msk-inl"><input type="checkbox" id="mskUseCircle"> Black out everything outside the sky circle</label>
+    <div class="cls-row" style="margin:0">
+      <button type="button" class="btn btn-sec" id="mskFindCircle">Find circle automatically</button>
+      <button type="button" class="btn btn-sec" id="mskFindText">Find overlay text</button>
+      <button type="button" class="btn btn-sec" id="mskUndo">Undo</button>
+      <button type="button" class="btn ai-delete-btn" id="mskClear">Clear mask</button>
+    </div>
+    <div class="msk-list" id="mskList" aria-live="polite"></div>
+    <div class="msk-note" id="mskMsg" hidden></div>
+    <div class="cls-row" style="margin:0">
+      <button type="button" class="btn" id="mskSave">Save mask</button>
+      <label class="msk-inl"><input type="checkbox" id="mskEnabled"> Use the mask</label>
+    </div>
+  </div>
+</div>
+<script type="application/json" id="mskInit">__INIT__</script>
+<script>
+(function () {
+  const init = JSON.parse(document.getElementById('mskInit').textContent);
+  const cv = document.getElementById('mskCanvas'), ctx = cv.getContext('2d');
+  const paint = document.createElement('canvas'), pctx = paint.getContext('2d');
+  const img = new Image();
+  const $ = id => document.getElementById(id);
+  const meta = init.meta;
+
+  let W = meta ? meta.width : 0, H = meta ? meta.height : 0;
+  let state = {
+    useCircle: meta ? !!meta.use_circle : false,
+    circle: meta && meta.circle ? Object.assign({}, meta.circle) : null,
+    boxes: meta ? (meta.boxes || []).map(b => Object.assign({}, b)) : []
+  };
+  let enabled = meta ? !!meta.enabled : true;
+  let status = init.status, tool = 'circle', view = 'edit', drag = null, undo = [], dirty = false, ready = false;
+
+  function setSize(w, h) {
+    W = w; H = h;
+    cv.width = paint.width = W;
+    cv.height = paint.height = H;
+    cv.style.aspectRatio = W + ' / ' + H;
+    if (!state.circle) {
+      state.circle = {x: Math.round(W / 2), y: Math.round(H / 2), r: Math.round(Math.min(W, H) * 0.45)};
+    }
+  }
+
+  function loadSample(id) {
+    $('mskSampleLabel').textContent = 'Loading frame…';
+    img.onload = () => {
+      if (!W) setSize(img.naturalWidth, img.naturalHeight);
+      $('mskSampleLabel').textContent = id && id !== 'latest' ? 'Sample: classified image ' + id : 'Sample: latest frame';
+      ready = true;
+      draw();
+    };
+    img.onerror = () => {
+      $('mskSampleLabel').textContent = '';
+      say('err', 'No frame to draw on. Check Settings → All Sky Camera, or pick a classified image.');
+    };
+    img.src = '/ai-mask-sample?id=' + encodeURIComponent(id || 'latest') + '&t=' + Date.now();
+  }
+
+  const snapshot = () => {
+    if (!W) return;
+    undo.push({s: JSON.parse(JSON.stringify(state)), p: pctx.getImageData(0, 0, W, H)});
+    if (undo.length > 40) undo.shift();
+  };
+
+  function maskCanvas() {
+    const m = document.createElement('canvas');
+    m.width = W; m.height = H;
+    const c = m.getContext('2d');
+    c.fillStyle = '#000';
+    if (state.useCircle && state.circle) {
+      c.fillRect(0, 0, W, H);
+      c.globalCompositeOperation = 'destination-out';
+      c.beginPath(); c.arc(state.circle.x, state.circle.y, state.circle.r, 0, Math.PI * 2); c.fill();
+      c.globalCompositeOperation = 'source-over';
+    }
+    state.boxes.forEach(b => c.fillRect(b.x, b.y, b.w, b.h));
+    c.drawImage(paint, 0, 0);
+    return m;
+  }
+
+  function draw() {
+    if (!ready) return;
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(img, 0, 0, W, H);
+    const m = maskCanvas();
+    if (view === 'ai') {
+      ctx.drawImage(m, 0, 0);
+    } else {
+      const t = document.createElement('canvas');
+      t.width = W; t.height = H;
+      const tc = t.getContext('2d');
+      tc.drawImage(m, 0, 0);
+      tc.globalCompositeOperation = 'source-in';
+      tc.fillStyle = 'rgba(214,40,40,0.55)';
+      tc.fillRect(0, 0, W, H);
+      ctx.drawImage(t, 0, 0);
+      if (state.circle) {
+        ctx.strokeStyle = state.useCircle ? '#ffd60a' : 'rgba(255,214,10,0.45)';
+        ctx.lineWidth = 2; ctx.setLineDash([6, 5]);
+        ctx.beginPath(); ctx.arc(state.circle.x, state.circle.y, state.circle.r, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.beginPath(); ctx.arc(state.circle.x, state.circle.y, 5, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+      state.boxes.forEach(b => ctx.strokeRect(b.x + .5, b.y + .5, b.w - 1, b.h - 1));
+      if (drag && drag.kind === 'newbox') {
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(drag.x0, drag.y0, drag.x1 - drag.x0, drag.y1 - drag.y0);
+        ctx.setLineDash([]);
+      }
+    }
+    renderList(m);
+  }
+
+  function renderList(m) {
+    const el = $('mskList');
+    el.innerHTML = '';
+    if (state.useCircle && state.circle) {
+      const d = document.createElement('div');
+      d.textContent = 'Sky circle: centre (' + state.circle.x + ', ' + state.circle.y + '), radius ' + state.circle.r + ' px';
+      el.appendChild(d);
+    }
+    state.boxes.forEach((b, i) => {
+      const d = document.createElement('div');
+      const s = document.createElement('span');
+      s.textContent = 'Box ' + (i + 1) + (b.auto ? ' (overlay text)' : '') + ': ' + b.x + ', ' + b.y + ', ' + b.w + ' × ' + b.h + ' px';
+      const x = document.createElement('button');
+      x.type = 'button'; x.textContent = 'Remove';
+      x.onclick = () => { snapshot(); state.boxes.splice(i, 1); changed(); };
+      d.appendChild(s); d.appendChild(x); el.appendChild(d);
+    });
+    // Same measure as the Pi's: share of the sky circle (or whole frame) blacked out.
+    const data = m.getContext('2d').getImageData(0, 0, W, H).data;
+    let total = 0, hidden = 0;
+    const c = state.circle, inCircle = state.useCircle && c;
+    for (let y = 0; y < H; y += 2) {
+      for (let x = 0; x < W; x += 2) {
+        if (inCircle && Math.hypot(x - c.x, y - c.y) > c.r) continue;
+        total++;
+        if (data[(y * W + x) * 4 + 3] >= 128) hidden++;
+      }
+    }
+    const pct = total ? Math.round(hidden * 100 / total) : 0;
+    $('mskSummary').textContent = pct + '% of the ' + (inCircle ? 'sky circle' : 'frame') + ' blacked out' +
+      (dirty ? ' · unsaved changes' : '');
+  }
+
+  function renderStatus() {
+    const pill = $('mskPill');
+    pill.textContent = !status.saved ? 'Not set up' : (status.enabled ? 'Mask on' : 'Mask off');
+    pill.className = 'msk-pill' + (status.saved && status.enabled ? ' on' : '');
+    const t = $('mskTrained');
+    if (status.changed_since_training === null) {
+      t.className = 'msk-note';
+      t.textContent = 'No AI Cloud Detect model yet. The next training run uses the saved mask.';
+    } else if (status.changed_since_training) {
+      t.className = 'msk-note warn';
+      t.textContent = 'The current AI Cloud Detect model was trained with a different mask (or none), and live ' +
+        'prediction keeps using that one until the model is retrained. To train on every image with the saved ' +
+        'mask: 🤖 AI Models → Reset cloud model, then Train via cloud server.';
+    } else {
+      t.className = 'msk-note ok';
+      t.textContent = status.enabled ? 'The current model was trained with this mask.'
+                                     : 'The current model was trained without a mask, matching this setting.';
+    }
+    $('mskEnabled').checked = enabled;
+    $('mskUseCircle').checked = state.useCircle;
+  }
+
+  function say(kind, text) {
+    const el = $('mskMsg');
+    el.hidden = !text;
+    el.className = 'msk-note ' + kind;
+    el.textContent = text || '';
+  }
+
+  function changed() {
+    dirty = true;
+    say('', '');
+    draw();
+  }
+
+  function pos(e) {
+    const r = cv.getBoundingClientRect();
+    return {x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height};
+  }
+
+  function stroke(p) {
+    const size = +$('mskBrushSize').value * W / cv.getBoundingClientRect().width;
+    pctx.globalCompositeOperation = tool === 'erase' ? 'destination-out' : 'source-over';
+    pctx.fillStyle = pctx.strokeStyle = '#000';
+    pctx.lineCap = 'round';
+    pctx.lineWidth = size;
+    pctx.beginPath();
+    if (drag.last) {
+      pctx.moveTo(drag.last.x, drag.last.y); pctx.lineTo(p.x, p.y); pctx.stroke();
+    } else {
+      pctx.arc(p.x, p.y, size / 2, 0, Math.PI * 2); pctx.fill();
+    }
+    drag.last = p;
+  }
+
+  cv.addEventListener('pointerdown', e => {
+    if (!ready || view === 'ai') return;
+    cv.setPointerCapture(e.pointerId);
+    const p = pos(e);
+    snapshot();
+    if (tool === 'circle') {
+      const d = Math.hypot(p.x - state.circle.x, p.y - state.circle.y);
+      const edge = 14 * W / cv.getBoundingClientRect().width;
+      drag = Math.abs(d - state.circle.r) < edge ? {kind: 'resize'}
+                                                : {kind: 'move', dx: p.x - state.circle.x, dy: p.y - state.circle.y};
+      state.useCircle = true;
+      $('mskUseCircle').checked = true;
+    } else if (tool === 'box') {
+      drag = {kind: 'newbox', x0: p.x, y0: p.y, x1: p.x, y1: p.y};
+    } else {
+      drag = {kind: 'paint', last: null};
+      stroke(p);
+    }
+    changed();
+  });
+
+  cv.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const p = pos(e);
+    if (drag.kind === 'move') {
+      state.circle.x = Math.round(p.x - drag.dx);
+      state.circle.y = Math.round(p.y - drag.dy);
+    } else if (drag.kind === 'resize') {
+      state.circle.r = Math.max(20, Math.round(Math.hypot(p.x - state.circle.x, p.y - state.circle.y)));
+    } else if (drag.kind === 'newbox') {
+      drag.x1 = p.x; drag.y1 = p.y;
+    } else {
+      stroke(p);
+    }
+    draw();
+  });
+
+  const endDrag = () => {
+    if (drag && drag.kind === 'newbox') {
+      const x = Math.max(0, Math.round(Math.min(drag.x0, drag.x1))), y = Math.max(0, Math.round(Math.min(drag.y0, drag.y1)));
+      const w = Math.round(Math.abs(drag.x1 - drag.x0)), h = Math.round(Math.abs(drag.y1 - drag.y0));
+      if (w > 3 && h > 3) state.boxes.push({x, y, w, h});
+    }
+    drag = null;
+    draw();
+  };
+  cv.addEventListener('pointerup', endDrag);
+  cv.addEventListener('pointercancel', endDrag);
+
+  document.querySelectorAll('.msk-tool').forEach(b => b.addEventListener('click', () => {
+    tool = b.dataset.tool;
+    document.querySelectorAll('.msk-tool').forEach(x => x.setAttribute('aria-pressed', x === b));
+  }));
+
+  const setView = v => {
+    view = v;
+    $('mskViewEdit').setAttribute('aria-pressed', v === 'edit');
+    $('mskViewAi').setAttribute('aria-pressed', v === 'ai');
+    cv.style.cursor = v === 'ai' ? 'default' : 'crosshair';
+    draw();
+  };
+  $('mskViewEdit').onclick = () => setView('edit');
+  $('mskViewAi').onclick = () => setView('ai');
+  $('mskBrushSize').oninput = e => { $('mskBrushVal').textContent = e.target.value + ' px'; };
+  $('mskUseCircle').onchange = e => { snapshot(); state.useCircle = e.target.checked; changed(); };
+  $('mskEnabled').onchange = e => { enabled = e.target.checked; changed(); };
+  $('mskLatest').onclick = () => loadSample('latest');
+
+  function find(what) {
+    if (!ready) return;
+    say('', 'Looking at recent frames…');
+    $('mskMsg').hidden = false;
+    fetch('/ai-mask-find?what=' + what + '&w=' + W + '&h=' + H).then(r => r.json()).then(d => {
+      if (!d.ok) { say('err', d.error); return; }
+      snapshot();
+      if (what === 'circle') {
+        state.circle = d.circle;
+        state.useCircle = true;
+      } else {
+        state.boxes = state.boxes.filter(b => !b.auto);
+        state.boxes.unshift(Object.assign({auto: true}, d.box));
+      }
+      changed();
+      $('mskUseCircle').checked = state.useCircle;
+      say('ok', (what === 'circle' ? 'Circle' : 'Overlay text') + ' found from ' + d.frames + ' recent frames. Check it, then Save mask.');
+    }).catch(() => say('err', 'Could not reach the Pi.'));
+  }
+  $('mskFindCircle').onclick = () => find('circle');
+  $('mskFindText').onclick = () => find('text');
+
+  $('mskUndo').onclick = () => {
+    const u = undo.pop();
+    if (!u) return;
+    state = u.s;
+    pctx.putImageData(u.p, 0, 0);
+    $('mskUseCircle').checked = state.useCircle;
+    changed();
+  };
+  $('mskClear').onclick = () => {
+    snapshot();
+    state.boxes = [];
+    state.useCircle = false;
+    pctx.clearRect(0, 0, W, H);
+    $('mskUseCircle').checked = false;
+    changed();
+  };
+
+  function brushPainted() {
+    const d = pctx.getImageData(0, 0, W, H).data;
+    for (let i = 3; i < d.length; i += 4) if (d[i]) return true;
+    return false;
+  }
+
+  $('mskSave').onclick = () => {
+    if (!W) return;
+    const body = {width: W, height: H, enabled, use_circle: state.useCircle, circle: state.circle,
+                  boxes: state.boxes, brush: brushPainted() ? paint.toDataURL('image/png') : ''};
+    say('', 'Saving…');
+    $('mskMsg').hidden = false;
+    fetch('/ai-mask-save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+      .then(r => r.json()).then(d => {
+        if (!d.ok) { say('err', d.error); return; }
+        status = d;
+        dirty = false;
+        renderStatus();
+        draw();
+        say('ok', d.changed_since_training ? 'Mask saved. It is used from the next training run.'
+                                           : 'Mask saved.');
+      }).catch(() => say('err', 'Could not reach the Pi - the mask was not saved.'));
+  };
+
+  window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+  if (W) setSize(W, H);
+  renderStatus();
+  if (meta && init.brush) {
+    const b = new Image();
+    b.onload = () => { pctx.drawImage(b, 0, 0, W, H); draw(); };
+    b.src = init.brush + '?t=' + Date.now();
+  }
+  loadSample(init.sample);
+})();
+</script>
+"""
+
+
+def _ai_mask_pane_html(status, sample_id):
+    """The Classify page's AI Mask pane (see _AI_MASK_PANE_TEMPLATE)."""
+    init = {"meta": _load_ai_mask_meta(), "status": status, "sample": sample_id or "latest",
+            "brush": "/ai-mask-brush.png" if os.path.isfile(AI_MASK_BRUSH_PATH) else None}
+    return _AI_MASK_PANE_TEMPLATE.replace("__INIT__", json.dumps(init).replace("</", "<\\/"))
+
+
 def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
     """The one-by-one view's card - the same info as a grid card, but one
     at a time and at full size, since the whole point of this view is
@@ -12180,6 +13082,8 @@ def _render_ai_classify_single_card(sample, tz, position, total, label_classes):
   <div class="ai-single-actions">
     {'<button type="button" class="btn ai-unclassify-btn" onclick="unclassifySingle()">↩ Unclassify</button>' if label else ''}
     <button type="button" class="btn ai-delete-btn" onclick="deleteSingle()">🗑 Delete this image</button>
+    {f'<a class="btn btn-sec" href="/ai-classify?mask_sample={urllib.parse.quote(sid)}#mask">⬛ Use as mask sample</a>'
+     if sample.get("image") else ''}
   </div>
 </div>"""
 
@@ -12778,6 +13682,7 @@ def ai_classify_page():
         cloud_used = "<b>Yes</b> — actively used"
     else:
         cloud_used = "No — dashboard comparison only"
+    mask_status = _ai_mask_status()
     cloud_rows = (f'<tr><th>In SAFE/UNSAFE decision</th><td>{cloud_used} &middot; '
                   f'<a href="/settings#safety-checks">change</a></td></tr>'
                   + (f'<tr><th>No image (sensor only)</th><td>{cloud_no_image:,} &middot; classified, but the '
@@ -12785,7 +13690,8 @@ def ai_classify_page():
                   + f'<tr><th>Last run</th><td id="cloudTrainStatus">{_cloud_job_status_line(cloud_job) or "No cloud training run yet"}</td></tr>'
                   f'<tr><th>Training server / auto-train</th><td>'
                   f'{"Set up" if cloud_server_configured else "Not set up"} / {"On" if auto_train_enabled else "Off"}'
-                  f' &middot; <a href="/settings#ai-learning-settings">change</a></td></tr>')
+                  f' &middot; <a href="/settings#ai-learning-settings">change</a></td></tr>'
+                  f'<tr><th>AI Mask</th><td>{_ai_mask_row_html(mask_status)}</td></tr>')
 
     # Top strip: what each AI trains on.
     sensor_sample_total = sum(effective_counts.values())
@@ -12809,7 +13715,7 @@ def ai_classify_page():
         'training copy) appear here only when something needs fixing.</p>')
     recovery_badge = '<span class="nav-warn">⚠</span>' if recovery_inner else '<span class="nav-ok">✓</span>'
     cls_sections = [("classify", f'🏷️ Classify samples <span class="nav-n">{unlabeled_count}</span>'),
-                    ("ai", "🤖 AI Models"), ("export", "📦 Export &amp; bulk actions"),
+                    ("ai", "🤖 AI Models"), ("mask", "⬛ AI Mask"), ("export", "📦 Export &amp; bulk actions"),
                     ("recovery", f"🛟 Recovery {recovery_badge}")]
     cls_nav_html = "".join(f'<a href="#{k}" data-g="{k}">{t}</a>' for k, t in cls_sections)
     unclassify_html = ('' if view != "grid" else
@@ -13058,6 +13964,10 @@ a{{color:var(--accent);}}
            '(see <code>cloud-training-server/</code> in this repo to set that server up).</p>'}
           <p id="resizedImagesStatus" class="hint"></p>
         </div>
+      </div>
+
+      <div class="cls-pane" id="sec-mask">
+        {_ai_mask_pane_html(mask_status, request.args.get("mask_sample", ""))}
       </div>
 
       <div class="cls-pane" id="sec-export">

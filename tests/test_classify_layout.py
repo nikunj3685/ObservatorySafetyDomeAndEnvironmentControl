@@ -84,7 +84,7 @@ mod._train_ai_sky_model()
 label([f"s{i:03d}" for i in range(50, 53)], "Clear")          # 3 pending Clear
 page = get("/ai-classify")
 nav = re.search(r'<nav class="cls-nav" id="clsNav">(.*?)</nav>', page).group(1)
-ck("menu: 4 sections in order", re.findall(r'data-g="(\w+)"', nav) == ["classify", "ai", "export", "recovery"])
+ck("menu: 5 sections in order", re.findall(r'data-g="(\w+)"', nav) == ["classify", "ai", "mask", "export", "recovery"])
 ck("menu: unclassified count badge", '<span class="nav-n">19</span>' in nav)
 ck("menu: recovery OK tick", 'nav-ok">✓' in nav and "Training list OK" in page)
 ck("no old cards", "📊 Training data overview" not in page and "Classified so far, per label" not in page)
