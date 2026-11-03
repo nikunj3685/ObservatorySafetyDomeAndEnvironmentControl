@@ -9816,6 +9816,9 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .allsky-img-wrap{{width:100%;border-radius:10px;overflow:hidden;background:#14161a;min-height:140px;
   flex:none;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;}}
 .allsky-img-wrap img{{width:100%;height:100%;object-fit:cover;display:block;}}
+.allsky-img-wrap{{position:relative;}}
+.allsky-img-wrap img.ai-mask-ov{{position:absolute;inset:0;pointer-events:none;}}
+.mask-toggle{{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;margin:8px 0 0;}}
 /* All Sky + the Safety Checks History card (the old Sky History) sit
    together in their own vertical flex column (not plain grid items) so
    the history card can grow to fill exactly whatever
@@ -10055,7 +10058,9 @@ a{{color:var(--accent-safety);}}
     <img id="allskyImg" src="{allsky_img_initial_src}" alt="Latest all-sky camera image"
      onerror="this.dataset.broken='1';var s=document.getElementById('allskyStatus');if(s)s.textContent='Image failed to load — check the location under Settings → All Sky Camera.';"
      onload="if(this.dataset.broken!=='1'){{var s=document.getElementById('allskyStatus');if(s)s.textContent='Updated '+new Date().toLocaleTimeString();}} this.dataset.broken='';">
+    {'<img class="ai-mask-ov" id="aiMaskOv" alt="" hidden>' if os.path.isfile(CLOUD_MODEL_MASK_PATH) else ''}
   </div>
+  {'<label class="mask-toggle"><input type="checkbox" id="aiMaskToggle"> Show AI mask</label>' if os.path.isfile(CLOUD_MODEL_MASK_PATH) else ''}
   <p class="hint" id="allskyStatus">Loading&hellip;</p>
   {"" if not allsky_page_url else f"<p class='hint'><a href='{allsky_page_url}' target='_blank' rel='noopener'>View full All Sky page &rarr;</a></p>"}
 </div>
@@ -10809,6 +10814,15 @@ setInterval(refreshSkyHistory, 60000);
 // nothing here touches any check or the SAFE/UNSAFE result. The banners in
 // #warningBanner are re-rendered by poll() every few seconds, hence the
 // MutationObserver rather than a one-off pass.
+// All Sky: show/hide the AI mask the current AI Cloud Detect model uses (remembered per browser).
+(function(){{
+  var t=document.getElementById('aiMaskToggle'), ov=document.getElementById('aiMaskOv');
+  if(!t||!ov) return;
+  function show(on){{ ov.hidden=!on; if(on && !ov.getAttribute('src')) ov.src='/ai-mask-overlay.png?'+Date.now(); }}
+  var on=false; try{{ on=localStorage.getItem('showAiMask')==='1'; }}catch(e){{}}
+  t.checked=on; show(on);
+  t.addEventListener('change',function(){{ try{{ localStorage.setItem('showAiMask', t.checked?'1':'0'); }}catch(e){{}} show(t.checked); }});
+}})();
 // Info tooltips open below the (i) icon, or above it when there isn't room below.
 (function(){{
   function place(i){{
@@ -11233,6 +11247,11 @@ def ai_training_image(name):
 AI_PERIODS = ("both", "day", "night")
 
 
+def _ai_exclude_arg():
+    """Select ALL minus the images unticked on the page (`exclude=id,id`)."""
+    return {i for i in request.args.get("exclude", "").split(",") if i}
+
+
 def _ai_period_arg():
     """Classify page's Day / Night filter from the request: "both" (default,
     everything), "day" or "night"."""
@@ -11314,7 +11333,8 @@ def ai_classify_save():
     all_filter = request.args.get("all")
     idx = _load_ai_training_index()
     if _ai_bulk_filter_ok(all_filter):
-        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg())]
+        ex = _ai_exclude_arg()
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg()) if s["id"] not in ex]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids or not label:
@@ -11387,7 +11407,8 @@ def ai_classify_unclassify():
     all_filter = request.args.get("all")
     idx = _load_ai_training_index()
     if _ai_bulk_filter_ok(all_filter):
-        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg())]
+        ex = _ai_exclude_arg()
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg()) if s["id"] not in ex]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids:
@@ -11604,6 +11625,24 @@ def ai_mask_sample():
     out.seek(0)
     resp = send_file(out, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/ai-mask-overlay.png", methods=["GET"])
+def ai_mask_overlay_png():
+    """Dashboard -> All Sky -> Show AI mask: the mask the current AI Cloud
+    Detect model uses, as a see-through red layer (masked = shaded)."""
+    mask = _trained_ai_mask()
+    if mask is None:
+        return ("No AI mask is in use", 404)
+    alpha = mask.point(lambda v: 110 if v >= 128 else 0)
+    layer = Image.new("RGBA", mask.size, (220, 38, 38, 0))
+    layer.putalpha(alpha)
+    buf = io.BytesIO()
+    layer.save(buf, "PNG")
+    buf.seek(0)
+    resp = send_file(buf, mimetype="image/png")
+    resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
@@ -11851,7 +11890,8 @@ def ai_classify_delete():
     all_filter = request.args.get("all")
     if _ai_bulk_filter_ok(all_filter):
         idx = _load_ai_training_index()
-        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg())]
+        ex = _ai_exclude_arg()
+        ids = [s["id"] for s in _ai_samples_matching_filter(idx, all_filter, _ai_period_arg()) if s["id"] not in ex]
     else:
         ids = [i for i in request.args.get("ids", "").split(",") if i]
     if not ids:
@@ -13298,8 +13338,8 @@ def ai_classify_page():
     # server-side, see /ai-classify-save and /ai-classify-delete), not just
     # whatever happens to be checked in the DOM.
     select_all_matching_html = (
-        f'<button type="button" class="btn" onclick="selectAllMatching(\'{show}\', {total_filtered})">'
-        f'Select ALL ({total_filtered})</button>'
+        f'<button type="button" class="btn" id="selAllBtn" onclick="selectAllMatching(\'{show}\', aiFilteredTotal)">'
+        f'Select ALL (<span id="selAllN">{total_filtered}</span>)</button>'
         if total_filtered else
         '<span class="btn ai-nav-btn-disabled">Select ALL (0)</span>')
     grid_controls_html = ('<button type="button" class="btn" onclick="selectAll(true)">Select all shown</button>'
@@ -13606,13 +13646,14 @@ def ai_classify_page():
     tr_night = (variants.get("night") or {}).get("class_counts") or {}
     sensor_labels = [c for c in label_classes if c.strip().lower() != "ignore"]
     sensor_labels += [c for c in list(tr_all) + list(effective_counts) if c not in sensor_labels]
-    s_rows, s_pend_total = "", 0
+    s_rows, s_pend_total, s_pend_by = "", 0, {}
     for c in sensor_labels:
         cur, t = effective_counts.get(c, 0), tr_all.get(c, 0)
         pend = max(0, cur - t)
         s_pend_total += pend
         tcell = (f'<td class="num low">{cur}/{AI_MODEL_MIN_SAMPLES_PER_CLASS}</td>'
                  if cur < AI_MODEL_MIN_SAMPLES_PER_CLASS else _num(t))
+        s_pend_by[c] = pend
         s_rows += f"<tr><td>{_html_escape(c)}</td>{_num(tr_day.get(c, 0))}{_num(tr_night.get(c, 0))}{tcell}{_pend(pend)}</tr>"
     s_d = (variants.get("day") or {}).get("sample_count", 0) if ai_model else 0
     s_n = (variants.get("night") or {}).get("sample_count", 0) if ai_model else 0
@@ -13674,6 +13715,33 @@ def ai_classify_page():
                  'Unlike the sensor model, '
                  '&ldquo;Ignore&rdquo; is a class here (it learns to spot bad frames). Imported images are included; '
                  'they have no Day/Night, so they only count in Total.</p>')
+    # Classify samples "?" table: classified images per label (Day / Night
+    # / Total), the unclassified ones, and Pending = not yet in a trained
+    # model (sensor model or AI Cloud Detect, whichever is behind).
+    cls_counts = {}
+    for smp in all_samples:
+        lbl = smp.get("label") or None
+        row = cls_counts.setdefault(lbl, [0, 0, 0])
+        dn = (smp.get("sensors") or {}).get("daynight")
+        row[0] += dn == "Day"
+        row[1] += dn == "Night"
+        row[2] += 1
+    k_labels = list(label_classes) + [c for c in cls_counts if c and c not in label_classes]
+    k_rows, k_tot, k_pend_tot = "", [0, 0, 0], 0
+    for c in k_labels:
+        d, n, t = cls_counts.get(c, [0, 0, 0])
+        pend = max(s_pend_by.get(c, 0), c_pend.get(c, 0))
+        k_pend_tot += pend
+        k_tot = [k_tot[0] + d, k_tot[1] + n, k_tot[2] + t]
+        k_rows += f"<tr><td>{_html_escape(c)}</td>{_num(d)}{_num(n)}{_num(t)}{_pend(pend)}</tr>"
+    ud, un, ut = cls_counts.get(None, [0, 0, 0])
+    k_rows += (f'<tr><td><i>Unclassified</i></td>{_num(ud)}{_num(un)}{_num(ut)}<td class="num zero">&mdash;</td></tr>'
+               f'<tr class="tot"><td>Total</td><td class="num">{k_tot[0] + ud:,}</td><td class="num">{k_tot[1] + un:,}</td>'
+               f'<td class="num">{k_tot[2] + ut:,}</td>{_pend(k_pend_tot)}</tr>')
+    classify_tip = (f'<p style="margin:0 0 8px">{instructions_html}</p>' + tbl_head + k_rows + "</tbody></table>"
+                    '<p class="tip-note">Day / Night / Total = images per label (from the Day/Night saved with each '
+                    'image; imported images count only in Total). Pending = classified but not yet used by a trained '
+                    'model - the sensor model or AI Cloud Detect, whichever is behind.</p>')
     cloud_line = _totals_line(_when(cloud_meta["trained_at"]) if cloud_meta and cloud_meta.get("trained_at") else None,
                               c_d, c_n, c_t, cloud_new_count)
     if cloud_model_wanted and not cloud_meta:
@@ -13714,7 +13782,7 @@ def ai_classify_page():
         '<p class="hint">Repair buttons (restore orphan images, recover from the AllSky archive, restore a '
         'training copy) appear here only when something needs fixing.</p>')
     recovery_badge = '<span class="nav-warn">⚠</span>' if recovery_inner else '<span class="nav-ok">✓</span>'
-    cls_sections = [("classify", f'🏷️ Classify samples <span class="nav-n">{unlabeled_count}</span>'),
+    cls_sections = [("classify", f'🏷️ Classify samples <span class="nav-n" id="clsNavCount">{unlabeled_count}</span>'),
                     ("ai", "🤖 AI Models"), ("mask", "⬛ AI Mask"), ("export", "📦 Export &amp; bulk actions"),
                     ("recovery", f"🛟 Recovery {recovery_badge}")]
     cls_nav_html = "".join(f'<a href="#{k}" data-g="{k}">{t}</a>' for k, t in cls_sections)
@@ -13909,7 +13977,7 @@ a{{color:var(--accent);}}
     <div class="cls-panes">
 
       <div class="cls-pane" id="sec-classify">
-        <div class="cls-title"><span>🏷️ Classify samples</span>{_help(instructions_html)}</div>
+        <div class="cls-title"><span>🏷️ Classify samples</span>{_help(classify_tip, wide=True)}</div>
         <p class="hint">Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
         <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
         <form class="cls-row" action="/ai-classify" method="get">
@@ -14048,6 +14116,7 @@ function clsShow(id) {{
 </script>
 <script>
 const aiShowFilter = {json.dumps(show)};
+var aiFilteredTotal = {total_filtered};
 function aiRecover(action, source) {{
   const el = document.getElementById('aiRecoverStatus');
   if (el) el.textContent = 'Working...';
@@ -14103,8 +14172,9 @@ function showUnclassify(query, onDone) {{
 function unclassifySelected() {{
   const status = document.getElementById('classifyStatus');
   if (selectAllMode) {{
-    showUnclassify('all=' + encodeURIComponent(aiShowFilter) + AI_PQ, d => {{
+    showUnclassify('all=' + encodeURIComponent(aiShowFilter) + AI_PQ + exQ(), d => {{
       status.textContent = 'Unclassified ' + d.unclassified + ' image(s). Reloading...';
+      selDone();
       window.location.reload();
     }});
     return;
@@ -14251,23 +14321,74 @@ function aiPagerRender(total) {{
 // has been clicked - cleared by either "Select all shown" or "Clear
 // selection", both of which narrow the scope back to just this page.
 var selectAllMode = false;
+// Select ALL = every image matching the filter EXCEPT the ones unticked
+// afterwards; kept across pages (sessionStorage) until Clear selection,
+// Select all shown, an action, or another filter.
+var selectAllExclude = new Set();
+var selectAllTotal = 0;
+const SEL_KEY = 'clsSelectAll';
+function selStore() {{
+  try {{
+    if (selectAllMode) sessionStorage.setItem(SEL_KEY, JSON.stringify({{f: AI_SHOW + AI_PQ, x: Array.from(selectAllExclude), n: selectAllTotal}}));
+    else sessionStorage.removeItem(SEL_KEY);
+  }} catch (e) {{}}
+}}
+function selStatus() {{
+  const st = document.getElementById('classifyStatus');
+  if (!st || !selectAllMode) return;
+  const k = selectAllExclude.size, n = Math.max(0, selectAllTotal - k);
+  st.textContent = 'All ' + n + ' of ' + selectAllTotal + ' matching image(s) selected (not just this page)' +
+    (k ? ' - ' + k + ' unticked ' + (k === 1 ? 'is' : 'are') + ' left out' : '') +
+    '. Click a label or Delete selected to apply to all of them.';
+}}
+function exQ() {{
+  return selectAllExclude.size ? '&exclude=' + encodeURIComponent(Array.from(selectAllExclude).join(',')) : '';
+}}
+function selDone() {{ selectAllMode = false; selectAllExclude.clear(); selStore(); }}
 function selectAll(check) {{
-  selectAllMode = false;
+  selDone();
   document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = check);
 }}
 function selectAllMatching(show, total) {{
   if (!total) return;
   selectAllMode = true;
+  selectAllTotal = total;
+  selectAllExclude.clear();
   document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = true);
-  document.getElementById('classifyStatus').textContent =
-    'All ' + total + ' matching image(s) selected (not just this page) - click a label or Delete ' +
-    'selected to apply to all of them.';
+  selStatus(); selStore();
+}}
+document.addEventListener('change', e => {{
+  const cb = e.target;
+  if (!selectAllMode || !cb.classList || !cb.classList.contains('ai-pick')) return;
+  if (cb.checked) selectAllExclude.delete(cb.value); else selectAllExclude.add(cb.value);
+  selStatus(); selStore();
+}});
+(function () {{
+  let saved = null;
+  try {{ saved = JSON.parse(sessionStorage.getItem(SEL_KEY) || 'null'); }} catch (e) {{}}
+  if (!saved) return;
+  if (saved.f !== AI_SHOW + AI_PQ) {{ try {{ sessionStorage.removeItem(SEL_KEY); }} catch (e) {{}} return; }}
+  selectAllMode = true;
+  selectAllTotal = aiFilteredTotal || saved.n || 0;
+  selectAllExclude = new Set(saved.x || []);
+  document.querySelectorAll('.ai-pick').forEach(cb => cb.checked = !selectAllExclude.has(cb.value));
+  selStatus();
+}})();
+// Side menu count, Select ALL (n) and the top tab after label/delete.
+function aiCountsRender(d) {{
+  if (d.filtered_count !== null && d.filtered_count !== undefined) {{
+    aiFilteredTotal = d.filtered_count;
+    const n = document.getElementById('selAllN'); if (n) n.textContent = d.filtered_count;
+  }}
+  if (d.unlabeled_count !== undefined) {{
+    ['clsNavCount', 'classifyCount'].forEach(id => {{ const el = document.getElementById(id); if (el) el.textContent = d.unlabeled_count; }});
+  }}
 }}
 function applyLabel(label) {{
   const status = document.getElementById('classifyStatus');
   if (selectAllMode) {{
     status.textContent = 'Saving...';
-    fetch('/ai-classify-save?all={show}' + AI_PQ + '&label=' + encodeURIComponent(label))
+    fetch('/ai-classify-save?all={show}' + AI_PQ + exQ() + '&label=' + encodeURIComponent(label))
       .then(r => r.json())
       .then(data => {{
         if (!data.ok) {{
@@ -14275,6 +14396,7 @@ function applyLabel(label) {{
           return;
         }}
         status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '". Reloading...';
+        selDone();
         window.location.reload();
       }})
       .catch(err => {{ status.textContent = 'Failed to save: ' + err; }});
@@ -14302,6 +14424,7 @@ function applyLabel(label) {{
       if (totalEl) totalEl.textContent = data.total_count;
       if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
       status.textContent = 'Labeled ' + data.matched + ' image(s) as "' + label + '".';
+      aiCountsRender(data);
       aiPagerRender(data.filtered_count);
       maybeAutoAdvance();
     }})
@@ -14312,7 +14435,7 @@ function deleteSelected() {{
   if (selectAllMode) {{
     if (!confirm('Delete ALL matching image(s)? This cannot be undone.')) return;
     status.textContent = 'Deleting...';
-    fetch('/ai-classify-delete?all={show}' + AI_PQ)
+    fetch('/ai-classify-delete?all={show}' + AI_PQ + exQ())
       .then(r => r.json())
       .then(data => {{
         if (!data.ok) {{
@@ -14320,6 +14443,7 @@ function deleteSelected() {{
           return;
         }}
         status.textContent = 'Deleted ' + data.deleted + ' image(s). Reloading...';
+        selDone();
         window.location.reload();
       }})
       .catch(err => {{ status.textContent = 'Failed to delete: ' + err; }});
@@ -14348,6 +14472,7 @@ function deleteSelected() {{
       if (totalEl) totalEl.textContent = data.total_count;
       if (unlabeledEl) unlabeledEl.textContent = data.unlabeled_count;
       status.textContent = 'Deleted ' + data.deleted + ' image(s).';
+      aiCountsRender(data);
       aiPagerRender(data.filtered_count);
       maybeAutoAdvance();
     }})

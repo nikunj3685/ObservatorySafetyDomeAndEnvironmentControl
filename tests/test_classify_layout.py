@@ -85,15 +85,15 @@ label([f"s{i:03d}" for i in range(50, 53)], "Clear")          # 3 pending Clear
 page = get("/ai-classify")
 nav = re.search(r'<nav class="cls-nav" id="clsNav">(.*?)</nav>', page).group(1)
 ck("menu: 5 sections in order", re.findall(r'data-g="(\w+)"', nav) == ["classify", "ai", "mask", "export", "recovery"])
-ck("menu: unclassified count badge", '<span class="nav-n">19</span>' in nav)
+ck("menu: unclassified count badge", '<span class="nav-n" id="clsNavCount">19</span>' in nav)
 ck("menu: recovery OK tick", 'nav-ok">✓' in nav and "Training list OK" in page)
 ck("no old cards", "📊 Training data overview" not in page and "Classified so far, per label" not in page)
 ck("top strip", "Sensor Samples: <b>53</b>" in page and "AllSky Samples: <b>53</b> captured" in page
    and "<b>0</b> imported (<b>19</b> not yet classified)" in page)
 cls = re.search(r'<div class="cls-pane" id="sec-classify">(.*?)<div class="cls-pane" id="sec-ai">', page, re.S).group(1)
 ck("classify: help icon holds the instructions", 'class="help"' in cls and "Select all shown" in cls
-   and "Pick a label" in re.search(r'class="help-tip">(.*?)</span></span>', cls, re.S).group(1))
-body = re.sub(r'class="help-tip">.*?</span></span>', "", cls, flags=re.S)
+   and "Pick a label" in re.search(r'class="help-tip[^"]*">(.*?)</span></span>', cls, re.S).group(1))
+body = re.sub(r'class="help-tip[^"]*">.*?</span></span>', "", cls, flags=re.S)
 order = [body.index(t) for t in ('name="show"', ">Filter<", "One by one", "Import images", "Select all shown",
                                 "Select ALL", "Clear selection", "Delete selected", "cls-sep", ">Clear</button>",
                                 "Unclassify selected")]
