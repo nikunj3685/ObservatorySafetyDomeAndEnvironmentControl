@@ -9818,6 +9818,7 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .allsky-img-wrap img{{width:100%;height:100%;object-fit:cover;display:block;}}
 .allsky-img-wrap{{position:relative;}}
 .allsky-img-wrap img.ai-mask-ov{{position:absolute;inset:0;pointer-events:none;}}
+.allsky-img-wrap img.ai-mask-ov[hidden]{{display:none;}}
 .mask-toggle{{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;margin:8px 0 0;}}
 /* All Sky + the Safety Checks History card (the old Sky History) sit
    together in their own vertical flex column (not plain grid items) so
@@ -13309,22 +13310,29 @@ def ai_classify_page():
                          if single_cursor and sidx < total_filtered - 1 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
 
     label_fn = "applyLabel" if view == "grid" else "applyLabelSingle"
+    # Images per label (all of them, same as the "?" table's Total column);
+    # refreshed live by aiRefreshCounts() after every label / delete.
+    label_totals = {}
+    for smp in all_samples:
+        if smp.get("label"):
+            label_totals[smp["label"]] = label_totals.get(smp["label"], 0) + 1
     label_buttons_html = "".join(
-        f'<button type="button" class="btn ai-label-btn" onclick="{label_fn}(\'{c}\')">{c}</button>'
-        for c in label_classes) or (
+        f'<button type="button" class="btn ai-label-btn" onclick="{label_fn}(\'{c}\')">{c} '
+        f'<i class="lb-n" id="lbN{i}">{label_totals.get(c, 0):,}</i></button>'
+        for i, c in enumerate(label_classes)) or (
         "<p class='hint'>No labels are configured — add some under "
         "<a href='/settings#ai-learning-settings'>Settings &rarr; AI Learning</a>.</p>")
 
-    show_options = "".join(
-        f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
-        for v, t in [("unclassified", "Unclassified only"), ("all", "All samples")])
+    def _opt(v, t):
+        # Each filter shows how many images it holds (same Day/Night choice as the page).
+        n = len(_ai_samples_matching_filter(idx, v, period))
+        return f"<option value='{v}'{' selected' if v == show else ''}>{t} ({n:,})</option>"
+    show_options = "".join(_opt(v, t) for v, t in [("unclassified", "Unclassified only"), ("all", "All samples")])
     show_options += "<optgroup label='By source'>" + "".join(
-        f"<option value='{v}'{' selected' if v == show else ''}>{t}</option>"
-        for v, t in [("source:captured", "Captured only"), ("source:imported", "Imported only")]) + "</optgroup>"
+        _opt(v, t) for v, t in [("source:captured", "Captured only"), ("source:imported", "Imported only")]) + "</optgroup>"
     if label_classes:
         show_options += "<optgroup label='By label'>" + "".join(
-            f"<option value='label:{c}'{' selected' if show == f'label:{c}' else ''}>{c}</option>"
-            for c in label_classes) + "</optgroup>"
+            _opt(f"label:{c}", c) for c in label_classes) + "</optgroup>"
 
     view_toggle_html = (f'<a class="btn" href="/ai-classify?show={show}{_html_escape(pq)}&amp;view=single&amp;idx=0">👁 One by one</a>'
                          if view == "grid" else
@@ -13632,8 +13640,9 @@ def ai_classify_page():
             head += f"{sep}Day <b>{d:,}</b>{sep}Night <b>{n:,}</b>{sep}Total <b>{t:,}</b>"
         return head + f"{sep}Pending <b class=\"{'lt-pend' if pend else ''}\">{pend:,}</b>"
 
-    def _help(inner, wide=False):
-        return (f'<span class="help" tabindex="0" aria-label="Help">?<span class="help-tip{" tip-table" if wide else ""}">'
+    def _help(inner, wide=False, tip_id=None):
+        return (f'<span class="help" tabindex="0" aria-label="Help">?<span class="help-tip{" tip-table" if wide else ""}"'
+                f'{f" id={chr(34)}{tip_id}{chr(34)}" if tip_id else ""}>'
                 f'{inner}</span></span>')
 
     tbl_head = ('<table class="cnt"><thead><tr><th>Label</th><th class="num">Day</th><th class="num">Night</th>'
@@ -13819,6 +13828,7 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .toolbar{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}}
 .toolbar select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
 .ai-label-btn{{background:var(--info);}}
+.ai-label-btn .lb-n{{font-style:normal;font-size:11px;opacity:.85;margin-left:2px;}}
 .ai-upload-btn{{background:var(--info);}}
 .ai-nav-btn-disabled{{background:#c7cdd2;cursor:default;}}
 #classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{{font-size:13px;color:var(--muted);margin:4px 0 0;}}
@@ -13977,11 +13987,11 @@ a{{color:var(--accent);}}
     <div class="cls-panes">
 
       <div class="cls-pane" id="sec-classify">
-        <div class="cls-title"><span>🏷️ Classify samples</span>{_help(classify_tip, wide=True)}</div>
+        <div class="cls-title"><span>🏷️ Classify samples</span>{_help(classify_tip, wide=True, tip_id="clsTip")}</div>
         <p class="hint">Total samples captured: <b id="aiTotalCount">{total_count}</b>, still unclassified:
         <b id="aiUnlabeledCount">{unlabeled_count}</b>.</p>
         <form class="cls-row" action="/ai-classify" method="get">
-          <select name="show" onchange="this.form.submit()">{show_options}</select>
+          <select name="show" id="clsShowSel" onchange="this.form.submit()">{show_options}</select>
           <select name="period" onchange="this.form.submit()" aria-label="Day / Night">{"".join(f"<option value='{v}'{' selected' if v == period else ''}>{t}</option>" for v, t in (("both", "--"), ("day", "Day"), ("night", "Night")))}</select>
           <input type="hidden" name="view" value="{view}">
           <button type="submit" class="btn">Filter</button>
@@ -14383,6 +14393,28 @@ function aiCountsRender(d) {{
   if (d.unlabeled_count !== undefined) {{
     ['clsNavCount', 'classifyCount'].forEach(id => {{ const el = document.getElementById(id); if (el) el.textContent = d.unlabeled_count; }});
   }}
+  aiRefreshCounts();
+}}
+// Re-reads this page in the background and copies every count across:
+// side menu, Select ALL, label buttons, filter list and the "?" table
+// (Day / Night / Total / Pending), so nothing needs a reload.
+function aiRefreshCounts() {{
+  fetch(window.location.href, {{cache: 'no-store'}})
+    .then(r => r.ok ? r.text() : Promise.reject(r.status))
+    .then(html => {{
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const ids = ['clsNavCount', 'classifyCount', 'selAllN', 'aiTotalCount', 'aiUnlabeledCount', 'clsTip'];
+      document.querySelectorAll('.lb-n').forEach(el => ids.push(el.id));
+      ids.forEach(id => {{
+        const mine = document.getElementById(id), fresh = doc.getElementById(id);
+        if (mine && fresh) mine.innerHTML = fresh.innerHTML;
+      }});
+      const sel = document.getElementById('clsShowSel'), fsel = doc.getElementById('clsShowSel');
+      if (sel && fsel && sel.options.length === fsel.options.length) {{
+        for (let i = 0; i < sel.options.length; i++) sel.options[i].text = fsel.options[i].text;
+      }}
+    }})
+    .catch(() => {{}});
 }}
 function applyLabel(label) {{
   const status = document.getElementById('classifyStatus');

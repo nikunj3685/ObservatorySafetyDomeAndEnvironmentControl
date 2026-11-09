@@ -94,6 +94,12 @@ with sync_playwright() as p:
     ck("dashboard: ticking shows the overlay", pg.evaluate("!document.getElementById('aiMaskOv').hidden && document.getElementById('aiMaskOv').src.includes('/ai-mask-overlay.png')"))
     pg.reload(); pg.wait_for_timeout(300)
     ck("remembered after reload", pg.is_checked("#aiMaskToggle") and pg.evaluate("!document.getElementById('aiMaskOv').hidden"))
+    vis = "getComputedStyle(document.getElementById('aiMaskOv')).display"
+    ck("overlay actually visible when ticked", pg.evaluate(vis) != "none")
+    pg.uncheck("#aiMaskToggle"); pg.wait_for_timeout(200)
+    ck("unticking really hides it (display none)", pg.evaluate(vis) == "none")
+    pg.reload(); pg.wait_for_timeout(300)
+    ck("stays hidden after reload", not pg.is_checked("#aiMaskToggle") and pg.evaluate(vis) == "none")
     ck(f"no JS errors {errs}", not errs)
     b.close()
 ck.done()

@@ -92,8 +92,8 @@ ck("top strip", "Sensor Samples: <b>53</b>" in page and "AllSky Samples: <b>53</
    and "<b>0</b> imported (<b>19</b> not yet classified)" in page)
 cls = re.search(r'<div class="cls-pane" id="sec-classify">(.*?)<div class="cls-pane" id="sec-ai">', page, re.S).group(1)
 ck("classify: help icon holds the instructions", 'class="help"' in cls and "Select all shown" in cls
-   and "Pick a label" in re.search(r'class="help-tip[^"]*">(.*?)</span></span>', cls, re.S).group(1))
-body = re.sub(r'class="help-tip[^"]*">.*?</span></span>', "", cls, flags=re.S)
+   and "Pick a label" in re.search(r'class="help-tip[^"]*"(?: id="clsTip")?>(.*?)</span></span>', cls, re.S).group(1))
+body = re.sub(r'class="help-tip[^"]*"(?: id="clsTip")?>.*?</span></span>', "", cls, flags=re.S)
 order = [body.index(t) for t in ('name="show"', ">Filter<", "One by one", "Import images", "Select all shown",
                                 "Select ALL", "Clear selection", "Delete selected", "cls-sep", ">Clear</button>",
                                 "Unclassify selected")]
