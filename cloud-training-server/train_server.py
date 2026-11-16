@@ -74,6 +74,26 @@ the class-index remapping this requires, and _expand_head_for_new_
 classes() for how a genuinely new label gets room in the model without
 disturbing what it already learned about the old ones.
 
+Improved training (server_config.json "training_method": "improved", the
+default since 2026-11-15; set it to "classic" and restart to go back to the
+incremental method above):
+  * every uploaded image is kept in library/<label>/ and EVERY run retrains
+    a fresh model on the whole library, so nothing is forgotten and the
+    latest batch can't pull the model towards one label;
+  * the training images are varied on the fly - rotation/flips,
+    brightness/contrast, colour shifts, 30% black-and-white and a random
+    light glow from the edge (the neighbour's light) - so the model can't
+    learn "green or bright = cloud";
+  * labels are weighted so small ones count as much as big ones;
+  * the check set is whole DAYS the model hasn't trained on, training stops
+    once that stops improving (best epoch kept), then a second pass gently
+    adjusts the top of MobileNetV2 itself;
+  * accuracy per label on the held-back days is written to the log.
+The model the Pi downloads is the same kind of .tflite as before. A
+/model reset also empties library/, so the Pi's next upload (all images)
+rebuilds it. Switching method either way: reset the cloud model on the Pi
+and train again.
+
 Training never touches anything outside its own jobs/<job_id>/ folder
 (plus the persisted current_model/ - see above), and never raises out
 of the background thread - a failed run just leaves that job's status
@@ -108,6 +128,9 @@ CURRENT_MODEL_DIR = os.path.join(BASE_DIR, "current_model")
 CURRENT_MODEL_KERAS_PATH = os.path.join(CURRENT_MODEL_DIR, "model.keras")
 CURRENT_MODEL_CLASSES_PATH = os.path.join(CURRENT_MODEL_DIR, "classes.json")
 
+# Improved training only: every image ever uploaded, one folder per label.
+LIBRARY_DIR = os.path.join(BASE_DIR, "library")
+
 # How long a finished/failed job's extracted images + model stick around
 # before being swept on startup - training data shouldn't pile up on this
 # machine's disk forever just because nobody re-ran the installer.
@@ -139,6 +162,15 @@ INCREMENTAL_LEARNING_RATE = 1e-4
 # misleading (or to crash on an unlucky split).
 MIN_IMAGES_FOR_VALIDATION_SPLIT = 40
 
+# Improved training (see module docstring).
+HEAD_EPOCHS = 10              # step 1: new last layer only (stops early when the held-back days stop improving)
+FINETUNE_EPOCHS = 8           # step 2: top of MobileNetV2 unfrozen as well
+FINETUNE_FROM_LAYER = 100     # MobileNetV2 has ~155 layers; layers from here on are adjusted in step 2
+FINETUNE_LEARNING_RATE = 1e-5
+EARLY_STOP_PATIENCE = 3
+MAX_CLASS_WEIGHT = 10.0       # a label with very few images can't swamp the others
+VAL_EVERY_NTH_DAY = 7         # whole days held back as the check set
+
 app = Flask(__name__)
 
 # ---- config / API key ----
@@ -160,6 +192,9 @@ def _load_config():
 _config = _load_config()
 API_KEY = _config["api_key"]
 PORT = _config.get("port", 8787)
+TRAINING_METHOD = str(_config.get("training_method", "improved")).strip().lower()
+if TRAINING_METHOD not in ("improved", "classic"):
+    TRAINING_METHOD = "improved"
 
 
 def _log(message):
@@ -355,6 +390,266 @@ def _expand_head_for_new_classes(model, old_classes, new_classes):
     return tf.keras.Model(model.input, outputs)
 
 
+# ---- improved training (see module docstring) ----
+
+
+def _image_ok(path):
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.load()
+        return True
+    except Exception:
+        return False
+
+
+def _add_to_library(images_dir):
+    """Copies this upload into library/<label>/. The same file name under
+    another label (re-labelled on the Pi) is moved, not duplicated. Damaged
+    images (e.g. a cut-short JPEG) are skipped instead of failing training."""
+    added = moved = 0
+    bad = []
+    for label in sorted(os.listdir(images_dir)):
+        src_dir = os.path.join(images_dir, label)
+        if not os.path.isdir(src_dir) or label.startswith("."):
+            continue
+        for name in os.listdir(src_dir):
+            if not name.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            src = os.path.join(src_dir, name)
+            if not _image_ok(src):
+                bad.append(f"{label}/{name}")
+                continue
+            if os.path.isdir(LIBRARY_DIR):
+                for other in os.listdir(LIBRARY_DIR):
+                    old = os.path.join(LIBRARY_DIR, other, name)
+                    if other != label and os.path.isfile(old):
+                        os.remove(old)
+                        moved += 1
+            dst_dir = os.path.join(LIBRARY_DIR, label)
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, name)
+            if not os.path.isfile(dst):
+                added += 1
+            shutil.copyfile(src, dst)
+    return added, moved, bad
+
+
+def _library_items():
+    items = []
+    if not os.path.isdir(LIBRARY_DIR):
+        return items
+    for label in sorted(os.listdir(LIBRARY_DIR)):
+        d = os.path.join(LIBRARY_DIR, label)
+        if not os.path.isdir(d) or label.startswith("."):
+            continue
+        for name in sorted(os.listdir(d)):
+            if name.lower().endswith((".jpg", ".jpeg", ".png")):
+                items.append((os.path.join(d, name), label, name))
+    return items
+
+
+def _day_of(name):
+    """YYYYMMDD from the Pi's sample names (20261115_203803_xxxx.jpg,
+    imp_20261013_...), or None."""
+    if name.startswith("imp_"):
+        name = name[4:]
+    return name[:8] if len(name) >= 8 and name[:8].isdigit() else None
+
+
+def _split_by_day(items):
+    """Whole days held back as the check set, so near-identical frames a
+    minute apart can't sit on both sides. Falls back to a random 15% when
+    there are too few dated days."""
+    import random
+    days = sorted({_day_of(n) for _, _, n in items} - {None})
+    val_days = set(days[VAL_EVERY_NTH_DAY // 2::VAL_EVERY_NTH_DAY]) if len(days) >= 2 * VAL_EVERY_NTH_DAY else set()
+    val = [it for it in items if _day_of(it[2]) in val_days]
+    if len(val) < max(20, len(items) // 20):
+        rest = items[:]
+        random.Random(1337).shuffle(rest)
+        cut = max(1, int(len(rest) * 0.15))
+        return rest[cut:], rest[:cut], "random 15% (too few dated days)"
+    train = [it for it in items if _day_of(it[2]) not in val_days]
+    return train, val, f"{len(val_days)} whole days held back"
+
+
+def _make_dataset(items, classes, training):
+    import tensorflow as tf
+    paths = [p for p, _, _ in items]
+    labels = [classes.index(lbl) for _, lbl, _ in items]
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(len(paths), seed=1337, reshuffle_each_iteration=True)
+
+    def load(path, y):
+        img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
+        img = tf.image.resize(tf.cast(img, tf.float32), IMG_SIZE)
+        return img, y
+
+    h, w = IMG_SIZE
+    yy, xx = tf.meshgrid(tf.range(h, dtype=tf.float32), tf.range(w, dtype=tf.float32), indexing="ij")
+
+    def vary(img, y):
+        img = tf.image.rot90(img, k=tf.random.uniform([], 0, 4, dtype=tf.int32))
+        img = tf.image.random_flip_left_right(img)
+        x = img / 255.0
+        x = tf.image.random_brightness(x, 0.15)
+        x = tf.image.random_contrast(x, 0.75, 1.3)
+        x = tf.image.random_hue(x, 0.08)
+        x = tf.image.random_saturation(x, 0.5, 1.5)
+        # A light glow coming in from a random point near the edge - like the
+        # neighbour's light - so a bright/coloured haze isn't read as cloud.
+        ang = tf.random.uniform([], 0.0, 6.2832)
+        cy = h / 2 + tf.sin(ang) * h * tf.random.uniform([], 0.35, 0.6)
+        cx = w / 2 + tf.cos(ang) * w * tf.random.uniform([], 0.35, 0.6)
+        radius = tf.random.uniform([], 0.25, 0.7) * w
+        glow = tf.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * radius ** 2))
+        tint = tf.stack([tf.random.uniform([], 0.7, 1.0), tf.random.uniform([], 0.7, 1.0), tf.random.uniform([], 0.4, 0.9)])
+        strength = tf.where(tf.random.uniform([]) < 0.4, tf.random.uniform([], 0.15, 0.6), 0.0)
+        x = x + strength * glow[..., None] * tint
+        gray = tf.image.grayscale_to_rgb(tf.image.rgb_to_grayscale(x))
+        x = tf.where(tf.random.uniform([]) < 0.3, gray, x)
+        return tf.clip_by_value(x, 0.0, 1.0) * 255.0, y
+
+    ds = ds.map(load, num_parallel_calls=tf.data.AUTOTUNE)
+    if training:
+        ds = ds.map(vary, num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+
+def _train_job_improved(job_id, images_dir, _set):
+    """Retrains a fresh model on the whole library. Returns (model, classes)."""
+    import tensorflow as tf
+    library_was_empty = not _library_items()
+    added, moved, bad = _add_to_library(images_dir)
+    for b in bad:
+        _log(f"job {job_id}: skipped damaged image {b}")
+    _log(f"job {job_id}: library +{added} new, {moved} moved to a new label")
+    if library_was_empty and os.path.isfile(CURRENT_MODEL_KERAS_PATH):
+        # The library starts with this server version: an older model exists
+        # but its images were never kept here, so training now would only
+        # see this one upload. Keep this upload, ask for a full re-upload.
+        raise ValueError("improved training needs all images once: on the Pi press Reset cloud model, "
+                         "then Train via cloud server")
+
+    items = _library_items()
+    counts = {}
+    for _, lbl, _ in items:
+        counts[lbl] = counts.get(lbl, 0) + 1
+    small = sorted(l for l, n in counts.items() if n < MIN_SAMPLES_PER_CLASS)
+    if small:
+        _log(f"job {job_id}: left out (fewer than {MIN_SAMPLES_PER_CLASS} images): {small}")
+    classes = sorted(l for l, n in counts.items() if n >= MIN_SAMPLES_PER_CLASS)
+    if len(classes) < MIN_CLASSES:
+        raise ValueError(f"need at least {MIN_CLASSES} labels with {MIN_SAMPLES_PER_CLASS}+ images each - "
+                         f"library has: {counts or 'none'}")
+    items = [it for it in items if it[1] in classes]
+    train, val, how = _split_by_day(items)
+    _log(f"job {job_id}: improved training on {len(items)} images {counts} - check set: {how} "
+         f"({len(val)} images)")
+
+    n = {c: 0 for c in classes}
+    for _, lbl, _ in train:
+        n[lbl] += 1
+    weights = {i: min(MAX_CLASS_WEIGHT, len(train) / (len(classes) * max(1, n[c]))) for i, c in enumerate(classes)}
+    _log(f"job {job_id}: label weights " + ", ".join(f"{c} {weights[i]:.2f}" for i, c in enumerate(classes)))
+
+    train_ds = _make_dataset(train, classes, True)
+    val_ds = _make_dataset(val, classes, False)
+
+    backbone = tf.keras.applications.MobileNetV2(input_shape=IMG_SIZE + (3,), include_top=False, weights="imagenet")
+    backbone.trainable = False
+    inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
+    x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
+    x = backbone(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    outputs = tf.keras.layers.Dense(len(classes), activation="softmax")(x)
+    model = tf.keras.Model(inputs, outputs)
+
+    class _Progress(tf.keras.callbacks.Callback):
+        def __init__(self, step, total):
+            super().__init__()
+            self.step, self.total = step, total
+
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs or {}
+            msg = (f"step {self.step} of 2, epoch {epoch + 1}/{self.total} - check-set accuracy "
+                   f"{logs.get('val_accuracy', 0):.1%}")
+            _set("training", progress=msg)
+            _log(f"job {job_id}: {msg}")
+
+    def stop():
+        return tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=EARLY_STOP_PATIENCE,
+                                                restore_best_weights=True)
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    model.fit(train_ds, validation_data=val_ds, epochs=HEAD_EPOCHS, class_weight=weights,
+              callbacks=[stop(), _Progress(1, HEAD_EPOCHS)], verbose=2)
+
+    backbone.trainable = True
+    for layer in backbone.layers[:FINETUNE_FROM_LAYER]:
+        layer.trainable = False
+    for layer in backbone.layers:
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = False
+    model.compile(optimizer=tf.keras.optimizers.Adam(FINETUNE_LEARNING_RATE),
+                  loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    model.fit(train_ds, validation_data=val_ds, epochs=FINETUNE_EPOCHS, class_weight=weights,
+              callbacks=[stop(), _Progress(2, FINETUNE_EPOCHS)], verbose=2)
+
+    # Accuracy per label on the held-back days - the honest number.
+    import numpy as np
+    pred = model.predict(val_ds, verbose=0).argmax(1)
+    true = np.array([classes.index(lbl) for _, lbl, _ in val])
+    per = []
+    for i, c in enumerate(classes):
+        m = true == i
+        if m.any():
+            per.append(f"{c} {int((pred[m] == i).sum())}/{int(m.sum())} ({(pred[m] == i).mean():.0%})")
+    overall = float((pred == true).mean()) if len(true) else 0.0
+    _log(f"job {job_id}: check-set accuracy {overall:.1%} - " + ", ".join(per))
+    _set("training", progress=f"check-set accuracy {overall:.1%}", accuracy=round(overall, 4))
+    return model, classes
+
+
+def _extract_zip(zip_bytes, dest_dir):
+    """Unzip only (with the zip-slip guard) - improved training checks the
+    label counts on the whole library instead of on one upload."""
+    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+            if not names:
+                raise ValueError("uploaded zip is empty")
+            for n in names:
+                target = os.path.normpath(os.path.join(dest_dir, n))
+                if not target.startswith(os.path.normpath(dest_dir)):
+                    raise ValueError(f"unsafe path in zip: {n}")
+            zf.extractall(dest_dir)
+    except zipfile.BadZipFile:
+        raise ValueError("uploaded file is not a valid zip")
+
+
+def _finish_job(job_id, job_path, model, combined_classes, mode, _set):
+    import tensorflow as tf
+    _log(f"job {job_id}: converting to TFLite")
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    tflite_model = converter.convert()
+
+    with open(os.path.join(job_path, "model.tflite"), "wb") as f:
+        f.write(tflite_model)
+    with open(os.path.join(job_path, "classes.json"), "w") as f:
+        json.dump(combined_classes, f)
+
+    _save_current_model(model, combined_classes)
+
+    _set("done", classes=combined_classes, mode=mode, error=None)
+    _log(f"job {job_id}: done ({mode}, {combined_classes})")
+
+
 def _train_job(job_id, zip_bytes):
     job_path = _job_dir(job_id)
     images_dir = os.path.join(job_path, "images")
@@ -365,6 +660,14 @@ def _train_job(job_id, zip_bytes):
 
     try:
         _set("training")
+        if TRAINING_METHOD == "improved":
+            _log(f"job {job_id}: extracting upload (improved training)")
+            _extract_zip(zip_bytes, images_dir)
+            _set("training", mode="fresh", method="improved")
+            model, combined_classes = _train_job_improved(job_id, images_dir, _set)
+            mode = "fresh"
+            _finish_job(job_id, job_path, model, combined_classes, mode, _set)
+            return
         _log(f"job {job_id}: extracting upload")
         counts = _extract_and_validate(zip_bytes, images_dir)
         total_images = sum(counts.values())
@@ -465,20 +768,7 @@ def _train_job(job_id, zip_bytes):
                  f"warm-started)")
 
         model.fit(train_ds, validation_data=val_ds, epochs=epochs, verbose=2)
-
-        _log(f"job {job_id}: converting to TFLite")
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        tflite_model = converter.convert()
-
-        with open(os.path.join(job_path, "model.tflite"), "wb") as f:
-            f.write(tflite_model)
-        with open(os.path.join(job_path, "classes.json"), "w") as f:
-            json.dump(combined_classes, f)
-
-        _save_current_model(model, combined_classes)
-
-        _set("done", classes=combined_classes, mode=mode, error=None)
-        _log(f"job {job_id}: done ({mode}, {combined_classes})")
+        _finish_job(job_id, job_path, model, combined_classes, mode, _set)
     except ValueError as e:
         # A data-quality problem (not enough images, bad zip, etc.) -
         # the same kind of message the Pi's own /ai-train-model route
@@ -496,7 +786,8 @@ def _train_job(job_id, zip_bytes):
 @app.route("/health", methods=["GET"])
 def health():
     has_current_model = os.path.isfile(CURRENT_MODEL_KERAS_PATH) and os.path.isfile(CURRENT_MODEL_CLASSES_PATH)
-    return jsonify({"ok": True, "jobs_in_memory": len(jobs), "has_current_model": has_current_model})
+    return jsonify({"ok": True, "jobs_in_memory": len(jobs), "has_current_model": has_current_model,
+                    "training_method": TRAINING_METHOD})
 
 
 @app.route("/train", methods=["POST"])
@@ -601,6 +892,8 @@ def reset_model():
     try:
         if had_model:
             shutil.rmtree(CURRENT_MODEL_DIR)
+        if os.path.isdir(LIBRARY_DIR):
+            shutil.rmtree(LIBRARY_DIR)   # improved training: the Pi's next upload (all images) rebuilds it
     except Exception as e:
         _log(f"reset_model: failed to remove {CURRENT_MODEL_DIR} - {e}")
         return jsonify({"ok": False, "error": f"could not clear current model: {e}"}), 500
@@ -611,7 +904,7 @@ def reset_model():
 if __name__ == "__main__":
     os.makedirs(JOBS_DIR, exist_ok=True)
     _cleanup_old_jobs()
-    _log(f"starting on port {PORT}")
+    _log(f"starting on port {PORT} (training method: {TRAINING_METHOD})")
     try:
         from waitress import serve
         serve(app, host="0.0.0.0", port=PORT)

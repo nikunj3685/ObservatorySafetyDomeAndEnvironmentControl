@@ -238,7 +238,35 @@ internet either way.
   anything is time-sensitive, just so old training runs don't pile up
   forever.
 
-### Incremental (warm-started) training
+### Improved training (default since 2026-11-15)
+
+`server_config.json` key `"training_method"`: `"improved"` (default when the key is missing) or `"classic"` (the incremental method below). To change it, edit the file, restart the server, then on the Pi press **Reset cloud model** and **Train via cloud server** once.
+
+install.ps1 writes it (and adds it to an older file, keeping your API key and port):
+
+```json
+{
+    "api_key":  "<your key>",
+    "port":  8787,
+    "training_method":  "improved",
+    "_note":  "training_method: improved (new) or classic (old). Restart server, then Reset cloud model + Train on the Pi."
+}
+```
+
+JSON has no comments - keys starting with `_` (like `_note`) are ignored by the server and are the place for notes.
+
+- Every uploaded image is kept in `library/<label>/`; each run retrains a fresh model on the whole library, so nothing is forgotten. An image re-labelled on the Pi moves to its new label; damaged images are skipped (logged).
+- Training images are varied on the fly: rotation/flips, brightness/contrast, colour shifts, 30% black-and-white and a random light glow from the edge (the neighbour's light), so the model can't learn "green or bright = cloud".
+- Labels are weighted so small ones count as much as big ones (capped at 10x). Labels with fewer than 5 images are left out.
+- The check set is whole days the model hasn't trained on (every 7th day). Step 1 trains the last layer, step 2 gently adjusts the top of MobileNetV2; each stops when the check set stops improving and keeps its best epoch.
+- The log ends with the check-set accuracy per label, e.g. `check-set accuracy 87.4% - Clear 410/440 (93%), ...`; `GET /train/status/<job_id>` shows `progress` while training and `accuracy` at the end.
+- A run takes longer (it sees every image): roughly 20-90 minutes on a normal PC CPU. The Pi waits up to 4 hours (v1.2.0+).
+- `DELETE /model` also empties `library/`.
+- If an older model exists but the library is empty (first run after updating), the job fails with "press Reset cloud model, then Train via cloud server" so it never trains on one small batch.
+
+`compare_training.py <images zip> [--quick]` trains the classic and improved methods side by side on a Classify export and writes `compare_training_report.txt` - nothing on the server or the Pi is changed.
+
+### Incremental (warm-started) training ("classic")
 
 The first-ever training run (upload) trains a brand-new model from
 scratch, same as always. Every run after that **warm-starts** from the
@@ -282,7 +310,6 @@ actively wrong rather than merely stale - for example, a new camera
 location, a different light-pollution environment, or starting the whole
 labeling process over. This only clears the warm-start base; it does not
 delete any past job's downloadable `model.tflite`/`classes.json` files
-under `jobs/` (those are swept on their own 14-day schedule). A matching
-"Reset cloud model" control on the Pi side (calling this endpoint and
-also clearing its own locally downloaded copy) is planned but not yet
-built - for now, resetting is a manual call to this endpoint.
+under `jobs/` (those are swept on their own 14-day schedule). The Pi's
+"Reset cloud model" button calls this endpoint. With improved training it
+also empties `library/`.

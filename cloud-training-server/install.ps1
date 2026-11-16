@@ -115,23 +115,32 @@ if ($LASTEXITCODE -ne 0) {
 # ---------------------------------------------------------------------
 
 $configPath = Join-Path $here "server_config.json"
+# "training_method": "improved" (default) or "classic" (the old incremental
+# method). JSON has no comments, so "_note" explains it inside the file;
+# the server ignores any key starting with "_".
+$trainingNote = "training_method: improved (new) or classic (old). Restart server, then Reset cloud model + Train on the Pi."
+$trainingMethod = "improved"
 if (Test-Path $configPath) {
     $existing = Get-Content $configPath -Raw | ConvertFrom-Json
     $apiKey = $existing.api_key
     $port = $existing.port
-    Write-Host "Reusing existing API key and port ($port) from server_config.json."
+    if ($existing.training_method) { $trainingMethod = $existing.training_method }
+    Write-Host "Reusing existing API key, port ($port) and training method ($trainingMethod) from server_config.json."
 } else {
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $apiKey = ([Convert]::ToBase64String($bytes) -replace '[^a-zA-Z0-9]', '').Substring(0, 32)
     $port = 8787
-    # Written via .NET directly (not Set-Content -Encoding UTF8) because
-    # Windows PowerShell's UTF8 encoding always prepends a byte-order-mark,
-    # which breaks Python's json.load with "Expecting value: line 1 column 1".
-    $json = @{ api_key = $apiKey; port = $port } | ConvertTo-Json
-    [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "Generated a new API key and saved it to server_config.json."
+    Write-Host "Generated a new API key."
 }
+# (Re)written every run so an older file also gets training_method + _note;
+# the API key, port and chosen method are kept as they were.
+# Written via .NET directly (not Set-Content -Encoding UTF8) because
+# Windows PowerShell's UTF8 encoding always prepends a byte-order-mark,
+# which breaks Python's json.load with "Expecting value: line 1 column 1".
+$json = [ordered]@{ api_key = $apiKey; port = $port; training_method = $trainingMethod; _note = $trainingNote } | ConvertTo-Json
+[System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "Saved server_config.json (training method: $trainingMethod)."
 
 # ---------------------------------------------------------------------
 # 4. Firewall rule - LAN-reachable only; nothing here opens this port
