@@ -107,6 +107,14 @@ from adafruit_extended_bus import ExtendedI2C
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 import adafruit_ssd1306
 
+# ---- Version ----------------------------------------------------------------
+# Shown after the main title on every page (hover: date + last change) and
+# in the "Service started" log line. Bump on every change:
+# fix -> x.y.Z+1, new feature/setting -> x.Y+1.0, big change -> X+1.0.0.
+APP_VERSION = "1.2.0"
+APP_VERSION_DATE = "2026-11-15"
+APP_VERSION_NOTE = "Waits up to 4 h for the improved cloud training"
+
 # Optional - only needed for the cloud-trained image model gate (Phase 5,
 # see the "CLOUD-TRAINED IMAGE MODEL" section below). tflite-runtime is a
 # much smaller install than full TensorFlow, which is exactly why training
@@ -404,7 +412,7 @@ DEFAULT_SETTINGS = {
     # device's own all-sky web server) or a plain file path on THIS Pi
     # (served by this service's own /allsky-image route) - whichever it
     # looks like at render time. "page_url" is optional and only powers the
-    # "View full All Sky page" link at the bottom of the card - e.g. the
+    # "All Sky Page" link at the bottom of the card - e.g. the
     # camera software's own dashboard, if it has one.
     "allsky": {
         "enabled": False,
@@ -799,7 +807,8 @@ CLOUD_UPLOAD_RESIZE_MAX_DIM = 400      # long-edge cap for images going into the
                                         # The manual "Export as .zip" (Teachable Machine reuse) stays full-res.
 CLOUD_MODEL_PREDICT_INTERVAL_SEC = 60  # how often the live gate re-classifies the current All Sky frame
 CLOUD_TRAIN_POLL_INTERVAL_SEC = 15     # how often the background upload/poll thread checks job status
-CLOUD_TRAIN_TIMEOUT_SEC = 30 * 60      # give up and mark the job failed after this long either way
+CLOUD_TRAIN_TIMEOUT_SEC = 4 * 60 * 60  # give up and mark the job failed after this long either way (improved
+                                       # training retrains on every image each run, so it can take an hour+)
 CLOUD_HTTP_TIMEOUT_SEC = 20            # for quick round trips (status polls, health, model download) - NOT the upload itself
 CLOUD_UPLOAD_TIMEOUT_SEC = 20 * 60     # the upload can be large (hundreds of labeled images) - a short timeout
                                         # would fail a real, still-in-progress upload, not just a dead one
@@ -5442,7 +5451,7 @@ def _log_startup_connectivity():
         status(RAIN_INSTALLED, s["rain_ok"], names["rain"]),
         status(True, s["cloud_ok"], "Simple Cloud Detect"),
     ]
-    _log_event("Service", "Service started - sensor connectivity: " + "; ".join(parts))
+    _log_event("Service", f"Service started (v{APP_VERSION}) - sensor connectivity: " + "; ".join(parts))
     _log_event("Service", "Override mode is AUTO at startup (forced SAFE/UNSAFE modes are not "
                            "persisted across restarts)")
 
@@ -6762,10 +6771,94 @@ def alpaca_unavailable(member_name, reason):
                             error_message=f"{member_name} unavailable: {reason}")
 
 
+# Alpaca UniqueIDs must NEVER change - imaging software (e.g. NINA) matches
+# devices by them, so a changed ID looks like a missing device. They used to
+# be rebuilt from uuid.getnode() on every start; after a power loss (12 Nov
+# 2026) the service started before the Pi's real network adapter was ready,
+# got a temporary locally-administered address (ea-0d-fe-...) and NINA could
+# not reconnect for ~5 h. Now the ID base is worked out ONCE from a real,
+# factory (universally administered) hardware address and saved here; every
+# later start reuses it as-is.
+ALPACA_IDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_ids.json")
+_alpaca_id_warning = None   # logged by the startup code (event log isn't ready at import)
+
+
+def _mac_str(node):
+    return "-".join(f"{(node >> ele) & 0xff:02x}" for ele in range(40, -8, -8))
+
+
+def _is_factory_mac(node):
+    """True for a real, universally administered unicast address (not a
+    random / Wi-Fi-privacy / virtual one): bits 0 and 1 of the first byte clear."""
+    return node is not None and node != 0 and not ((node >> 40) & 0x03)
+
+
+def _factory_mac_now(net_dir="/sys/class/net"):
+    """First real hardware address on this machine (same order as `ip link`),
+    read straight from the kernel, or None if none is visible yet."""
+    found = []
+    try:
+        names = os.listdir(net_dir)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            with open(os.path.join(net_dir, name, "address")) as f:
+                node = int(f.read().strip().replace(":", ""), 16)
+            try:
+                with open(os.path.join(net_dir, name, "ifindex")) as f:
+                    order = int(f.read().strip())
+            except (OSError, ValueError):
+                order = 9999
+        except (OSError, ValueError):
+            continue
+        if _is_factory_mac(node):
+            found.append((order, name, node))
+    return min(found)[2] if found else None
+
+
+def _alpaca_id_base():
+    """The saved ID base, or (first start) a real hardware address - saved so
+    it never changes again. Sets _alpaca_id_warning when something is off."""
+    global _alpaca_id_warning
+    saved = None
+    try:
+        with open(ALPACA_IDS_PATH) as f:
+            saved = (json.load(f) or {}).get("base")
+    except (OSError, ValueError):
+        pass
+    now = _factory_mac_now()
+    if now is None:
+        node = uuid.getnode()
+        now = node if _is_factory_mac(node) else None
+    if saved:
+        if now is not None and _mac_str(now) != saved:
+            _alpaca_id_warning = (f"Network hardware address at start ({_mac_str(now)}) differs from the saved Alpaca "
+                                  f"ID base ({saved}) - kept the saved IDs so your imaging software still finds the devices")
+        return saved
+    if now is None:
+        # No real adapter visible yet: use whatever is there for this run only
+        # and do NOT save it, so the next start can pick up the real one.
+        tmp = _mac_str(uuid.getnode())
+        _alpaca_id_warning = (f"No real network hardware address found at start - using a temporary Alpaca ID base "
+                              f"({tmp}) for this run only; your imaging software may not find the devices until "
+                              f"the service restarts")
+        return tmp
+    base = _mac_str(now)
+    try:
+        with open(ALPACA_IDS_PATH + ".tmp", "w") as f:
+            json.dump({"base": base, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        os.replace(ALPACA_IDS_PATH + ".tmp", ALPACA_IDS_PATH)
+    except OSError as e:
+        _alpaca_id_warning = f"Could not save the Alpaca IDs to {ALPACA_IDS_PATH}: {e}"
+    return base
+
+
+ALPACA_ID_BASE = _alpaca_id_base()
+
+
 def get_unique_id(suffix):
-    node = uuid.getnode()
-    mac = "-".join(f"{(node >> ele) & 0xff:02x}" for ele in range(40, -8, -8))
-    return f"{mac}-{suffix}"
+    return f"{ALPACA_ID_BASE}-{suffix}"
 
 
 SAFETY_UNIQUE_ID = get_unique_id("safety")
@@ -9339,6 +9432,8 @@ def web_sky_history():
 # update for the pages that did not already have it (Logs, Classify).
 PAGE_HEADER_CSS = """
 h1{font-size:21px;margin:2px 0 2px;}
+.app-ver{display:inline-block;vertical-align:middle;font-size:11.5px;font-weight:500;color:var(--muted);
+         border:1px solid #d0d5dd;border-radius:999px;padding:1px 8px;margin-left:4px;cursor:help;}
 .subtitle{color:var(--muted);font-size:13px;margin:0 0 18px;}
 .topnav{display:flex;align-items:center;flex-wrap:wrap;gap:4px 6px;margin:0 0 14px;border-bottom:1px solid #e3e6ea;}
 .topnav a{padding:9px 14px;text-decoration:none;color:#475262;font-weight:600;font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px;}
@@ -9389,7 +9484,8 @@ def _page_header_html(active, unlabeled_count):
     the small red restart-service button at the right end of the bar."""
     def tab(key, href, label):
         return f'<a href="{href}"{" class=\"on\"" if key == active else ""}>{label}</a>'
-    return ('<h1>🔭 Observatory Control</h1>\n'
+    ver_tip = _html_escape(f"Version {APP_VERSION} · {APP_VERSION_DATE} · {APP_VERSION_NOTE}")
+    return (f'<h1>🔭 Observatory Control <span class="app-ver" title="{ver_tip}">v{APP_VERSION}</span></h1>\n'
             '<p class="subtitle">Alpaca Dome + SafetyMonitor + ObservingConditions on port 11112</p>\n'
             '<nav class="topnav">'
             + tab("dash", "/", "🏠 Dashboard")
@@ -9819,7 +9915,12 @@ h1{{font-size:21px;margin:2px 0 2px;}}
 .allsky-img-wrap{{position:relative;}}
 .allsky-img-wrap img.ai-mask-ov{{position:absolute;inset:0;pointer-events:none;}}
 .allsky-img-wrap img.ai-mask-ov[hidden]{{display:none;}}
-.mask-toggle{{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;margin:8px 0 0;}}
+.mask-toggle{{display:inline-flex;align-items:center;gap:5px;font-size:13px;margin:0;flex:none;}}
+.mask-toggle input{{margin:0;}}
+.allsky-foot{{display:flex;align-items:center;justify-content:space-between;flex-wrap:nowrap;gap:10px;margin:8px 0 0;white-space:nowrap;font-size:13px;}}
+.allsky-foot .hint{{margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;}}
+.allsky-foot a{{flex:none;}}
+@media (max-width:480px){{.allsky-foot,.allsky-foot .mask-toggle,.allsky-foot .hint{{font-size:12px;}}.allsky-foot{{gap:6px;}}.allsky-foot .mask-toggle{{gap:4px;}}}}
 /* All Sky + the Safety Checks History card (the old Sky History) sit
    together in their own vertical flex column (not plain grid items) so
    the history card can grow to fill exactly whatever
@@ -10057,13 +10158,15 @@ a{{color:var(--accent-safety);}}
   <h2><span class="title">🌌 All Sky</span></h2>
   <div class="allsky-img-wrap">
     <img id="allskyImg" src="{allsky_img_initial_src}" alt="Latest all-sky camera image"
-     onerror="this.dataset.broken='1';var s=document.getElementById('allskyStatus');if(s)s.textContent='Image failed to load — check the location under Settings → All Sky Camera.';"
-     onload="if(this.dataset.broken!=='1'){{var s=document.getElementById('allskyStatus');if(s)s.textContent='Updated '+new Date().toLocaleTimeString();}} this.dataset.broken='';">
+     onerror="this.dataset.broken='1';var s=document.getElementById('allskyStatus');if(s){{s.textContent='Image failed to load — check the location under Settings → All Sky Camera.';s.title=s.textContent;}}"
+     onload="if(this.dataset.broken!=='1'){{var s=document.getElementById('allskyStatus');if(s){{s.textContent='(Updated '+(window.innerWidth<=480?new Date().toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}}):new Date().toLocaleTimeString())+')';s.title='';}}}} this.dataset.broken='';">
     {'<img class="ai-mask-ov" id="aiMaskOv" alt="" hidden>' if os.path.isfile(CLOUD_MODEL_MASK_PATH) else ''}
   </div>
-  {'<label class="mask-toggle"><input type="checkbox" id="aiMaskToggle"> Show AI mask</label>' if os.path.isfile(CLOUD_MODEL_MASK_PATH) else ''}
-  <p class="hint" id="allskyStatus">Loading&hellip;</p>
-  {"" if not allsky_page_url else f"<p class='hint'><a href='{allsky_page_url}' target='_blank' rel='noopener'>View full All Sky page &rarr;</a></p>"}
+  <div class="allsky-foot">
+    {'<label class="mask-toggle"><input type="checkbox" id="aiMaskToggle"> Show AI mask</label>' if os.path.isfile(CLOUD_MODEL_MASK_PATH) else ''}
+    <span class="hint" id="allskyStatus">(Loading&hellip;)</span>
+    {"" if not allsky_page_url else f"<a href='{allsky_page_url}' target='_blank' rel='noopener'>All Sky Page &rarr;</a>"}
+  </div>
 </div>
 <div id="historyBlock">{sky_history_html}</div>
 </div>'''}
@@ -10513,7 +10616,7 @@ a{{color:var(--accent-safety);}}
       <input type="text" name="pageUrl" value="{allsky_page_url}"
        placeholder="http://192.168.1.50/allsky/">
       <p class="hint">If the camera software has its own full web page/dashboard, put its address here —
-      it's shown as a "View full All Sky page" link at the bottom of the card. Leave blank to omit it.</p>
+      it's shown as an "All Sky Page" link at the bottom of the card. Leave blank to omit it.</p>
 
       <label>Extra Text File path (only if Allsky runs on THIS Pi — clear it otherwise)</label>
       <input type="text" name="extraTextFile" value="{allsky_extra_text_file}"
@@ -13310,16 +13413,9 @@ def ai_classify_page():
                          if single_cursor and sidx < total_filtered - 1 else '<span class="btn ai-nav-btn ai-nav-btn-disabled">Next &rarr;</span>')
 
     label_fn = "applyLabel" if view == "grid" else "applyLabelSingle"
-    # Images per label (all of them, same as the "?" table's Total column);
-    # refreshed live by aiRefreshCounts() after every label / delete.
-    label_totals = {}
-    for smp in all_samples:
-        if smp.get("label"):
-            label_totals[smp["label"]] = label_totals.get(smp["label"], 0) + 1
     label_buttons_html = "".join(
-        f'<button type="button" class="btn ai-label-btn" onclick="{label_fn}(\'{c}\')">{c} '
-        f'<i class="lb-n" id="lbN{i}">{label_totals.get(c, 0):,}</i></button>'
-        for i, c in enumerate(label_classes)) or (
+        f'<button type="button" class="btn ai-label-btn" onclick="{label_fn}(\'{c}\')">{c}</button>'
+        for c in label_classes) or (
         "<p class='hint'>No labels are configured — add some under "
         "<a href='/settings#ai-learning-settings'>Settings &rarr; AI Learning</a>.</p>")
 
@@ -13828,7 +13924,6 @@ body{{background:var(--page-bg);color:var(--text);font-family:-apple-system,Blin
 .toolbar{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}}
 .toolbar select{{padding:6px 8px;border-radius:6px;border:1px solid #ccc;font-size:14px;}}
 .ai-label-btn{{background:var(--info);}}
-.ai-label-btn .lb-n{{font-style:normal;font-size:11px;opacity:.85;margin-left:2px;}}
 .ai-upload-btn{{background:var(--info);}}
 .ai-nav-btn-disabled{{background:#c7cdd2;cursor:default;}}
 #classifyStatus,#trainStatus,#sensorDataStatus,#resizedImagesStatus{{font-size:13px;color:var(--muted);margin:4px 0 0;}}
@@ -14011,8 +14106,8 @@ a{{color:var(--accent);}}
       <div class="cls-pane" id="sec-ai">
         <div class="cls-title"><span>🤖 AI Models</span></div>
         <div class="ai-block">
-          <div class="cls-title sub"><span>🤖 AI Sky Prediction (Sensor)</span>{_help(sensor_tip, wide=True)}</div>
-          <table class="kv"><tr><th>Last trained</th><td>{sensor_line}</td></tr>{_ai_accuracy_row_html(ai_model, checks) if ai_model else ""}</table>
+          <div class="cls-title sub"><span>🤖 AI Sky Prediction (Sensor)</span>{_help(sensor_tip, wide=True, tip_id="sensorTip")}</div>
+          <table class="kv"><tr><th>Last trained</th><td id="sensorLine">{sensor_line}</td></tr>{_ai_accuracy_row_html(ai_model, checks) if ai_model else ""}</table>
           <div class="btn-groups">
             <div class="cls-row"><span class="btn-lbl">Model</span>
               <button type="button" class="btn" onclick="trainModel()">Train model now</button>{reset_model_html}</div>
@@ -14026,8 +14121,8 @@ a{{color:var(--accent);}}
           <p id="sensorDataStatus" class="hint"></p>
         </div>
         <div class="ai-block">
-          <div class="cls-title sub"><span>📷 AI Cloud Detect (All Sky)</span>{_help(cloud_tip, wide=True)}</div>
-          <table class="kv"><tr><th>Last trained</th><td>{cloud_line}</td></tr></table>
+          <div class="cls-title sub"><span>📷 AI Cloud Detect (All Sky)</span>{_help(cloud_tip, wide=True, tip_id="cloudTip")}</div>
+          <table class="kv"><tr><th>Last trained</th><td id="cloudLine">{cloud_line}</td></tr></table>
           <div class="btn-groups">
             <div class="cls-row"><span class="btn-lbl">Model</span>{cloud_train_button_html}{cloud_reset_button_html}{cloud_cancel_button_html}</div>
             <div class="cls-row"><span class="btn-lbl">Data</span>{resized_images_download_html}
@@ -14396,15 +14491,15 @@ function aiCountsRender(d) {{
   aiRefreshCounts();
 }}
 // Re-reads this page in the background and copies every count across:
-// side menu, Select ALL, label buttons, filter list and the "?" table
-// (Day / Night / Total / Pending), so nothing needs a reload.
+// side menu, Select ALL, filter list, every "?" table (Day / Night / Total /
+// Pending) and both AI Models "Last trained" lines, so nothing needs a reload.
 function aiRefreshCounts() {{
   fetch(window.location.href, {{cache: 'no-store'}})
     .then(r => r.ok ? r.text() : Promise.reject(r.status))
     .then(html => {{
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      const ids = ['clsNavCount', 'classifyCount', 'selAllN', 'aiTotalCount', 'aiUnlabeledCount', 'clsTip'];
-      document.querySelectorAll('.lb-n').forEach(el => ids.push(el.id));
+      const ids = ['clsNavCount', 'classifyCount', 'selAllN', 'aiTotalCount', 'aiUnlabeledCount',
+                   'clsTip', 'sensorTip', 'cloudTip', 'sensorLine', 'cloudLine'];
       ids.forEach(id => {{
         const mine = document.getElementById(id), fresh = doc.getElementById(id);
         if (mine && fresh) mine.innerHTML = fresh.innerHTML;
@@ -14846,6 +14941,12 @@ def discovery_loop():
 if __name__ == "__main__":
     print(f"[startup] SafetyMonitor UniqueID: {SAFETY_UNIQUE_ID}")
     print(f"[startup] Dome UniqueID: {DOME_UNIQUE_ID}")
+    if _alpaca_id_warning:
+        print(f"[startup] WARNING: {_alpaca_id_warning}")
+        try:
+            _log_event("Service", _alpaca_id_warning, severity="warn")
+        except Exception as e:
+            print(f"[startup] could not log the Alpaca ID warning: {e}")
     print(f"[startup] safety_checks={get_setting('safety_checks')}")
     print(f"[startup] location={get_setting('location')}")
 

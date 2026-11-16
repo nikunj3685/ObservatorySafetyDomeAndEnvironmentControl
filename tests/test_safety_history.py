@@ -295,7 +295,7 @@ pages = {"/": c.get("/").get_data(as_text=True), "/settings": c.get("/settings")
          "/ai-classify": c.get("/ai-classify").get_data(as_text=True), "/logs": c.get("/logs").get_data(as_text=True)}
 for path, h in pages.items():
     check(f"{path}: 200 + shared header (title, subtitle, 4 tabs in order)",
-          "🔭 Observatory Control</h1>" in h and "Alpaca Dome + SafetyMonitor" in h
+          "<h1>🔭 Observatory Control <span class=\"app-ver\"" in h and "Alpaca Dome + SafetyMonitor" in h
           and re.search(r'Dashboard</a><a href="/settings">⚙ Settings</a><a href="/ai-classify">🏷️ Classify \(<span id="classifyCount">\d+</span>\)</a><a href="/logs">🗒 Logs</a>', h.replace(' class="on"', "")) is not None)
     check(f"{path}: red restart button at the right end", 'class="nav-restart"' in h and "hdrRestart()" in h and h.index("🗒 Logs") < h.index('class="nav-restart"'))
     check(f"{path}: safety tab icon link present", 'rel="icon" id="safetyFavicon"' in h)
